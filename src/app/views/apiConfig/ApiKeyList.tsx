@@ -192,6 +192,13 @@ export function ApiKeyList({
             ? apiConfigErrorText(writeReport.errorCode, t)
             : null;
   const reportRole = writeReport?.outcome === "committed" ? "status" : "alert";
+  const canRestart = writeReport != null && (
+    writeReport.outcome === "committed" ||
+    (writeReport.codexWasRunning && (
+      writeReport.outcome === "failed_before_mutation" ||
+      (writeReport.outcome === "restored" && writeReport.rollbackVerified)
+    ))
+  );
 
   return (
     <section className="api-config-connected api-config-with-footer">
@@ -252,7 +259,7 @@ export function ApiKeyList({
               <code>{writeReport.backupDir}</code>
             </div>
           ) : null}
-          {writeReport.outcome === "committed" ? (
+          {canRestart ? (
             <button className="btn primary api-config-restart" type="button" onClick={() => void restart()} disabled={restarting}>
               <Icon name={restarting ? "loader" : "play"} />
               {t(restarting ? "config.restarting" : "config.restart")}

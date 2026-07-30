@@ -623,12 +623,11 @@ impl RawApiKey {
         });
         if matches!(expiration, Some(Ok(true))) || self.status == "expired" {
             OrangeKeyStatus::Expired
-        } else if matches!(expiration, Some(Err(_))) {
-            OrangeKeyStatus::Inactive
-        } else if !self
-            .group
-            .as_ref()
-            .is_some_and(|group| group.status == "active")
+        } else if matches!(expiration, Some(Err(_)))
+            || self
+                .group
+                .as_ref()
+                .is_none_or(|group| group.status != "active")
         {
             OrangeKeyStatus::Inactive
         } else if (self.quota > 0.0 && self.quota_used >= self.quota)
@@ -1251,10 +1250,10 @@ mod tests {
         );
         assert!(keys.items.iter().find(|key| key.id == 1).unwrap().enabled);
         assert_eq!(token_store.load().unwrap().as_deref(), Some("new-refresh"));
-        unauthorized.assert_hits_async(1).await;
-        refresh.assert_hits_async(1).await;
-        page_one.assert_hits_async(1).await;
-        page_two.assert_hits_async(1).await;
+        unauthorized.assert_calls_async(1).await;
+        refresh.assert_calls_async(1).await;
+        page_one.assert_calls_async(1).await;
+        page_two.assert_calls_async(1).await;
         let _ = fs::remove_dir_all(root);
     }
 

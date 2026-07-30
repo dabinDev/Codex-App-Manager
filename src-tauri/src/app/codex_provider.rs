@@ -161,6 +161,8 @@ pub struct ProviderWritePermit {
 enum ProviderWriteFault {
     None,
     #[cfg(test)]
+    BeforePreimageRead,
+    #[cfg(test)]
     BeforeAuthReplace,
     #[cfg(test)]
     VerificationMismatch,
@@ -263,18 +265,34 @@ fn write_provider_files_with_permit(
     codex_was_running: bool,
     _fault: ProviderWriteFault,
 ) -> Result<ProviderWriteReport, ProviderWriteError> {
-    if api_key.trim().is_empty() {
-        return Err(ProviderWriteError::EmptyKey);
-    }
-
     let config_path = permit.paths.codex_home.join("config.toml");
     let auth_path = permit.paths.codex_home.join("auth.json");
-    reject_symlink(&config_path)?;
-    reject_symlink(&auth_path)?;
-
-    let preimage = Preimage {
-        config: read_optional(&config_path)?,
-        auth: read_optional(&auth_path)?,
+    let preimage = (|| -> Result<Preimage, ProviderWriteError> {
+        if api_key.trim().is_empty() {
+            return Err(ProviderWriteError::EmptyKey);
+        }
+        reject_symlink(&config_path)?;
+        reject_symlink(&auth_path)?;
+        #[cfg(test)]
+        if _fault == ProviderWriteFault::BeforePreimageRead {
+            return Err(ProviderWriteError::Io);
+        }
+        Ok(Preimage {
+            config: read_optional(&config_path)?,
+            auth: read_optional(&auth_path)?,
+        })
+    })();
+    let preimage = match preimage {
+        Ok(preimage) => preimage,
+        Err(error) => {
+            return Ok(failed_before_mutation_report(
+                &config_path,
+                &auth_path,
+                codex_was_running,
+                None,
+                &error,
+            ));
+        }
     };
     let backup_dir =
         permit
@@ -296,7 +314,13 @@ fn write_provider_files_with_permit(
     }
 
     let config_bytes = provider_config().into_bytes();
-    let auth_bytes = auth_template(api_key).map_err(|_| ProviderWriteError::Io)?;
+    let auth_bytes = match auth_template(api_key) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            report.error_code = Some(ProviderWriteError::Io.code().into());
+            return Ok(report);
+        }
+    };
     let mutation_result = (|| -> Result<(), ProviderWriteError> {
         replace_durable(&config_path, &config_bytes, false).map_err(|_| ProviderWriteError::Io)?;
         #[cfg(test)]
@@ -371,6 +395,7 @@ fn acquire_lock(backup_root: &Path) -> Result<ProviderLock, ProviderWriteError> 
     let path = backup_root.join("provider-write.lock");
     let file = OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(path)
@@ -584,6 +609,18 @@ fn report_base(
         rollback_verified: false,
         error_code: None,
     }
+}
+
+fn failed_before_mutation_report(
+    config_path: &Path,
+    auth_path: &Path,
+    codex_was_running: bool,
+    backup_dir: Option<String>,
+    error: &ProviderWriteError,
+) -> ProviderWriteReport {
+    let mut report = report_base(config_path, auth_path, codex_was_running, backup_dir);
+    report.error_code = Some(error.code().into());
+    report
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -839,6 +876,53 @@ mod tests {
     }
 
     #[test]
+    fn unsafe_destination_after_shutdown_returns_a_structured_report() {
+        let (root, paths) = fixture("provider-unsafe-after-shutdown");
+        let config_path = paths.codex_home.join("config.toml");
+        fs::remove_file(&config_path).unwrap();
+        fs::create_dir(&config_path).unwrap();
+
+        let report = write_provider_files_at(&paths, "sk-new", true)
+            .expect("post-shutdown validation must return a report");
+
+        assert_eq!(report.outcome, ProviderWriteOutcome::FailedBeforeMutation);
+        assert!(report.codex_was_running);
+        assert_eq!(
+            report.error_code.as_deref(),
+            Some("provider_unsafe_destination")
+        );
+        assert!(report.backup_dir.is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn preimage_read_failure_after_shutdown_returns_a_structured_report() {
+        let (root, paths) = fixture("provider-read-after-shutdown");
+
+        let report = write_provider_files_at_with_fault(
+            &paths,
+            "sk-new",
+            true,
+            ProviderWriteFault::BeforePreimageRead,
+        )
+        .expect("post-shutdown read failure must return a report");
+
+        assert_eq!(report.outcome, ProviderWriteOutcome::FailedBeforeMutation);
+        assert!(report.codex_was_running);
+        assert_eq!(report.error_code.as_deref(), Some("provider_io"));
+        assert!(report.backup_dir.is_none());
+        assert_eq!(
+            fs::read_to_string(paths.codex_home.join("config.toml")).unwrap(),
+            "old-config"
+        );
+        assert_eq!(
+            read_local_api_key_at(&paths.codex_home).as_deref(),
+            Some("old")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn second_replace_failure_restores_both_preimages() {
         let (root, paths) = fixture("provider-rollback");
         let report = write_provider_files_at_with_fault(
@@ -848,6 +932,30 @@ mod tests {
             ProviderWriteFault::BeforeAuthReplace,
         )
         .unwrap();
+        assert_eq!(report.outcome, ProviderWriteOutcome::Restored);
+        assert!(report.rollback_verified);
+        assert_eq!(
+            fs::read_to_string(paths.codex_home.join("config.toml")).unwrap(),
+            "old-config"
+        );
+        assert_eq!(
+            read_local_api_key_at(&paths.codex_home).as_deref(),
+            Some("old")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn verification_mismatch_restores_both_preimages() {
+        let (root, paths) = fixture("provider-verification-rollback");
+        let report = write_provider_files_at_with_fault(
+            &paths,
+            "sk-new",
+            true,
+            ProviderWriteFault::VerificationMismatch,
+        )
+        .unwrap();
+
         assert_eq!(report.outcome, ProviderWriteOutcome::Restored);
         assert!(report.rollback_verified);
         assert_eq!(

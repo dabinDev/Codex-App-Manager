@@ -324,6 +324,47 @@ describe("ApiKeyList", () => {
 
     expect(await screen.findByRole("alert")).toHaveTextContent(message);
     expect(screen.getByText(WRITE_REPORT.backupDir!)).toBeVisible();
+    if (outcome === "recovery_required") {
+      expect(screen.queryByRole("button", { name: "Restart Codex" })).not.toBeInTheDocument();
+    } else {
+      expect(screen.getByRole("button", { name: "Restart Codex" })).toBeVisible();
+    }
+  });
+
+  it("does not offer restart when a restored report lacks rollback verification", async () => {
+    const user = userEvent.setup();
+    api.apiConfigWriteLocal.mockResolvedValue({
+      ...WRITE_REPORT,
+      outcome: "restored",
+      writeVerified: false,
+      rollbackVerified: false,
+      errorCode: "provider_io",
+    });
+    renderKeyList(list([activeKey()]));
+
+    await user.click(screen.getByRole("button", { name: "Write to computer" }));
+    await user.click(screen.getByRole("button", { name: "Back up and replace" }));
+
+    expect(await screen.findByRole("alert")).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Restart Codex" })).not.toBeInTheDocument();
+  });
+
+  it("does not offer restart after a failed write when Codex was already stopped", async () => {
+    const user = userEvent.setup();
+    api.apiConfigWriteLocal.mockResolvedValue({
+      ...WRITE_REPORT,
+      outcome: "failed_before_mutation",
+      codexWasRunning: false,
+      writeVerified: false,
+      errorCode: "provider_unsafe_destination",
+    });
+    renderKeyList(list([activeKey()]));
+
+    await user.click(screen.getByRole("button", { name: "Write to computer" }));
+    await user.click(screen.getByRole("button", { name: "Back up and replace" }));
+
+    expect(await screen.findByRole("alert")).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Restart Codex" })).not.toBeInTheDocument();
   });
 
   it("keeps restart available after a failed attempt", async () => {
