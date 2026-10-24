@@ -48,8 +48,10 @@ export function ModelImportSheet({
     setCodexCloseConfirmed(false);
     setTraeProbe(null);
     setTraeReport(null);
-    void managerApi
-      .apiConfigModels(apiKey.id)
+    const loadModels = destination === "codex"
+      ? managerApi.apiConfigModels(apiKey.id)
+      : managerApi.apiConfigTraeCodeModels(apiKey.id);
+    void loadModels
       .then((items) => {
         if (!cancelled) {
           const available = destination === "codex"

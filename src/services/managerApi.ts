@@ -962,6 +962,12 @@ export const managerApi = {
     if (invalid) return Promise.reject(invalid);
     return invoke<string[]>("api_config_models", { keyId }).then(guardApiConfigModels);
   },
+  apiConfigTraeCodeModels(keyId: number): Promise<string[]> {
+    if (!hasTauriRuntime()) return desktopRequired();
+    const invalid = modelImportRequestError(keyId);
+    if (invalid) return Promise.reject(invalid);
+    return invoke<string[]>("api_config_traecode_models", { keyId }).then(guardApiConfigModels);
+  },
   apiConfigImportCodex(
     keyId: number,
     models: string[],

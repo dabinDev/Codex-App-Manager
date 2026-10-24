@@ -1285,6 +1285,18 @@ pub async fn api_config_models(
 }
 
 #[tauri::command]
+pub async fn api_config_traecode_models(
+    state: State<'_, ManagerState>,
+    key_id: u64,
+) -> Result<Vec<String>, CommandError> {
+    state
+        .orange
+        .models_for_key(key_id)
+        .await
+        .map_err(orange_command_error)
+}
+
+#[tauri::command]
 pub async fn api_config_import_codex(
     state: State<'_, ManagerState>,
     key_id: u64,

@@ -841,6 +841,7 @@ fn run_tauri_app() {
             commands::api_config_login,
             commands::api_config_keys,
             commands::api_config_models,
+            commands::api_config_traecode_models,
             commands::api_config_import_codex,
             commands::api_config_probe_traecode,
             commands::api_config_import_traecode,
