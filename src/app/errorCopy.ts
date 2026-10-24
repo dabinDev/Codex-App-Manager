@@ -19,6 +19,7 @@ export interface FailureSurface {
 
 const CODE_COPY: Record<string, TKey> = {
   network: "error.network",
+  rate_limit: "error.rate_limit",
   timeout: "error.timeout",
   disk_space: "error.disk_space",
   disk_write: "error.disk_write",
@@ -39,6 +40,7 @@ const CODE_COPY: Record<string, TKey> = {
 /** Codes where a retry / settings change / closing Codex is a reasonable next step. */
 const RECOVERABLE = new Set([
   "network",
+  "rate_limit",
   "timeout",
   "disk_space",
   "disk_write",
@@ -58,7 +60,16 @@ export function resolveFailure(cause: unknown, t: TFn): FailureSurface {
   const code = errorCode(cause) ?? "unknown";
   const raw = errorMessage(cause).trim();
   const key = CODE_COPY[code] ?? "error.generic";
-  const message = t(key);
+  let message = t(key);
+  if (code === "rate_limit" && typeof cause === "object" && cause !== null && "retryAfterUnix" in cause) {
+    const timestamp = cause.retryAfterUnix;
+    if (typeof timestamp === "number") {
+      const retryAt = new Date(timestamp * 1000);
+      if (Number.isFinite(retryAt.getTime())) {
+        message = t("error.rate_limit_reset", { time: retryAt.toLocaleString(document.documentElement.lang || undefined) });
+      }
+    }
+  }
   // Never surface raw engine / PowerShell / OS text as primary copy. Keep it
   // only when it actually adds diagnostic value beyond the localized line.
   const detail = raw && raw !== message && raw !== code ? raw : null;
@@ -73,6 +84,15 @@ export function resolveFailure(cause: unknown, t: TFn): FailureSurface {
 /** Localized primary message only — safe for banners and toasts. */
 export function userErrorMessage(cause: unknown, t: TFn): string {
   return resolveFailure(cause, t).message;
+}
+
+/**
+ * Localized message for a bare stable failure code, as carried by a backend
+ * snapshot (e.g. the Manager self-update runtime) rather than a rejected
+ * invoke. A missing code falls back to the generic copy.
+ */
+export function codeErrorMessage(code: string | null, t: TFn): string {
+  return userErrorMessage({ code: code ?? "unknown" }, t);
 }
 
 /** Build a FailureSurface from already-localized copy (no raw detail). */

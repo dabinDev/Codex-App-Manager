@@ -11,10 +11,12 @@
 //! `simulated_build` lets the UI preview the delta path even when the machine is
 //! already on the latest build (the user's case during development).
 
-use std::path::{Path, PathBuf};
+use std::io::Read;
+use std::net::IpAddr;
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use codex_mac_engine::{
     apply_delta, download, gate_reconstructed, parse_appcast, plan_update, quit_codex_at, relaunch,
@@ -23,20 +25,43 @@ use codex_mac_engine::{
 };
 
 use crate::app::disk;
-use crate::app::install_tx::{ActiveInstallTx, InstallTxKind};
+use crate::app::install_tx::{ActiveInstallTx, InstallTxKind, SelfUpdatePolicyTransition};
 use crate::app::op_phase::OperationPhase;
 use crate::app::operation_outcome::{recovery, OperationOutcome, StepOutcome};
 use crate::app::provenance::ProvenanceStore;
+use crate::app::release_install::{
+    resolved_local_asset, verify_file_digest, ReleaseArchitecture, ReleasePackageFormat,
+    ResolvedReleaseAsset,
+};
 use crate::app::settings_store::UpdateSource;
 use crate::app::staging::{self, StagingDir};
-use crate::app::url_guard::validate_custom_source;
+use crate::app::url_guard::{
+    custom_source_host, resolve_custom_source, resolve_custom_source_with_addresses,
+    ResolvedCustomUrl, UrlRejectReason,
+};
 use crate::errors::AppError;
 
 /// Optional hook for the command layer to publish operation phases (quit policy).
 pub type PhaseHook<'a> = dyn Fn(OperationPhase) + Send + Sync + 'a;
 
+/// Completion evidence for historical installs. This keeps renderer recovery
+/// honest if the invoke is lost across the destructive rename window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoricalMacEvidence {
+    MutationStarted,
+    MutationRolledBack,
+}
+
+pub type HistoricalEvidenceHook<'a> = dyn Fn(HistoricalMacEvidence) + Send + Sync + 'a;
+pub type BeforeHistoricalCommitHook<'a> = dyn Fn() -> Result<(), AppError> + Send + Sync + 'a;
+pub type AfterHistoricalRollbackHook<'a> = dyn Fn() -> Result<(), AppError> + Send + Sync + 'a;
+
 const DITTO: &str = "/usr/bin/ditto";
 const OPEN: &str = "/usr/bin/open";
+const MAX_APP_PACKAGE_ENTRIES: usize = 200_000;
+const MAX_APP_EXPANDED_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+const APP_EXPANSION_HEADROOM_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_ZIP_SYMLINK_TARGET_BYTES: u64 = 16 * 1024;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -66,6 +91,7 @@ pub struct MacUpdateReport {
     /// `<pubDate>` of the latest appcast item — the release date of the update
     /// target, when the feed publishes it.
     pub latest_pub_date: Option<String>,
+    pub compatibility: Option<codex_mac_engine::compatibility::MacOsCompatibility>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -120,10 +146,168 @@ fn arch_of(installed: &Option<InstalledCodex>) -> &str {
         .unwrap_or(std::env::consts::ARCH)
 }
 
-fn fetch_one(url: String, network: &NetworkConfig) -> Result<(String, String), AppError> {
+struct FetchedAppcast {
+    url: String,
+    xml: String,
+    /// Custom feeds are untrusted network input. Their enclosure destinations
+    /// must receive the same runtime DNS/IP pinning as the feed itself.
+    restrict_downloads: bool,
+}
+
+const PROXY_DOH_ENDPOINT: &str = "https://dns.google/resolve";
+const PROXY_DOH_TIMEOUT_SECS: u64 = 15;
+
+#[derive(Deserialize)]
+struct DohResponse {
+    #[serde(rename = "Status")]
+    status: u32,
+    #[serde(rename = "Answer", default)]
+    answers: Vec<DohAnswer>,
+}
+
+#[derive(Deserialize)]
+struct DohAnswer {
+    #[serde(rename = "type")]
+    record_type: u16,
+    data: String,
+}
+
+fn parse_doh_addresses(json: &str) -> Result<Vec<IpAddr>, UrlRejectReason> {
+    let response: DohResponse =
+        serde_json::from_str(json).map_err(|_| UrlRejectReason::DnsResolutionFailed)?;
+    if response.status != 0 {
+        return Err(UrlRejectReason::DnsResolutionFailed);
+    }
+    let mut addresses = Vec::new();
+    for answer in response.answers {
+        if !matches!(answer.record_type, 1 | 28) {
+            continue;
+        }
+        let address = answer
+            .data
+            .parse::<IpAddr>()
+            .map_err(|_| UrlRejectReason::DnsResolutionFailed)?;
+        if !addresses.contains(&address) {
+            addresses.push(address);
+        }
+    }
+    Ok(addresses)
+}
+
+fn resolve_host_via_proxy_doh(
+    host: &str,
+    network: &NetworkConfig,
+) -> Result<Vec<IpAddr>, UrlRejectReason> {
+    let mut addresses = Vec::new();
+    for record_type in ["A", "AAAA"] {
+        let mut endpoint = url::Url::parse(PROXY_DOH_ENDPOINT)
+            .map_err(|_| UrlRejectReason::DnsResolutionFailed)?;
+        endpoint
+            .query_pairs_mut()
+            .append_pair("name", host)
+            .append_pair("type", record_type);
+        let json = sys::fetch_text_no_redirect_with_network(
+            endpoint.as_str(),
+            PROXY_DOH_TIMEOUT_SECS,
+            network,
+        )
+        .map_err(|_| {
+            log::warn!("proxy DoH query failed record_type={record_type}");
+            UrlRejectReason::DnsResolutionFailed
+        })?;
+        for address in parse_doh_addresses(&json)? {
+            if !addresses.contains(&address) {
+                addresses.push(address);
+            }
+        }
+    }
+    if addresses.is_empty() {
+        return Err(UrlRejectReason::DnsResolutionFailed);
+    }
+    Ok(addresses)
+}
+
+fn resolve_custom_source_for_network(
+    raw: &str,
+    network: &NetworkConfig,
+) -> Result<ResolvedCustomUrl, UrlRejectReason> {
+    resolve_custom_source_for_network_with(raw, network, resolve_custom_source, |host| {
+        resolve_host_via_proxy_doh(host, network)
+    })
+}
+
+fn resolve_custom_source_for_network_with<F, G>(
+    raw: &str,
+    network: &NetworkConfig,
+    local_resolver: F,
+    proxy_resolver: G,
+) -> Result<ResolvedCustomUrl, UrlRejectReason>
+where
+    F: FnOnce(&str) -> Result<ResolvedCustomUrl, UrlRejectReason>,
+    G: FnOnce(&str) -> Result<Vec<IpAddr>, UrlRejectReason>,
+{
+    match local_resolver(raw) {
+        Err(UrlRejectReason::DnsResolutionFailed) if network.routes_through_proxy() => {
+            let host = custom_source_host(raw)?;
+            let addresses = proxy_resolver(&host)?;
+            resolve_custom_source_with_addresses(raw, addresses)
+        }
+        result => result,
+    }
+}
+
+fn fetch_one(
+    url: String,
+    network: &NetworkConfig,
+    restrict_downloads: bool,
+) -> Result<FetchedAppcast, AppError> {
     let xml =
         sys::fetch_text_with_network(&url, network).map_err(|e| AppError::Engine(e.to_string()))?;
-    Ok((url, xml))
+    Ok(FetchedAppcast {
+        url,
+        xml,
+        restrict_downloads,
+    })
+}
+
+fn pinned_network_candidates(
+    network: &NetworkConfig,
+    host: &str,
+    port: u16,
+    addresses: &[IpAddr],
+) -> Vec<NetworkConfig> {
+    addresses
+        .iter()
+        .map(|address| network.with_https_destination_pin(host, port, *address))
+        .collect()
+}
+
+fn fetch_custom_appcast(
+    url: String,
+    host: &str,
+    port: u16,
+    addresses: &[IpAddr],
+    network: &NetworkConfig,
+) -> Result<FetchedAppcast, AppError> {
+    let candidates = pinned_network_candidates(network, host, port, addresses);
+    let candidate_count = candidates.len();
+    let mut last_error = None;
+    for (index, candidate) in candidates.iter().enumerate() {
+        match fetch_one(url.clone(), candidate, true) {
+            Ok(fetched) => return Ok(fetched),
+            Err(error) => {
+                log::warn!(
+                    "custom macOS appcast address attempt failed candidate={}/{} error={error}",
+                    index + 1,
+                    candidate_count
+                );
+                last_error = Some(error);
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        AppError::Engine("自定义更新源域名解析失败：没有可用的公网地址".to_string())
+    }))
 }
 
 /// Latest build number advertised by an appcast XML, or 0 if it can't be parsed.
@@ -134,26 +318,29 @@ fn latest_build_of(xml: &str) -> u64 {
         .unwrap_or(0)
 }
 
-/// Fetch the appcast XML honoring the configured source — returns (url, xml).
+/// Fetch the appcast XML honoring the configured source.
 /// `auto` tries the CN-reachable mirror first and falls back to OpenAI official
 /// when the mirror is unreachable; `mirror` / `official` / `custom` use exactly
 /// that source (custom falls back to the mirror when its URL is blank).
-fn fetch_appcast_for_arch(
-    arch: &str,
-    network: &NetworkConfig,
-) -> Result<(String, String), AppError> {
+fn fetch_appcast_for_arch(arch: &str, network: &NetworkConfig) -> Result<FetchedAppcast, AppError> {
     let settings = crate::app::settings_store::AppSettings::load();
     match settings.source {
-        UpdateSource::Official => fetch_one(official_for_arch(arch).to_string(), network),
-        UpdateSource::Mirror => fetch_one(appcast_for_arch(arch).to_string(), network),
+        UpdateSource::Official => fetch_one(official_for_arch(arch).to_string(), network, false),
+        UpdateSource::Mirror => fetch_one(appcast_for_arch(arch).to_string(), network, false),
         UpdateSource::Custom => {
             let u = settings.custom_url.trim();
-            let url = if u.is_empty() {
-                appcast_for_arch(arch).to_string()
-            } else {
-                validate_custom_source(u).map_err(|e| AppError::Engine(e.to_string()))?
-            };
-            fetch_one(url, network)
+            if u.is_empty() {
+                return fetch_one(appcast_for_arch(arch).to_string(), network, false);
+            }
+            let resolved = resolve_custom_source_for_network(u, network)
+                .map_err(|e| AppError::Engine(format!("自定义更新源被拒绝：{e}")))?;
+            fetch_custom_appcast(
+                resolved.url,
+                &resolved.host,
+                resolved.port,
+                &resolved.addresses,
+                network,
+            )
         }
         UpdateSource::Auto => {
             // auto: pick the higher build between the CN-reachable mirror and
@@ -170,13 +357,29 @@ fn fetch_appcast_for_arch(
             match (mirror, official) {
                 (Some(m), Some(o)) => {
                     if latest_build_of(&o) > latest_build_of(&m) {
-                        Ok((official_url, o))
+                        Ok(FetchedAppcast {
+                            url: official_url,
+                            xml: o,
+                            restrict_downloads: false,
+                        })
                     } else {
-                        Ok((mirror_url, m))
+                        Ok(FetchedAppcast {
+                            url: mirror_url,
+                            xml: m,
+                            restrict_downloads: false,
+                        })
                     }
                 }
-                (Some(m), None) => Ok((mirror_url, m)),
-                (None, Some(o)) => Ok((official_url, o)),
+                (Some(m), None) => Ok(FetchedAppcast {
+                    url: mirror_url,
+                    xml: m,
+                    restrict_downloads: false,
+                }),
+                (None, Some(o)) => Ok(FetchedAppcast {
+                    url: official_url,
+                    xml: o,
+                    restrict_downloads: false,
+                }),
                 (None, None) => Err(AppError::Engine(
                     "both the mirror and OpenAI official appcast are unreachable".to_string(),
                 )),
@@ -192,7 +395,7 @@ fn parse_macos_version(s: &str) -> Option<(u32, u32)> {
     Some((major, minor))
 }
 
-fn host_macos_version() -> Option<(u32, u32)> {
+fn host_macos_version_string() -> Option<String> {
     let out = std::process::Command::new("sw_vers")
         .arg("-productVersion")
         .output()
@@ -200,7 +403,13 @@ fn host_macos_version() -> Option<(u32, u32)> {
     if !out.status.success() {
         return None;
     }
-    parse_macos_version(&String::from_utf8_lossy(&out.stdout))
+    Some(String::from_utf8(out.stdout).ok()?.trim().to_string())
+}
+
+fn host_macos_version() -> Option<(u32, u32)> {
+    host_macos_version_string()
+        .as_deref()
+        .and_then(parse_macos_version)
 }
 
 /// Reject staging/installing an update the host macOS is too old to run. If the
@@ -346,14 +555,16 @@ pub fn plan_macos_update_with_network(
 ) -> Result<MacUpdateReport, AppError> {
     log::info!("macOS plan start simulated_build={simulated_build:?}");
     let installed = detect_managed_installed();
-    let (appcast_url, xml) = fetch_appcast_for_arch(arch_of(&installed), network)?;
-    let appcast = parse_appcast(&xml).map_err(|e| AppError::Engine(e.to_string()))?;
+    let fetched = fetch_appcast_for_arch(arch_of(&installed), network)?;
+    let appcast = parse_appcast(&fetched.xml).map_err(|e| AppError::Engine(e.to_string()))?;
     let plan = plan_update(&appcast, effective_build(simulated_build, &installed));
 
     let latest = appcast.latest();
-    if let Some(latest) = latest {
-        require_os_supported(latest.minimum_system_version.as_deref())?;
-    }
+    // Checking remains read-only and successful even when the update cannot run.
+    // Staging and install paths still enforce their existing OS guards.
+    let compatibility = host_macos_version_string()
+        .as_deref()
+        .and_then(|host| codex_mac_engine::compatibility::update_compatibility(&appcast, host));
     let latest_pub_date = latest.and_then(|latest| latest.pub_date.clone());
 
     // Release date of the *installed* build (its own appcast item), so it stays
@@ -368,12 +579,13 @@ pub fn plan_macos_update_with_network(
     });
 
     let report = MacUpdateReport {
-        appcast_url,
+        appcast_url: fetched.url,
         installed,
         simulated_build,
         plan,
         installed_pub_date,
         latest_pub_date,
+        compatibility,
     };
     let installed_build = report.installed.as_ref().map(|installed| installed.build);
     let latest_build = report.plan.as_ref().map(|plan| plan.latest_build);
@@ -489,6 +701,7 @@ fn download_and_verify(
     signature: &str,
     progress: &dyn Fn(DownloadProgress),
     network: &NetworkConfig,
+    restrict_destination: bool,
 ) -> Result<PathBuf, AppError> {
     let source = host_of(url);
     log::info!("macOS download and verify start source={source}");
@@ -497,6 +710,13 @@ fn download_and_verify(
             "artifact size {size} exceeds {max_size} byte limit"
         )));
     }
+    let download_networks = if restrict_destination {
+        let resolved = resolve_custom_source_for_network(url, network)
+            .map_err(|e| AppError::Engine(format!("自定义更新下载地址被拒绝：{e}")))?;
+        pinned_network_candidates(network, &resolved.host, resolved.port, &resolved.addresses)
+    } else {
+        vec![network.clone()]
+    };
     let file_name = url.rsplit('/').next().unwrap_or("payload.bin");
     // Download into the PERSISTENT cache (not a per-run staging dir): a paused
     // `.part` survives here, so the next perform/install resumes it instead of
@@ -516,20 +736,49 @@ fn download_and_verify(
             source,
         });
     } else {
-        download::download_to_with_progress_bounded_with_network(
-            url,
-            &dest,
-            max_size,
-            &|downloaded| {
-                progress(DownloadProgress {
-                    downloaded,
-                    total: size,
-                    source: source.clone(),
-                });
-            },
-            network,
-        )
-        .map_err(|e| AppError::Engine(e.to_string()))?;
+        let candidate_count = download_networks.len();
+        let mut last_error = None;
+        for (index, download_network) in download_networks.iter().enumerate() {
+            match download::download_to_with_progress_bounded_with_network(
+                url,
+                &dest,
+                max_size,
+                &|downloaded| {
+                    progress(DownloadProgress {
+                        downloaded,
+                        total: size,
+                        source: source.clone(),
+                    });
+                },
+                download_network,
+            ) {
+                Ok(_) => {
+                    last_error = None;
+                    break;
+                }
+                Err(error) if download::is_cancelled_error(&error) => {
+                    return Err(AppError::Engine(error.to_string()));
+                }
+                Err(error) => {
+                    log::warn!(
+                        "macOS download address attempt failed candidate={}/{} error={error}",
+                        index + 1,
+                        candidate_count
+                    );
+                    last_error = Some(error);
+                }
+            }
+        }
+        if let Some(error) = last_error {
+            return Err(AppError::Engine(format!(
+                "all validated download addresses failed: {error}"
+            )));
+        }
+        if candidate_count == 0 {
+            return Err(AppError::Engine(
+                "自定义更新下载地址域名解析失败：没有可用的公网地址".to_string(),
+            ));
+        }
     }
 
     let len = std::fs::metadata(&dest)
@@ -580,8 +829,8 @@ pub fn stage_macos_update_with_network(
     // make the NEXT perform/install abort itself at its first checkpoint.
     let _abort_guard = AbortGuard::new();
     let installed = detect_managed_installed();
-    let (_, xml) = fetch_appcast_for_arch(arch_of(&installed), network)?;
-    let appcast = parse_appcast(&xml).map_err(|e| AppError::Engine(e.to_string()))?;
+    let fetched = fetch_appcast_for_arch(arch_of(&installed), network)?;
+    let appcast = parse_appcast(&fetched.xml).map_err(|e| AppError::Engine(e.to_string()))?;
     let plan = plan_update(&appcast, effective_build(simulated_build, &installed))
         .ok_or_else(|| AppError::Engine("appcast had no items".to_string()))?;
 
@@ -621,6 +870,7 @@ pub fn stage_macos_update_with_network(
         &signature,
         &no_progress,
         network,
+        fetched.restrict_downloads,
     ) {
         Ok(dest) => dest,
         Err(err) => {
@@ -689,6 +939,8 @@ pub struct PerformExpectation {
 /// extracted bundle still passes `codesign`/Gatekeeper. The found bundle is
 /// moved to `out_app` (both live under the same-volume `work` dir).
 fn unpack_app_zip(zip: &Path, work: &Path, out_app: &Path) -> Result<(), AppError> {
+    preflight_app_zip(zip, work)?;
+
     let extract = work.join("unzip");
     let _ = std::fs::remove_dir_all(&extract);
     std::fs::create_dir_all(&extract).map_err(|e| AppError::Engine(format!("mkdir unzip: {e}")))?;
@@ -709,6 +961,10 @@ fn unpack_app_zip(zip: &Path, work: &Path, out_app: &Path) -> Result<(), AppErro
     // pre-merge, ChatGPT.app post-merge); identity is checked, and the rename
     // below normalizes whatever we accepted to the caller's canonical out_app.
     let found = require_single_codex_app(&extract)?;
+    // Defense in depth against parser differentials between the Rust ZIP reader
+    // and ditto: the actual extracted bundle must still fit the same hard tree
+    // budget before it can become the install candidate.
+    extracted_app_logical_size(&found)?;
     if out_app.exists() {
         let _ = std::fs::remove_dir_all(out_app);
     }
@@ -717,13 +973,432 @@ fn unpack_app_zip(zip: &Path, work: &Path, out_app: &Path) -> Result<(), AppErro
     Ok(())
 }
 
+/// Validate archive paths and stream every entry through the real decompressor
+/// before `ditto` writes anything. Central-directory sizes are attacker input:
+/// they are used only as a consistency check, never as the expansion budget.
+/// Native extraction is still required to preserve signatures, but only after
+/// the measured output bytes fit the hard limit and available-space budget.
+fn preflight_app_zip(path: &Path, work: &Path) -> Result<(), AppError> {
+    preflight_app_zip_with_available(path, work, disk::available_space)
+}
+
+fn preflight_app_zip_with_available<F>(
+    path: &Path,
+    work: &Path,
+    available: F,
+) -> Result<(), AppError>
+where
+    F: Fn(&Path) -> Result<Option<u64>, AppError>,
+{
+    let metadata =
+        std::fs::metadata(path).map_err(|e| AppError::Engine(format!("读取 ZIP 信息失败: {e}")))?;
+    if !metadata.is_file()
+        || metadata.len() == 0
+        || metadata.len() > codex_mac_engine::limits::MAX_PACKAGE_BYTES
+    {
+        return Err(AppError::Engine(format!(
+            "ZIP 大小 {} 超出允许范围",
+            metadata.len()
+        )));
+    }
+
+    let file =
+        std::fs::File::open(path).map_err(|e| AppError::Engine(format!("打开 ZIP 失败: {e}")))?;
+    let mut archive = zip::ZipArchive::new(file)
+        .map_err(|e| AppError::Engine(format!("读取 ZIP 目录失败: {e}")))?;
+    if archive.is_empty() || archive.len() > MAX_APP_PACKAGE_ENTRIES {
+        return Err(AppError::Engine(format!(
+            "ZIP 条目数 {} 超出允许范围",
+            archive.len()
+        )));
+    }
+
+    let mut expanded_bytes = 0_u64;
+    for index in 0..archive.len() {
+        let mut entry = archive
+            .by_index(index)
+            .map_err(|e| AppError::Engine(format!("读取 ZIP 条目失败: {e}")))?;
+        let entry_name = codex_archive::entry_name(&entry)
+            .map_err(|e| AppError::Engine(format!("读取 ZIP 条目名称失败: {e}")))?
+            .into_owned();
+        let Some(enclosed) = codex_archive::enclosed_path(&entry_name) else {
+            return Err(AppError::Engine(format!(
+                "ZIP 包含不安全路径：{}",
+                entry_name
+            )));
+        };
+        let declared_size = entry.size();
+        // Oversized declarations are safe to reject early. A forged *small*
+        // declaration is caught below by counting actual decompressor output.
+        let remaining = MAX_APP_EXPANDED_BYTES.saturating_sub(expanded_bytes);
+        if declared_size > remaining {
+            return Err(AppError::Engine(format!(
+                "ZIP 声明解压后大小超出允许范围：{}",
+                entry_name
+            )));
+        }
+
+        let actual_size = if entry.is_symlink() {
+            if declared_size == 0 || declared_size > MAX_ZIP_SYMLINK_TARGET_BYTES {
+                return Err(AppError::Engine(format!(
+                    "ZIP 包含无效符号链接：{}",
+                    entry_name
+                )));
+            }
+            let mut target = Vec::new();
+            let actual = (&mut entry)
+                .take(MAX_ZIP_SYMLINK_TARGET_BYTES + 1)
+                .read_to_end(&mut target)
+                .map_err(|e| AppError::Engine(format!("读取 ZIP 符号链接失败: {e}")))?;
+            let actual = actual as u64;
+            if actual == 0 || actual > MAX_ZIP_SYMLINK_TARGET_BYTES {
+                return Err(AppError::Engine(format!(
+                    "ZIP 符号链接实际展开大小超出允许范围：{}",
+                    entry_name
+                )));
+            }
+            let target = String::from_utf8(target).map_err(|_| {
+                AppError::Engine(format!("ZIP 符号链接目标不是 UTF-8：{}", entry_name))
+            })?;
+            validate_zip_symlink_target(&enclosed, &target)?;
+            actual
+        } else {
+            std::io::copy(
+                &mut (&mut entry).take(remaining.saturating_add(1)),
+                &mut std::io::sink(),
+            )
+            .map_err(|e| AppError::Engine(format!("展开 ZIP 条目失败: {e}")))?
+        };
+        if actual_size > remaining {
+            return Err(AppError::Engine(format!(
+                "ZIP 实际解压后大小超出允许范围：{}",
+                entry_name
+            )));
+        }
+        if actual_size != declared_size {
+            return Err(AppError::Engine(format!(
+                "ZIP 条目声明大小与实际展开大小不一致：{}（{} != {}），拒绝安装",
+                entry_name,
+                declared_size,
+                actual_size
+            )));
+        }
+        expanded_bytes = checked_zip_expanded_bytes(expanded_bytes, actual_size)?;
+    }
+    require_zip_expansion_space(expanded_bytes, work, available)?;
+    Ok(())
+}
+
+/// Official signed app bundles contain relative framework/node symlinks, so a
+/// blanket symlink ban would reject real GitHub ZIP assets. Allow only nested,
+/// relative links whose lexical destination remains inside the same top-level
+/// `.app`; in particular the `.app` itself can never be a link to a machine-local
+/// signed installation.
+fn validate_zip_symlink_target(link: &Path, target: &str) -> Result<(), AppError> {
+    let components = link.components().collect::<Vec<_>>();
+    let app_root = match components.as_slice() {
+        [Component::Normal(root), _, ..]
+            if Path::new(root).extension().is_some_and(|x| x == "app") =>
+        {
+            root.to_os_string()
+        }
+        _ => {
+            return Err(AppError::Engine(format!(
+                "ZIP 符号链接不在物理 .app 目录内：{}",
+                link.display()
+            )))
+        }
+    };
+    if target.is_empty() || target.contains('\0') {
+        return Err(AppError::Engine(format!(
+            "ZIP 符号链接目标无效：{}",
+            link.display()
+        )));
+    }
+
+    let mut resolved = link
+        .parent()
+        .into_iter()
+        .flat_map(Path::components)
+        .filter_map(|component| match component {
+            Component::Normal(value) => Some(value.to_os_string()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    for component in Path::new(target).components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(value) => resolved.push(value.to_os_string()),
+            Component::ParentDir if resolved.len() > 1 => {
+                resolved.pop();
+            }
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(AppError::Engine(format!(
+                    "ZIP 符号链接会逃出应用目录：{} -> {target}",
+                    link.display()
+                )))
+            }
+        }
+    }
+    if resolved.first() != Some(&app_root) {
+        return Err(AppError::Engine(format!(
+            "ZIP 符号链接会逃出应用目录：{} -> {target}",
+            link.display()
+        )));
+    }
+    Ok(())
+}
+
+fn require_zip_expansion_space<F>(
+    expanded_bytes: u64,
+    work: &Path,
+    available: F,
+) -> Result<(), AppError>
+where
+    F: Fn(&Path) -> Result<Option<u64>, AppError>,
+{
+    let need = expanded_bytes.saturating_add(APP_EXPANSION_HEADROOM_BYTES);
+    if let Some(free) = available(work)? {
+        if free < need {
+            return Err(AppError::Engine(format!(
+                "磁盘可用空间不足：ZIP 解压约需 {}，当前可用 {}。请清理后重试",
+                human_bytes(need),
+                human_bytes(free)
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn checked_zip_expanded_bytes(current: u64, entry_size: u64) -> Result<u64, AppError> {
+    let total = current
+        .checked_add(entry_size)
+        .ok_or_else(|| AppError::Engine("ZIP 解压大小溢出，拒绝安装".to_string()))?;
+    if total > MAX_APP_EXPANDED_BYTES {
+        return Err(AppError::Engine(format!(
+            "ZIP 解压后大小 {total} 超出允许范围"
+        )));
+    }
+    Ok(total)
+}
+
+fn preflight_app_dmg_with_available<F>(
+    dmg: &Path,
+    work: &Path,
+    available: F,
+) -> Result<(), AppError>
+where
+    F: Fn(&Path) -> Result<Option<u64>, AppError>,
+{
+    const HEADROOM: u64 = 512 * 1024 * 1024;
+    let metadata =
+        std::fs::metadata(dmg).map_err(|e| AppError::Engine(format!("读取 DMG 信息失败: {e}")))?;
+    let size = metadata.len();
+    if !metadata.is_file() || size == 0 || size > codex_mac_engine::limits::MAX_PACKAGE_BYTES {
+        return Err(AppError::Engine(format!("DMG 大小 {size} 超出允许范围")));
+    }
+    let need = size.saturating_mul(4).saturating_add(HEADROOM);
+    if let Some(free) = available(work)? {
+        if free < need {
+            return Err(AppError::Engine(format!(
+                "磁盘可用空间不足：检查 DMG 约需 {}，当前可用 {}。请清理后重试",
+                human_bytes(need),
+                human_bytes(free)
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn preflight_app_dmg(dmg: &Path, work: &Path) -> Result<(), AppError> {
+    preflight_app_dmg_with_available(dmg, work, disk::available_space)
+}
+
+/// Measure the mounted bundle itself before `ditto` copies it. A compressed DMG
+/// has no trustworthy fixed expansion ratio, so the image-file preflight above
+/// is only an early rejection; this walk is the authoritative copy budget.
+/// Symlinks are counted as entries but never followed into the host filesystem.
+fn mounted_app_logical_size(app: &Path) -> Result<u64, AppError> {
+    physical_app_logical_size(app, "DMG 应用")
+}
+
+fn extracted_app_logical_size(app: &Path) -> Result<u64, AppError> {
+    physical_app_logical_size(app, "ZIP 应用")
+}
+
+fn physical_app_logical_size(app: &Path, label: &str) -> Result<u64, AppError> {
+    let metadata = std::fs::symlink_metadata(app)
+        .map_err(|e| AppError::Engine(format!("读取{label}信息失败: {e}")))?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(AppError::Engine(format!("{label}不是物理目录，拒绝复制")));
+    }
+
+    let mut pending = vec![app.to_path_buf()];
+    let mut entries = 0_usize;
+    let mut logical_bytes = 0_u64;
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir)
+            .map_err(|e| AppError::Engine(format!("读取{label}目录失败: {e}")))?
+        {
+            let entry = entry.map_err(|e| AppError::Engine(format!("读取{label}条目失败: {e}")))?;
+            entries = entries
+                .checked_add(1)
+                .ok_or_else(|| AppError::Engine("DMG 应用条目数溢出，拒绝安装".to_string()))?;
+            if entries > MAX_APP_PACKAGE_ENTRIES {
+                return Err(AppError::Engine(format!(
+                    "{label}条目数 {entries} 超出允许范围"
+                )));
+            }
+
+            let file_type = entry
+                .file_type()
+                .map_err(|e| AppError::Engine(format!("读取{label}条目类型失败: {e}")))?;
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
+                pending.push(entry.path());
+            } else if file_type.is_file() {
+                let size = entry
+                    .metadata()
+                    .map_err(|e| AppError::Engine(format!("读取{label}文件大小失败: {e}")))?
+                    .len();
+                logical_bytes = checked_app_expanded_bytes(logical_bytes, size, label)?;
+            } else {
+                return Err(AppError::Engine(format!(
+                    "{label}包含不支持的特殊文件：{}",
+                    entry.path().display()
+                )));
+            }
+        }
+    }
+    if entries == 0 || logical_bytes == 0 {
+        return Err(AppError::Engine(format!("{label}内容为空，拒绝安装")));
+    }
+    Ok(logical_bytes)
+}
+
+fn checked_app_expanded_bytes(current: u64, entry_size: u64, label: &str) -> Result<u64, AppError> {
+    let total = current
+        .checked_add(entry_size)
+        .ok_or_else(|| AppError::Engine(format!("{label}大小溢出，拒绝安装")))?;
+    if total > MAX_APP_EXPANDED_BYTES {
+        return Err(AppError::Engine(format!(
+            "{label}大小 {total} 超出允许范围"
+        )));
+    }
+    Ok(total)
+}
+
+fn preflight_mounted_app_copy_with_available<F>(
+    app: &Path,
+    work: &Path,
+    available: F,
+) -> Result<(), AppError>
+where
+    F: Fn(&Path) -> Result<Option<u64>, AppError>,
+{
+    let logical_bytes = mounted_app_logical_size(app)?;
+    let need = logical_bytes.saturating_add(APP_EXPANSION_HEADROOM_BYTES);
+    if let Some(free) = available(work)? {
+        if free < need {
+            return Err(AppError::Engine(format!(
+                "磁盘可用空间不足：复制 DMG 应用约需 {}，当前可用 {}。请清理后重试",
+                human_bytes(need),
+                human_bytes(free)
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn preflight_mounted_app_copy(app: &Path, work: &Path) -> Result<(), AppError> {
+    preflight_mounted_app_copy_with_available(app, work, disk::available_space)
+}
+
+/// Mount a GitHub Release DMG read-only, copy its single Codex-lineage app with
+/// `ditto` (preserving signature metadata), then detach before installation.
+fn unpack_app_dmg(dmg: &Path, work: &Path, out_app: &Path) -> Result<(), AppError> {
+    const HDIUTIL: &str = "/usr/bin/hdiutil";
+    // Fail before hdiutil can mount or ditto can expand an oversized local
+    // image. This is also used by the offline picker inspection path.
+    preflight_app_dmg(dmg, work)?;
+    let mount = work.join("dmg-mount");
+    let _ = std::fs::remove_dir_all(&mount);
+    std::fs::create_dir_all(&mount)
+        .map_err(|e| AppError::Engine(format!("创建 DMG 挂载目录失败: {e}")))?;
+    let attach = std::process::Command::new(HDIUTIL)
+        .args([
+            "attach",
+            "-readonly",
+            "-nobrowse",
+            "-noautoopen",
+            "-mountpoint",
+        ])
+        .arg(&mount)
+        .arg(dmg)
+        .status()
+        .map_err(|e| AppError::Engine(format!("启动 hdiutil 失败: {e}")))?;
+    if !attach.success() {
+        return Err(AppError::Engine(format!(
+            "hdiutil 挂载 DMG 失败（{attach}）"
+        )));
+    }
+
+    let copy_result = (|| -> Result<(), AppError> {
+        let found = require_single_codex_app(&mount)?;
+        preflight_mounted_app_copy(&found, work)?;
+        if out_app.exists() {
+            std::fs::remove_dir_all(out_app)
+                .map_err(|e| AppError::Engine(format!("清理旧暂存应用失败: {e}")))?;
+        }
+        let status = std::process::Command::new(DITTO)
+            .arg(&found)
+            .arg(out_app)
+            .status()
+            .map_err(|e| AppError::Engine(format!("从 DMG 复制应用失败: {e}")))?;
+        if !status.success() {
+            return Err(AppError::Engine(format!(
+                "ditto 从 DMG 复制应用失败（{status}）"
+            )));
+        }
+        Ok(())
+    })();
+
+    let detach = std::process::Command::new(HDIUTIL)
+        .args(["detach"])
+        .arg(&mount)
+        .status()
+        .map_err(|e| AppError::Engine(format!("启动 hdiutil detach 失败: {e}")))?;
+    if !detach.success() {
+        return Err(AppError::Engine(format!(
+            "DMG 已读取但无法安全卸载（{detach}），拒绝继续安装"
+        )));
+    }
+    copy_result
+}
+
 fn require_single_codex_app(dir: &Path) -> Result<PathBuf, AppError> {
     let mut apps = Vec::new();
     for entry in std::fs::read_dir(dir).map_err(|e| AppError::Engine(format!("read unzip: {e}")))? {
-        let path = entry
-            .map_err(|e| AppError::Engine(format!("read unzip entry: {e}")))?
-            .path();
-        if path.is_dir() && path.extension().map(|x| x == "app").unwrap_or(false) {
+        let entry = entry.map_err(|e| AppError::Engine(format!("read unzip entry: {e}")))?;
+        let path = entry.path();
+        if path.extension().is_some_and(|x| x == "app")
+            && entry
+                .file_type()
+                .map_err(|e| AppError::Engine(format!("read unzip entry type: {e}")))?
+                .is_symlink()
+        {
+            return Err(AppError::Engine(
+                "安装包的顶层 .app 是符号链接，拒绝跟随本机路径".to_string(),
+            ));
+        }
+        if entry
+            .file_type()
+            .map_err(|e| AppError::Engine(format!("read unzip entry type: {e}")))?
+            .is_dir()
+            && path.extension().is_some_and(|x| x == "app")
+        {
             apps.push(path);
         }
     }
@@ -738,6 +1413,15 @@ fn require_single_codex_app(dir: &Path) -> Result<PathBuf, AppError> {
         ));
     }
     let app = apps.remove(0);
+    let root = std::fs::canonicalize(dir)
+        .map_err(|e| AppError::Engine(format!("resolve extraction root: {e}")))?;
+    let physical = std::fs::canonicalize(&app)
+        .map_err(|e| AppError::Engine(format!("resolve extracted app: {e}")))?;
+    if physical.parent() != Some(root.as_path()) {
+        return Err(AppError::Engine(
+            "安装包的 .app 不在解压根目录内，拒绝安装".to_string(),
+        ));
+    }
     // Accept any top-level bundle name but require the Codex product identity —
     // the codesign gate re-asserts this against the sealed plist right after.
     match sys::read_bundle_identifier(&app.to_string_lossy()).as_deref() {
@@ -761,6 +1445,7 @@ fn reconstruct_full(
     out_app: &Path,
     progress: &dyn Fn(DownloadProgress),
     network: &NetworkConfig,
+    restrict_downloads: bool,
 ) -> Result<(), AppError> {
     let latest = appcast
         .latest()
@@ -775,6 +1460,7 @@ fn reconstruct_full(
         &sig,
         progress,
         network,
+        restrict_downloads,
     )?;
     unpack_app_zip(&staged, work, out_app)
 }
@@ -881,8 +1567,8 @@ pub fn perform_macos_update_with_network_and_phase(
 
     let install_path = PathBuf::from(&installed.path);
 
-    let (_, xml) = fetch_appcast_for_arch(&installed.arch, network)?;
-    let appcast = parse_appcast(&xml).map_err(|e| AppError::Engine(e.to_string()))?;
+    let fetched = fetch_appcast_for_arch(&installed.arch, network)?;
+    let appcast = parse_appcast(&fetched.xml).map_err(|e| AppError::Engine(e.to_string()))?;
     let plan = plan_update(&appcast, installed.build)
         .ok_or_else(|| AppError::Engine("appcast had no items".to_string()))?;
     // The appcast fetch is the slow part of "正在准备" — honor a cancel here,
@@ -957,23 +1643,45 @@ pub fn perform_macos_update_with_network_and_phase(
                     &sig,
                     progress,
                     network,
+                    fetched.restrict_downloads,
                 )?;
                 set_phase(OperationPhase::Applying);
                 match apply_delta(tool, &install_path, &out_app, &staged) {
                     Ok(()) => strategy_label(&plan.strategy),
                     Err(delta_err) => {
-                        reconstruct_full(&appcast, &work, &out_app, progress, network)?;
+                        reconstruct_full(
+                            &appcast,
+                            &work,
+                            &out_app,
+                            progress,
+                            network,
+                            fetched.restrict_downloads,
+                        )?;
                         format!("full (delta 应用失败回退: {delta_err})")
                     }
                 }
             } else {
                 set_phase(OperationPhase::Applying);
-                reconstruct_full(&appcast, &work, &out_app, progress, network)?;
+                reconstruct_full(
+                    &appcast,
+                    &work,
+                    &out_app,
+                    progress,
+                    network,
+                    fetched.restrict_downloads,
+                )?;
                 "full (delta 工具缺失，回退全量)".to_string()
             }
         } else {
             set_phase(OperationPhase::Applying);
-            reconstruct_full(&appcast, &work, &out_app, progress, network)?;
+            reconstruct_full(
+                &appcast,
+                &work,
+                &out_app,
+                progress,
+                network,
+                fetched.restrict_downloads,
+            )?;
             "full".to_string()
         };
 
@@ -1060,6 +1768,9 @@ pub fn perform_macos_update_with_network_and_phase(
                 SwapBoundary::AfterMoveNew => tx
                     .mark_new_installed()
                     .map_err(|e| codex_mac_engine::EngineError::Io(e.to_string())),
+                SwapBoundary::BeforeRollback => tx
+                    .mark_rollback_started()
+                    .map_err(|e| codex_mac_engine::EngineError::Io(e.to_string())),
             }
         };
         if let Err(err) =
@@ -1134,7 +1845,13 @@ pub fn perform_macos_update_with_network_and_phase(
 
             // Not running, or relaunched cleanly → the backup is no longer needed.
             let _ = std::fs::remove_dir_all(&backup);
-            tx.succeed()?;
+            let tx_warnings = tx.succeed();
+            let final_warning = match (save_warning, tx_warnings.is_empty()) {
+                (Some(existing), true) => Some(existing),
+                (Some(existing), false) => Some(format!("{existing}；{}", tx_warnings.join("；"))),
+                (None, true) => None,
+                (None, false) => Some(tx_warnings.join("；")),
+            };
             let report = MacPerformReport {
                 up_to_date: false,
                 from_build: installed.build,
@@ -1145,7 +1862,7 @@ pub fn perform_macos_update_with_network_and_phase(
                 relaunched: was_running,
                 relaunch_failed: false,
                 rolled_back: false,
-                warning: save_warning,
+                warning: final_warning,
                 message: format!("已更新 build {} → {}", installed.build, plan.latest_build),
             };
             log::info!(
@@ -1156,6 +1873,7 @@ pub fn perform_macos_update_with_network_and_phase(
             Ok(report)
         } else {
             log::warn!("macOS perform step=rollback");
+            tx.mark_rollback_started()?;
             match rollback(&install_path, &backup) {
                 Ok(()) => {
                     tx.mark_rolled_back()?;
@@ -1343,6 +2061,18 @@ pub fn install_macos_with_network_and_phase(
     network: &NetworkConfig,
     phase_hook: Option<&PhaseHook<'_>>,
 ) -> Result<MacInstallStatus, AppError> {
+    install_macos_with_network_and_phase_for_target(progress, network, phase_hook, None)
+}
+
+/// Same fresh-install path with an optional latest-build consent guard. The UI
+/// supplies it for resumable operations so an appcast refresh cannot redirect a
+/// paused download to a newer build the user never started.
+pub fn install_macos_with_network_and_phase_for_target(
+    progress: &dyn Fn(DownloadProgress),
+    network: &NetworkConfig,
+    phase_hook: Option<&PhaseHook<'_>>,
+    expected_target_build: Option<u64>,
+) -> Result<MacInstallStatus, AppError> {
     log::info!("macOS install start");
     // Reset on op end, not entry — race-free cancel (see AbortGuard).
     let _abort_guard = AbortGuard::new();
@@ -1360,13 +2090,14 @@ pub fn install_macos_with_network_and_phase(
     } else {
         "x86_64"
     };
-    let (_, xml) = fetch_appcast_for_arch(arch, network)?;
-    let appcast = parse_appcast(&xml).map_err(|e| AppError::Engine(e.to_string()))?;
+    let fetched = fetch_appcast_for_arch(arch, network)?;
+    let appcast = parse_appcast(&fetched.xml).map_err(|e| AppError::Engine(e.to_string()))?;
     if let Some(latest) = appcast.latest() {
         require_os_supported(latest.minimum_system_version.as_deref())?;
     }
     let plan = plan_update(&appcast, 0)
         .ok_or_else(|| AppError::Engine("appcast had no items".to_string()))?;
+    require_expected_latest_build(expected_target_build, plan.latest_build)?;
     preflight_mac_disk(&plan)?;
     // Cancel checkpoint before bytes flow (mirrors perform) — makes a fresh
     // install's "正在准备" cancellable too.
@@ -1375,11 +2106,11 @@ pub fn install_macos_with_network_and_phase(
     let staging = staging::create_unique_staging("update")?;
     let install_result = install_macos_in_staging(
         &appcast,
-        &install_dir,
         &install_path,
         &staging,
         progress,
         network,
+        fetched.restrict_downloads,
         phase_hook,
     );
     match install_result {
@@ -1401,21 +2132,42 @@ pub fn install_macos_with_network_and_phase(
     }
 }
 
+fn require_expected_latest_build(expected: Option<u64>, actual: u64) -> Result<(), AppError> {
+    if let Some(expected) = expected {
+        if expected != actual {
+            return Err(AppError::StaleExpectation(format!(
+                "macOS latest release changed before install (expected build {expected}, found {actual}); please re-check and confirm again."
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn install_macos_in_staging(
     appcast: &Appcast,
-    install_dir: &Path,
     install_path: &Path,
     staging: &StagingDir,
     progress: &dyn Fn(DownloadProgress),
     network: &NetworkConfig,
+    restrict_downloads: bool,
     phase_hook: Option<&PhaseHook<'_>>,
 ) -> Result<MacInstallStatus, AppError> {
+    let install_dir = install_path
+        .parent()
+        .ok_or_else(|| AppError::Internal("macOS 安装路径缺少父目录".to_string()))?;
     let work = staging.path();
     let out_app = staging.join("Codex.app");
     let _ = std::fs::remove_dir_all(&out_app);
 
     // Full package only — no basis bundle to delta against.
-    reconstruct_full(appcast, work, &out_app, progress, network)?;
+    reconstruct_full(
+        appcast,
+        work,
+        &out_app,
+        progress,
+        network,
+        restrict_downloads,
+    )?;
     if let Some(hook) = phase_hook {
         hook(OperationPhase::Verifying);
     }
@@ -1480,6 +2232,581 @@ fn install_macos_in_staging(
     Ok(status)
 }
 
+#[derive(Debug, Clone)]
+pub struct HistoricalMacExpectation {
+    pub current_path: Option<String>,
+    pub current_build: Option<u64>,
+}
+
+fn validate_historical_mac_expectation(
+    expected: &HistoricalMacExpectation,
+    current: Option<&InstalledCodex>,
+) -> Result<(), AppError> {
+    let actual_path = current.map(|installed| installed.path.as_str());
+    let actual_build = current.map(|installed| installed.build);
+    if actual_path != expected.current_path.as_deref() || actual_build != expected.current_build {
+        return Err(AppError::StaleExpectation(format!(
+            "Codex 在确认后发生变化（确认时 {:?} build {:?}，现在 {:?} build {:?}），请重新检查后再试",
+            expected.current_path, expected.current_build, actual_path, actual_build
+        )));
+    }
+    Ok(())
+}
+
+fn preflight_historical_mac_disk(package_size: u64) -> Result<(), AppError> {
+    const HEADROOM: u64 = 512 * 1024 * 1024;
+    let need = package_size.saturating_mul(4).saturating_add(HEADROOM);
+    if let Some(free) = disk::available_space(&staging::staging_root())? {
+        if free < need {
+            return Err(AppError::Engine(format!(
+                "磁盘可用空间不足：历史版本安装约需 {}，当前可用 {}。请清理后重试",
+                human_bytes(need),
+                human_bytes(free)
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// A fresh install uses one atomic rename. A failed rename is definitive
+/// no-mutation evidence, so publish `MutationStarted` only after it succeeds.
+/// A worker panic after the syscall is still handled conservatively by the
+/// command layer's join-error path.
+fn commit_fresh_historical_app(
+    staged_app: &Path,
+    install_path: &Path,
+    evidence: Option<&HistoricalEvidenceHook<'_>>,
+    tx: Option<&mut ActiveInstallTx>,
+) -> Result<(), AppError> {
+    std::fs::rename(staged_app, install_path)
+        .map_err(|e| AppError::Engine(format!("写入 {} 失败: {e}", install_path.display())))?;
+    if let Some(hook) = evidence {
+        hook(HistoricalMacEvidence::MutationStarted);
+    }
+    if let Some(tx) = tx {
+        // If this durable mark fails, the Prepared journal plus the fresh-install
+        // disk matrix (target exists, payload absent) still proves the rename
+        // landed and startup recovery will finalize the requested policy.
+        tx.mark_new_installed()?;
+    }
+    Ok(())
+}
+
+/// Finish a confirmed rollback in the only safe order: restore the policy that
+/// the old app should inherit, then relaunch it. If policy restoration fails,
+/// leave the old app stopped instead of launching it with the temporary setting;
+/// the command layer will make one final restore attempt before returning.
+fn finish_historical_rollback(
+    primary: AppError,
+    was_running: bool,
+    after_rollback: Option<&AfterHistoricalRollbackHook<'_>>,
+    relaunch_old: impl FnOnce() -> Result<(), codex_mac_engine::EngineError>,
+) -> AppError {
+    if let Some(hook) = after_rollback {
+        if let Err(restore) = hook() {
+            return AppError::Internal(format!(
+                "{primary}；回滚后恢复安装前的 Codex 自更新策略失败：{restore}"
+            ));
+        }
+    }
+    if was_running {
+        if let Err(error) = relaunch_old() {
+            log::warn!("relaunch rolled-back Codex failed error={error}");
+        }
+    }
+    primary
+}
+
+fn normalize_release_arch(value: &str) -> Option<ReleaseArchitecture> {
+    ReleaseArchitecture::from_runtime(value)
+}
+
+fn read_bundle_minimum_system_version(app: &Path) -> Option<String> {
+    let plist = app.join("Contents/Info.plist");
+    let output = std::process::Command::new("/usr/libexec/PlistBuddy")
+        .args(["-c", "Print :LSMinimumSystemVersion"])
+        .arg(plist)
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Inspect a local DMG/ZIP without any network access. The mounted/extracted
+/// bundle must pass the same OpenAI code-signing, Gatekeeper/notarization,
+/// identity, architecture and OS gates as the real installer.
+pub fn resolve_macos_local_package(
+    path: &Path,
+    architecture: ReleaseArchitecture,
+) -> Result<ResolvedReleaseAsset, AppError> {
+    let format = match path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("dmg") => ReleasePackageFormat::Dmg,
+        Some("zip") => ReleasePackageFormat::Zip,
+        _ => {
+            return Err(AppError::Internal(
+                "请选择从 GitHub Release 下载的 DMG 或 ZIP 文件".to_string(),
+            ))
+        }
+    };
+    let staging = staging::create_unique_staging("inspect")?;
+    let out_app = staging.join("Codex.app");
+    let result = (|| -> Result<ResolvedReleaseAsset, AppError> {
+        match format {
+            ReleasePackageFormat::Dmg => {
+                unpack_app_dmg(path, staging.path(), &out_app)?;
+            }
+            ReleasePackageFormat::Zip => {
+                unpack_app_zip(path, staging.path(), &out_app)?;
+            }
+            ReleasePackageFormat::Msix => unreachable!(),
+        }
+        gate_reconstructed(&out_app)
+            .map_err(|e| AppError::Engine(format!("本地安装包代码签名/公证验证失败: {e}")))?;
+        let version = sys::read_bundle_short_version(&out_app.to_string_lossy())
+            .ok_or_else(|| AppError::Engine("无法读取本地 Codex 安装包版本".to_string()))?;
+        let actual_arch = sys::app_arch(&out_app.to_string_lossy())
+            .and_then(|value| normalize_release_arch(&value))
+            .ok_or_else(|| AppError::Engine("无法识别本地 Codex 安装包架构".to_string()))?;
+        if actual_arch != architecture {
+            return Err(AppError::Engine(format!(
+                "本地安装包架构 {} 与所选设备架构 {} 不一致",
+                actual_arch.as_str(),
+                architecture.as_str()
+            )));
+        }
+        require_os_supported(read_bundle_minimum_system_version(&out_app).as_deref())?;
+        resolved_local_asset(path, &version, actual_arch, format, None)
+    })();
+    staging.discard();
+    result
+}
+
+/// Install a specific DMG/ZIP from the mirror repository's GitHub Releases.
+/// The caller has already rebound the selected tag/name to a fresh API response
+/// and checked that GitHub's asset digest agrees with SHA256SUMS. This function
+/// still hashes the actual local/downloaded bytes, gates the extracted app, and
+/// re-checks both the source package and current install immediately before the
+/// atomic swap.
+#[allow(clippy::too_many_arguments)]
+pub fn install_macos_historical_release(
+    resolved: ResolvedReleaseAsset,
+    local_path: Option<PathBuf>,
+    expected: HistoricalMacExpectation,
+    progress: &dyn Fn(DownloadProgress),
+    network: &NetworkConfig,
+    phase: Option<&PhaseHook<'_>>,
+    policy_transition: Option<SelfUpdatePolicyTransition>,
+    before_commit: Option<&BeforeHistoricalCommitHook<'_>>,
+    evidence: Option<&HistoricalEvidenceHook<'_>>,
+    after_rollback: Option<&AfterHistoricalRollbackHook<'_>>,
+) -> Result<MacInstallStatus, AppError> {
+    let set_phase = |value: OperationPhase| {
+        if let Some(hook) = phase {
+            hook(value);
+        }
+    };
+    let _abort_guard = AbortGuard::new();
+    set_phase(OperationPhase::Preparing);
+
+    if !matches!(
+        resolved.format,
+        ReleasePackageFormat::Dmg | ReleasePackageFormat::Zip
+    ) {
+        return Err(AppError::Internal(
+            "macOS 历史安装仅支持 GitHub Release 的 DMG/ZIP".to_string(),
+        ));
+    }
+    let initial_status = mac_install_status();
+    if initial_status.status == "external" {
+        return Err(AppError::StaleExpectation(
+            "当前 Codex 尚未由管理器托管，请先“开始管理”再更换版本".to_string(),
+        ));
+    }
+    let initial = initial_status.installed;
+    validate_historical_mac_expectation(&expected, initial.as_ref())?;
+    preflight_historical_mac_disk(resolved.size)?;
+    check_update_abort()?;
+
+    let is_local = local_path.is_some();
+    let package = if let Some(path) = local_path {
+        let metadata = std::fs::metadata(&path)
+            .map_err(|e| AppError::Engine(format!("读取本地安装包失败: {e}")))?;
+        if metadata.len() != resolved.size {
+            return Err(AppError::StaleExpectation(format!(
+                "本地安装包在确认后发生变化（大小 {} → {}），请重新选择",
+                resolved.size,
+                metadata.len()
+            )));
+        }
+        verify_file_digest(&path, &resolved.digest)?;
+        path
+    } else {
+        set_phase(OperationPhase::Downloading);
+        let dest = staging::download_cache_path(&resolved.url, &resolved.name)?;
+        let cached_ok = std::fs::metadata(&dest)
+            .map(|metadata| metadata.len() == resolved.size)
+            .unwrap_or(false)
+            && verify_file_digest(&dest, &resolved.digest).is_ok();
+        if !cached_ok {
+            if dest.exists() {
+                let _ = std::fs::remove_file(&dest);
+            }
+            let source = host_of(&resolved.url);
+            download::download_to_with_progress_bounded_with_network(
+                &resolved.url,
+                &dest,
+                codex_mac_engine::limits::MAX_PACKAGE_BYTES,
+                &|downloaded| {
+                    progress(DownloadProgress {
+                        downloaded,
+                        total: resolved.size,
+                        source: source.clone(),
+                    });
+                },
+                network,
+            )
+            .map_err(|e| AppError::Engine(e.to_string()))?;
+        } else {
+            progress(DownloadProgress {
+                downloaded: resolved.size,
+                total: resolved.size,
+                source: host_of(&resolved.url),
+            });
+        }
+        let actual_size = std::fs::metadata(&dest)
+            .map_err(|e| AppError::Engine(format!("读取下载包信息失败: {e}")))?
+            .len();
+        if actual_size != resolved.size {
+            return Err(AppError::Engine(format!(
+                "下载包大小不匹配（{actual_size} != {}）",
+                resolved.size
+            )));
+        }
+        verify_file_digest(&dest, &resolved.digest)?;
+        dest
+    };
+
+    check_update_abort()?;
+    let staging = staging::create_unique_staging("update")?;
+    let out_app = staging.join("Codex.app");
+    let backup = staging.join("backup-Codex.app");
+    let work = staging.path().to_path_buf();
+    let mut keep_staging = false;
+    let install_result = (|| -> Result<MacInstallStatus, AppError> {
+        set_phase(OperationPhase::Applying);
+        match resolved.format {
+            ReleasePackageFormat::Dmg => unpack_app_dmg(&package, &work, &out_app)?,
+            ReleasePackageFormat::Zip => unpack_app_zip(&package, &work, &out_app)?,
+            ReleasePackageFormat::Msix => unreachable!("validated above"),
+        }
+
+        set_phase(OperationPhase::Verifying);
+        gate_reconstructed(&out_app).map_err(|e| {
+            AppError::Engine(format!("codesign/Gatekeeper 闸失败（拒绝安装）: {e}"))
+        })?;
+        let (_, target_build) = sys::installed_codex_build_at_path(&out_app.to_string_lossy())
+            .ok_or_else(|| AppError::Engine("无法读取待安装 Codex 的 bundle build".to_string()))?;
+        let target_version = sys::read_bundle_short_version(&out_app.to_string_lossy())
+            .ok_or_else(|| AppError::Engine("无法读取待安装 Codex 的版本号".to_string()))?;
+        if target_version != resolved.version {
+            return Err(AppError::Engine(format!(
+                "安装包内版本 {target_version} 与 Release {} 不一致，拒绝安装",
+                resolved.version
+            )));
+        }
+        let target_arch = sys::app_arch(&out_app.to_string_lossy())
+            .and_then(|value| normalize_release_arch(&value))
+            .ok_or_else(|| AppError::Engine("无法识别待安装 Codex 的架构".to_string()))?;
+        if target_arch != resolved.architecture {
+            return Err(AppError::Engine(format!(
+                "安装包内架构 {} 与 Release 资产架构 {} 不一致，拒绝安装",
+                target_arch.as_str(),
+                resolved.architecture.as_str()
+            )));
+        }
+        let minimum = read_bundle_minimum_system_version(&out_app);
+        require_os_supported(minimum.as_deref())?;
+
+        // Re-detect after the potentially long download/extract/gate window.
+        let current_status = mac_install_status();
+        if current_status.status == "external" {
+            return Err(AppError::StaleExpectation(
+                "当前安装在确认后变为外部安装，请重新检查并先开始管理".to_string(),
+            ));
+        }
+        validate_historical_mac_expectation(&expected, current_status.installed.as_ref())?;
+        let install_path = match current_status.installed.as_ref() {
+            Some(installed) => PathBuf::from(&installed.path),
+            None => choose_install_dir()?.join("Codex.app"),
+        };
+        let install_parent = install_path.parent().unwrap_or(install_path.as_path());
+        if !codex_mac_engine::swap::same_volume(&out_app, install_parent) {
+            return Err(AppError::Engine(
+                "暂存目录与安装根不在同一卷，无法原子安装".to_string(),
+            ));
+        }
+        if let Some(installed) = current_status.installed.as_ref() {
+            match sys::installed_codex_build_at_path(&installed.path) {
+                Some((_, build)) if Some(build) == expected.current_build => {}
+                _ => {
+                    return Err(AppError::StaleExpectation(
+                        "安装目标在确认后被移动、替换或更新，请重新检查后再试".to_string(),
+                    ));
+                }
+            }
+            require_not_translocation_risk(&installed.path)?;
+        } else if detect_installed().is_some() {
+            return Err(AppError::StaleExpectation(
+                "确认后检测到新的 Codex 安装，请重新检查后再试".to_string(),
+            ));
+        }
+
+        // No cancel is accepted after this phase. Persist crash-recovery
+        // ownership (including the old/requested update policy) before changing
+        // launchctl/settings or stopping/moving the installed app.
+        set_phase(OperationPhase::Committing);
+        check_update_abort()?;
+        let had_previous = current_status.installed.is_some();
+        let was_running = had_previous && codex_running_at(&install_path);
+        let mut tx = ActiveInstallTx::begin(
+            InstallTxKind::MacosSwap,
+            &install_path,
+            &out_app,
+            &backup,
+            had_previous,
+            Some(was_running),
+        )?;
+        if let Some(transition) = policy_transition {
+            tx.set_self_update_policy_transition(transition)?;
+        }
+        if let Some(hook) = before_commit {
+            hook()?;
+        }
+        if had_previous {
+            // Establish crash-recovery ownership before stopping a running app.
+            // If journal creation fails, the user's existing Codex stays open.
+            quit_codex_gracefully(&install_path)?;
+            let swap_result = {
+                let mut observer =
+                    |boundary: SwapBoundary| -> Result<(), codex_mac_engine::EngineError> {
+                        match boundary {
+                            SwapBoundary::BeforeMoveOld | SwapBoundary::BeforeMoveNew => Ok(()),
+                            SwapBoundary::AfterMoveOld => {
+                                if let Some(hook) = evidence {
+                                    hook(HistoricalMacEvidence::MutationStarted);
+                                }
+                                tx.mark_old_moved()
+                                    .map_err(|e| codex_mac_engine::EngineError::Io(e.to_string()))
+                            }
+                            SwapBoundary::AfterMoveNew => tx
+                                .mark_new_installed()
+                                .map_err(|e| codex_mac_engine::EngineError::Io(e.to_string())),
+                            SwapBoundary::BeforeRollback => tx
+                                .mark_rollback_started()
+                                .map_err(|e| codex_mac_engine::EngineError::Io(e.to_string())),
+                        }
+                    };
+                swap_in_place_with_observer(&install_path, &out_app, &backup, &mut observer)
+            };
+            if let Err(err) = swap_result {
+                let primary = AppError::Engine(format!("历史版本原子替换失败: {err}"));
+                if historical_swap_needs_recovery_materials(&install_path, &backup) {
+                    // The backup may be the only remaining runnable copy. Keep
+                    // both it and the pending journal; startup recovery owns the
+                    // next move and staging cleanup must not delete either.
+                    tx.leave_pending();
+                    keep_staging = true;
+                } else {
+                    // The engine restored the old install in place and consumed
+                    // the backup. Record that terminal truth so no stale pending
+                    // journal survives a clean in-process rollback.
+                    tx.mark_rolled_back()?;
+                    if let Some(hook) = evidence {
+                        hook(HistoricalMacEvidence::MutationRolledBack);
+                    }
+                    return Err(finish_historical_rollback(
+                        primary,
+                        was_running,
+                        after_rollback,
+                        || relaunch(&install_path),
+                    ));
+                }
+                return Err(primary);
+            }
+            set_phase(OperationPhase::Finishing);
+            let healthy = sys::installed_codex_build_at_path(&install_path.to_string_lossy())
+                .map(|(_, build)| build == target_build)
+                .unwrap_or(false)
+                && sys::read_bundle_short_version(&install_path.to_string_lossy()).as_deref()
+                    == Some(resolved.version.as_str())
+                && gate_reconstructed(&install_path).is_ok();
+            if !healthy {
+                tx.mark_rollback_started()?;
+                match rollback(&install_path, &backup) {
+                    Ok(()) => {
+                        tx.mark_rolled_back()?;
+                        if let Some(hook) = evidence {
+                            hook(HistoricalMacEvidence::MutationRolledBack);
+                        }
+                        return Err(finish_historical_rollback(
+                            AppError::Engine(
+                                "历史版本安装后健康检查失败，已回滚到原版本".to_string(),
+                            ),
+                            was_running,
+                            after_rollback,
+                            || relaunch(&install_path),
+                        ));
+                    }
+                    Err(err) => {
+                        tx.leave_pending();
+                        keep_staging = true;
+                        return Err(AppError::Engine(format!(
+                            "历史版本安装后健康检查失败且回滚失败（需人工介入）: {err}"
+                        )));
+                    }
+                }
+            }
+
+            let mut outcome = OperationOutcome::full_success("present", Some("managed"))
+                .with_path(install_path.to_string_lossy().into_owned());
+            outcome.cleanup = StepOutcome::not_applicable();
+            let mut store = ProvenanceStore::load();
+            store.record(
+                install_path.to_string_lossy().into_owned(),
+                target_build,
+                if is_local {
+                    "manager-installed-local-signed-package"
+                } else {
+                    "manager-installed-github-release"
+                },
+            );
+            if let Err(err) = store.save() {
+                let detail = format!("托管记录保存失败（{err}）");
+                outcome.provenance = StepOutcome::failed(detail.clone());
+                outcome.install_class = Some("external".to_string());
+                outcome.push_warning(format!(
+                    "{detail}；版本已安装，请用“开始管理”重试写入托管记录，勿重复安装"
+                ));
+                outcome.push_recovery(recovery::RECORD_PROVENANCE);
+            }
+            if was_running {
+                if let Err(err) = relaunch(&install_path) {
+                    keep_staging = true;
+                    tx.leave_pending();
+                    outcome.push_warning(format!(
+                        "已安装 {}，但自动重新打开失败（{err}）；旧版本备份暂留于 {}",
+                        resolved.version,
+                        backup.display()
+                    ));
+                } else {
+                    let _ = std::fs::remove_dir_all(&backup);
+                    for warning in tx.succeed() {
+                        outcome.push_warning(warning);
+                    }
+                }
+            } else {
+                let _ = std::fs::remove_dir_all(&backup);
+                for warning in tx.succeed() {
+                    outcome.push_warning(warning);
+                }
+            }
+            let mut status = mac_install_status();
+            if outcome.provenance.is_failed() {
+                status.status = "external".to_string();
+            }
+            status.outcome = Some(outcome);
+            Ok(status)
+        } else {
+            // A fresh install is one atomic rename, but still carries a durable
+            // journal so a crash after changing the requested update policy (or
+            // between rename and NewInstalled) can be resolved from disk truth.
+            commit_fresh_historical_app(&out_app, &install_path, evidence, Some(&mut tx))?;
+            set_phase(OperationPhase::Finishing);
+            let healthy = sys::installed_codex_build_at_path(&install_path.to_string_lossy())
+                .map(|(_, build)| build == target_build)
+                .unwrap_or(false)
+                && gate_reconstructed(&install_path).is_ok();
+            if !healthy {
+                tx.mark_rollback_started()?;
+                std::fs::remove_dir_all(&install_path).map_err(|e| {
+                    AppError::Engine(format!("新安装健康检查失败，且清理失败（需人工介入）: {e}"))
+                })?;
+                if let Some(hook) = evidence {
+                    hook(HistoricalMacEvidence::MutationRolledBack);
+                }
+                tx.mark_rolled_back()?;
+                return Err(AppError::Engine(
+                    "新安装健康检查失败，已移除无效安装".to_string(),
+                ));
+            }
+            let mut outcome = OperationOutcome::full_success("present", Some("managed"))
+                .with_path(install_path.to_string_lossy().into_owned());
+            outcome.cleanup = StepOutcome::not_applicable();
+            let mut store = ProvenanceStore::load();
+            store.record(
+                install_path.to_string_lossy().into_owned(),
+                target_build,
+                if is_local {
+                    "manager-installed-local-signed-package"
+                } else {
+                    "manager-installed-github-release"
+                },
+            );
+            if let Err(err) = store.save() {
+                let detail = format!("托管记录保存失败（{err}）");
+                outcome.provenance = StepOutcome::failed(detail.clone());
+                outcome.install_class = Some("external".to_string());
+                outcome.push_warning(format!(
+                    "{detail}；版本已安装，请用“开始管理”重试写入托管记录，勿重复安装"
+                ));
+                outcome.push_recovery(recovery::RECORD_PROVENANCE);
+            }
+            let mut status = mac_install_status();
+            if outcome.provenance.is_failed() {
+                status.status = "external".to_string();
+            }
+            for warning in tx.succeed() {
+                outcome.push_warning(warning);
+            }
+            status.outcome = Some(outcome);
+            Ok(status)
+        }
+    })();
+
+    match install_result {
+        Ok(status) => {
+            if keep_staging {
+                let _ = staging.keep();
+            } else {
+                staging.discard();
+            }
+            if !is_local {
+                let _ = staging::clear_download_cache();
+            }
+            Ok(status)
+        }
+        Err(err) => {
+            if keep_staging {
+                let _ = staging.keep();
+            } else {
+                staging.discard();
+            }
+            Err(err)
+        }
+    }
+}
+
+fn historical_swap_needs_recovery_materials(install_path: &Path, backup: &Path) -> bool {
+    backup.exists() || !install_path.exists()
+}
+
 /// Open the installed Codex.app — invoked by the UI's explicit 〔打开 Codex〕
 /// action (we no longer auto-launch after a fresh install).
 pub fn launch_codex() -> Result<(), AppError> {
@@ -1539,12 +2866,12 @@ pub(crate) fn clear_update_abort() {
 /// command now binds the latch to the owning operation under the op lock, but the
 /// worker may still be between entry and its first checkpoint — hence the guard
 /// instead of an entry reset.
-struct AbortGuard;
+pub(crate) struct AbortGuard;
 
 static UPDATE_ABORT_GUARD_DEPTH: AtomicUsize = AtomicUsize::new(0);
 
 impl AbortGuard {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         UPDATE_ABORT_GUARD_DEPTH.fetch_add(1, Ordering::SeqCst);
         Self
     }
@@ -1863,6 +3190,352 @@ mod disk_preflight_tests {
     }
 
     #[test]
+    fn fresh_rename_reports_mutation_only_after_success() {
+        let root = std::env::temp_dir().join(format!(
+            "cam-fresh-historical-rename-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let staged = root.join("staged.app");
+        let blocked_parent = root.join("blocked");
+        let install = blocked_parent.join("Codex.app");
+        std::fs::create_dir_all(&staged).unwrap();
+        std::fs::write(staged.join("payload"), b"test").unwrap();
+        // A file cannot be traversed as a parent directory on any supported
+        // platform. The failed atomic call must leave policy/completion
+        // evidence in the pre-commit state.
+        std::fs::write(&blocked_parent, b"occupied").unwrap();
+        let evidence = std::sync::Mutex::new(Vec::new());
+        let hook = |value| evidence.lock().unwrap().push(value);
+        assert!(commit_fresh_historical_app(&staged, &install, Some(&hook), None).is_err());
+        assert!(evidence.lock().unwrap().is_empty());
+        assert!(staged.exists());
+
+        std::fs::remove_file(&blocked_parent).unwrap();
+        std::fs::create_dir_all(&blocked_parent).unwrap();
+        commit_fresh_historical_app(&staged, &install, Some(&hook), None).unwrap();
+        assert_eq!(
+            evidence.lock().unwrap().as_slice(),
+            &[HistoricalMacEvidence::MutationStarted]
+        );
+        assert!(install.join("payload").is_file());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn confirmed_rollback_restores_policy_before_relaunch() {
+        let order = std::sync::Mutex::new(Vec::new());
+        let restore = || {
+            order.lock().unwrap().push("policy");
+            Ok(())
+        };
+        let error = finish_historical_rollback(
+            AppError::Engine("primary failure".to_string()),
+            true,
+            Some(&restore),
+            || {
+                order.lock().unwrap().push("relaunch");
+                Ok::<(), codex_mac_engine::EngineError>(())
+            },
+        );
+        assert_eq!(order.lock().unwrap().as_slice(), &["policy", "relaunch"]);
+        assert!(error.to_string().contains("primary failure"));
+
+        let relaunched = std::sync::atomic::AtomicBool::new(false);
+        let failed_restore = || Err(AppError::Internal("restore failed".to_string()));
+        let error = finish_historical_rollback(
+            AppError::Engine("primary failure".to_string()),
+            true,
+            Some(&failed_restore),
+            || {
+                relaunched.store(true, Ordering::SeqCst);
+                Ok::<(), codex_mac_engine::EngineError>(())
+            },
+        );
+        assert!(!relaunched.load(Ordering::SeqCst));
+        assert!(error.to_string().contains("restore failed"));
+    }
+
+    #[test]
+    fn zip_expansion_budget_rejects_oversized_or_overflowing_archives() {
+        assert_eq!(checked_zip_expanded_bytes(1, 2).unwrap(), 3);
+        assert!(checked_zip_expanded_bytes(MAX_APP_EXPANDED_BYTES, 1)
+            .unwrap_err()
+            .to_string()
+            .contains("超出允许范围"));
+        assert!(checked_zip_expanded_bytes(u64::MAX, 1)
+            .unwrap_err()
+            .to_string()
+            .contains("溢出"));
+    }
+
+    #[test]
+    fn zip_expansion_preflight_uses_measured_output_before_ditto() {
+        let work = Path::new("/staging");
+        let expanded = 2 * 1024 * 1024 * 1024;
+        let need = expanded + APP_EXPANSION_HEADROOM_BYTES;
+
+        let err = require_zip_expansion_space(expanded, work, |_| Ok(Some(need - 1))).unwrap_err();
+        assert!(err.to_string().contains("磁盘可用空间不足"));
+        assert!(require_zip_expansion_space(expanded, work, |_| Ok(Some(need))).is_ok());
+        assert!(require_zip_expansion_space(expanded, work, |_| Ok(None)).is_ok());
+    }
+
+    #[test]
+    fn zip_preflight_validates_the_decoded_unicode_path() {
+        use crate::zip_test::{archive, unicode_path_extra, Entry};
+
+        let root = std::env::temp_dir().join(format!("cam-encoded-zip-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let package = root.join("Codex.zip");
+        let raw = b"Codex.app/Contents/\xc3\xa9.bin";
+        let unicode = unicode_path_extra(raw, "Codex.app/Contents/资源.bin".as_bytes(), true);
+        let bad_crc = unicode_path_extra(raw, b"../escape.bin", false);
+        for (flags, extra) in [
+            (0, &[][..]),
+            (1 << 11, &[][..]),
+            (0, unicode.as_slice()),
+            (0, bad_crc.as_slice()),
+        ] {
+            let mut entry = Entry::new(raw, b"payload");
+            entry.flags = flags;
+            entry.extra = extra;
+            std::fs::write(&package, archive(&[entry])).unwrap();
+            preflight_app_zip_with_available(&package, &root, |_| Ok(Some(u64::MAX))).unwrap();
+        }
+
+        for unsafe_name in [
+            "../escape.bin", r"..\escape.bin", "/absolute", r"C:\escape", "nul\0path",
+        ] {
+            let extra = unicode_path_extra(raw, unsafe_name.as_bytes(), true);
+            let mut entry = Entry::new(raw, b"payload");
+            entry.extra = &extra;
+            std::fs::write(&package, archive(&[entry])).unwrap();
+            let error = preflight_app_zip_with_available(&package, &root, |_| Ok(Some(u64::MAX)))
+                .unwrap_err();
+            assert!(error.to_string().contains("不安全路径"), "{unsafe_name:?}: {error}");
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn zip_preflight_rejects_invalid_flagged_utf8() {
+        use crate::zip_test::{archive, Entry};
+
+        let root = std::env::temp_dir().join(format!("cam-invalid-zip-name-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let package = root.join("Codex.zip");
+        let mut entry = Entry::new(b"Codex.app/Contents/caf\x82.bin", b"payload");
+        entry.flags = 1 << 11;
+        std::fs::write(&package, archive(&[entry])).unwrap();
+        let error = preflight_app_zip_with_available(&package, &root, |_| Ok(Some(u64::MAX)))
+            .unwrap_err();
+        assert!(error.to_string().contains("名称失败"), "{error}");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn zip_preflight_uses_cp437_name_in_symlink_checks() {
+        use crate::zip_test::{archive, Entry};
+
+        let root = std::env::temp_dir().join(format!("cam-cp437-symlink-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let package = root.join("Codex.zip");
+        let mut entry = Entry::new(b"\xc3\xa9.app", b"/Applications/Codex.app");
+        entry.unix_mode = 0o120777;
+        std::fs::write(&package, archive(&[entry])).unwrap();
+        let error = preflight_app_zip_with_available(&package, &root, |_| Ok(Some(u64::MAX)))
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("物理 .app") && message.contains("├⌐.app"),
+            "{error}"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn zip_preflight_rejects_forged_small_sizes_before_ditto_can_expand_them() {
+        use std::io::Write as _;
+
+        let tmp = std::env::temp_dir().join(format!(
+            "cam-zip-forged-size-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&tmp).unwrap();
+        let package = tmp.join("Codex.zip");
+        let file = std::fs::File::create(&package).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        writer
+            .start_file(
+                "Codex.app/Contents/large.bin",
+                zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Deflated),
+            )
+            .unwrap();
+        writer.write_all(&vec![b'0'; 1024 * 1024]).unwrap();
+        writer.finish().unwrap();
+
+        // Forge both local and central-directory uncompressed sizes to one byte,
+        // matching the bypass reproduced against ditto during review.
+        let mut bytes = std::fs::read(&package).unwrap();
+        let local = bytes
+            .windows(4)
+            .position(|window| window == b"PK\x03\x04")
+            .unwrap();
+        bytes[local + 22..local + 26].copy_from_slice(&1_u32.to_le_bytes());
+        let central = bytes
+            .windows(4)
+            .position(|window| window == b"PK\x01\x02")
+            .unwrap();
+        bytes[central + 24..central + 28].copy_from_slice(&1_u32.to_le_bytes());
+        std::fs::write(&package, bytes).unwrap();
+
+        let error =
+            preflight_app_zip_with_available(&package, &tmp, |_| Ok(Some(u64::MAX))).unwrap_err();
+        assert!(
+            error.to_string().contains("ZIP"),
+            "forged expansion must be rejected: {error}"
+        );
+
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn zip_symlinks_must_stay_inside_a_physical_top_level_app() {
+        assert!(validate_zip_symlink_target(
+            Path::new("Codex.app/Contents/Frameworks/Codex.framework/Versions/Current"),
+            "A",
+        )
+        .is_ok());
+        assert!(validate_zip_symlink_target(
+            Path::new("Codex.app/Contents/Frameworks/Codex.framework/Codex"),
+            "Versions/Current/Codex",
+        )
+        .is_ok());
+
+        let top_level =
+            validate_zip_symlink_target(Path::new("Codex.app"), "/Applications/Codex.app")
+                .unwrap_err();
+        assert!(top_level.to_string().contains("物理 .app"));
+
+        let escaping = validate_zip_symlink_target(
+            Path::new("Codex.app/Contents/escape"),
+            "../../Applications/Codex.app",
+        )
+        .unwrap_err();
+        assert!(escaping.to_string().contains("逃出应用目录"));
+    }
+
+    #[test]
+    fn zip_preflight_rejects_a_top_level_app_symlink_entry() {
+        let tmp = std::env::temp_dir().join(format!(
+            "cam-zip-symlink-preflight-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&tmp).unwrap();
+        let package = tmp.join("Codex.zip");
+        let file = std::fs::File::create(&package).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        writer
+            .add_symlink(
+                "Codex.app",
+                "/Applications/Codex.app",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        writer.finish().unwrap();
+
+        let error =
+            preflight_app_zip_with_available(&package, &tmp, |_| Ok(Some(u64::MAX))).unwrap_err();
+        assert!(error.to_string().contains("物理 .app"));
+
+        std::fs::remove_file(&package).unwrap();
+        std::fs::remove_dir(&tmp).unwrap();
+    }
+
+    #[test]
+    fn dmg_preflight_rejects_oversized_and_low_space_before_mounting() {
+        let tmp = std::env::temp_dir().join(format!(
+            "cam-dmg-preflight-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&tmp).unwrap();
+        let dmg = tmp.join("Codex.dmg");
+        let file = std::fs::File::create(&dmg).unwrap();
+        file.set_len(codex_mac_engine::limits::MAX_PACKAGE_BYTES + 1)
+            .unwrap();
+        assert!(
+            preflight_app_dmg_with_available(&dmg, &tmp, |_| Ok(Some(u64::MAX)))
+                .unwrap_err()
+                .to_string()
+                .contains("超出允许范围")
+        );
+
+        file.set_len(1).unwrap();
+        assert!(
+            preflight_app_dmg_with_available(&dmg, &tmp, |_| Ok(Some(0)))
+                .unwrap_err()
+                .to_string()
+                .contains("磁盘可用空间不足")
+        );
+        drop(file);
+        std::fs::remove_file(&dmg).unwrap();
+        std::fs::remove_dir(&tmp).unwrap();
+    }
+
+    #[test]
+    fn mounted_dmg_app_preflight_uses_actual_logical_size_before_ditto() {
+        let tmp = std::env::temp_dir().join(format!(
+            "cam-mounted-app-preflight-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let app = tmp.join("Codex.app");
+        let contents = app.join("Contents");
+        std::fs::create_dir_all(&contents).unwrap();
+        std::fs::write(contents.join("Info.plist"), vec![0_u8; 1024]).unwrap();
+
+        let logical = mounted_app_logical_size(&app).unwrap();
+        assert_eq!(logical, 1024);
+        let need = logical + APP_EXPANSION_HEADROOM_BYTES;
+        assert!(
+            preflight_mounted_app_copy_with_available(&app, &tmp, |_| Ok(Some(need - 1)))
+                .unwrap_err()
+                .to_string()
+                .contains("磁盘可用空间不足")
+        );
+        assert!(preflight_mounted_app_copy_with_available(&app, &tmp, |_| Ok(Some(need))).is_ok());
+
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn mounted_dmg_app_preflight_rejects_actual_oversized_bundle() {
+        let tmp = std::env::temp_dir().join(format!(
+            "cam-mounted-app-oversized-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let app = tmp.join("Codex.app");
+        let contents = app.join("Contents");
+        std::fs::create_dir_all(&contents).unwrap();
+        let payload = std::fs::File::create(contents.join("payload.bin")).unwrap();
+        payload.set_len(MAX_APP_EXPANDED_BYTES + 1).unwrap();
+
+        assert!(mounted_app_logical_size(&app)
+            .unwrap_err()
+            .to_string()
+            .contains("超出允许范围"));
+
+        drop(payload);
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
     fn preflight_mac_disk_rejects_low_space_and_allows_unknown_space() {
         let p = plan(100, 200, UpdateStrategy::Full);
         let err = preflight_mac_disk_with_available(&p, |_| Ok(Some(10))).unwrap_err();
@@ -1889,6 +3562,36 @@ mod disk_preflight_tests {
             .iter()
             .any(|action| action == recovery::RECORD_PROVENANCE));
     }
+
+    #[test]
+    fn historical_swap_failure_preserves_staging_until_disk_is_restored() {
+        let tmp = std::env::temp_dir().join(format!(
+            "cam-historical-swap-recovery-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let install = tmp.join("Codex.app");
+        let backup = tmp.join("backup-Codex.app");
+        std::fs::create_dir_all(&install).unwrap();
+
+        assert!(
+            !historical_swap_needs_recovery_materials(&install, &backup),
+            "an intact restored install with no backup needs no retained staging"
+        );
+        std::fs::create_dir_all(&backup).unwrap();
+        assert!(
+            historical_swap_needs_recovery_materials(&install, &backup),
+            "a backup must remain available to the pending recovery journal"
+        );
+        std::fs::remove_dir_all(&install).unwrap();
+        std::fs::remove_dir_all(&backup).unwrap();
+        assert!(
+            historical_swap_needs_recovery_materials(&install, &backup),
+            "a missing install is outcome-ambiguous even if the backup probe failed"
+        );
+
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
 }
 
 // The full-update unpack branch is new logic (the delta/gate/swap tail reuses
@@ -1897,6 +3600,100 @@ mod disk_preflight_tests {
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proxy_only_dns_falls_back_to_validated_doh_addresses() {
+        let network = NetworkConfig::custom("socks5h://127.0.0.1:7890");
+        let resolved = resolve_custom_source_for_network_with(
+            "https://proxy-only.invalid/appcast.xml",
+            &network,
+            |_| Err(UrlRejectReason::DnsResolutionFailed),
+            |host| {
+                assert_eq!(host, "proxy-only.invalid");
+                Ok(vec!["93.184.216.34".parse().unwrap()])
+            },
+        )
+        .unwrap();
+
+        assert_eq!(resolved.host, "proxy-only.invalid");
+        assert_eq!(
+            resolved.addresses,
+            ["93.184.216.34".parse::<IpAddr>().unwrap()]
+        );
+
+        let direct_error = resolve_custom_source_for_network_with(
+            "https://proxy-only.invalid/appcast.xml",
+            &NetworkConfig::direct(),
+            |_| Err(UrlRejectReason::DnsResolutionFailed),
+            |_| panic!("direct mode must not disclose DNS names to the proxy DoH fallback"),
+        );
+        assert_eq!(direct_error, Err(UrlRejectReason::DnsResolutionFailed));
+
+        // A resolved system proxy reaches the same hosts a custom one does.
+        let system_proxy = NetworkConfig::with_system_proxy(
+            codex_mac_engine::SystemProxyState::manual("http://127.0.0.1:7890", ""),
+        );
+        let resolved = resolve_custom_source_for_network_with(
+            "https://proxy-only.invalid/appcast.xml",
+            &system_proxy,
+            |_| Err(UrlRejectReason::DnsResolutionFailed),
+            |_| Ok(vec!["93.184.216.34".parse().unwrap()]),
+        )
+        .unwrap();
+        assert_eq!(resolved.host, "proxy-only.invalid");
+
+        let no_system_proxy =
+            NetworkConfig::with_system_proxy(codex_mac_engine::SystemProxyState::default());
+        let system_direct_error = resolve_custom_source_for_network_with(
+            "https://proxy-only.invalid/appcast.xml",
+            &no_system_proxy,
+            |_| Err(UrlRejectReason::DnsResolutionFailed),
+            |_| panic!("system mode without a proxy must not use the proxy DoH fallback"),
+        );
+        assert_eq!(system_direct_error, Err(UrlRejectReason::DnsResolutionFailed));
+    }
+
+    #[test]
+    fn proxy_doh_answers_are_strictly_parsed_and_deduplicated() {
+        let addresses = parse_doh_addresses(
+            r#"{
+                "Status": 0,
+                "Answer": [
+                    {"name":"example.com.","type":5,"TTL":60,"data":"edge.example.net."},
+                    {"name":"edge.example.net.","type":1,"TTL":60,"data":"93.184.216.34"},
+                    {"name":"edge.example.net.","type":1,"TTL":60,"data":"93.184.216.34"},
+                    {"name":"edge.example.net.","type":28,"TTL":60,"data":"2606:2800:220:1:248:1893:25c8:1946"}
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(addresses.len(), 2);
+        assert!(addresses.contains(&"93.184.216.34".parse().unwrap()));
+        assert!(addresses.contains(&"2606:2800:220:1:248:1893:25c8:1946".parse().unwrap()));
+        assert!(parse_doh_addresses(r#"{"Status": 2}"#).is_err());
+        assert!(
+            parse_doh_addresses(r#"{"Status":0,"Answer":[{"type":1,"data":"not-an-ip"}]}"#)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn destination_candidates_preserve_every_validated_address() {
+        let network = NetworkConfig::system();
+        let addresses = [
+            "93.184.216.34".parse().unwrap(),
+            "2001:db8::1".parse().unwrap(),
+        ];
+
+        assert_eq!(
+            pinned_network_candidates(&network, "updates.example.com", 443, &addresses),
+            vec![
+                network.with_https_destination_pin("updates.example.com", 443, addresses[0]),
+                network.with_https_destination_pin("updates.example.com", 443, addresses[1]),
+            ]
+        );
+    }
 
     #[test]
     fn abort_guard_preserves_a_startup_race_cancel_and_resets_on_drop() {
@@ -1928,6 +3725,16 @@ mod tests {
             check_update_abort().is_ok(),
             "guard drop must reset the latch for the next op"
         );
+    }
+
+    #[test]
+    fn fresh_install_refuses_a_latest_build_that_changed_after_confirmation() {
+        assert!(require_expected_latest_build(Some(5813), 5813).is_ok());
+        assert!(require_expected_latest_build(None, 6000).is_ok());
+        assert!(matches!(
+            require_expected_latest_build(Some(5813), 6000),
+            Err(AppError::StaleExpectation(_))
+        ));
     }
 
     fn ditto(args: &[&str]) {
@@ -2023,5 +3830,26 @@ mod tests {
         assert!(found.ends_with("ChatGPT.app"));
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn require_single_codex_app_rejects_a_top_level_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "codex-top-level-symlink-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let extract = root.join("extract");
+        let outside = root.join("outside/Codex.app");
+        std::fs::create_dir_all(&extract).unwrap();
+        write_bundle_plist(&outside, sys::CODEX_BUNDLE_ID);
+        symlink(&outside, extract.join("Codex.app")).unwrap();
+
+        let error = require_single_codex_app(&extract).unwrap_err();
+        assert!(error.to_string().contains("顶层 .app 是符号链接"));
+
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

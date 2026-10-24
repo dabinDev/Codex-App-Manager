@@ -1,7 +1,61 @@
-import { describe, expect, it } from "vitest";
+import { act, renderHook } from "@testing-library/react";
+import { listen } from "@tauri-apps/api/event";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { normalizePath } from "../paths";
-import { installIdentity } from "./useFocusRecheck";
+import { installIdentity, useFocusRecheck } from "./useFocusRecheck";
+
+vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn() }));
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((res) => { resolve = res; });
+  return { promise, resolve };
+}
+
+function focusOptions() {
+  return {
+    fetchStatus: vi.fn(async () => ({ installed: null })),
+    onStatus: vi.fn(),
+    hasChecked: () => true,
+    checkedIdentity: () => "old",
+    identityOf: () => null,
+    isBusy: vi.fn(() => false),
+    onIdentityChanged: vi.fn(),
+  };
+}
+
+describe("useFocusRecheck lifecycle", () => {
+  beforeEach(() => vi.mocked(listen).mockReset());
+
+  it("removes a listener whose registration finishes after unmount", async () => {
+    const registration = deferred<() => void>();
+    const dispose = vi.fn();
+    vi.mocked(listen).mockReturnValueOnce(registration.promise);
+    const { unmount } = renderHook(() => useFocusRecheck(focusOptions()));
+
+    unmount();
+    await act(async () => registration.resolve(dispose));
+    expect(dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it("ignores a late status result after unmount", async () => {
+    vi.mocked(listen).mockResolvedValue(vi.fn());
+    const probe = deferred<{ installed: null }>();
+    const options = focusOptions();
+    options.fetchStatus.mockReturnValueOnce(probe.promise);
+    const { unmount } = renderHook(() => useFocusRecheck(options));
+    await act(async () => {});
+    const onFocus = vi.mocked(listen).mock.calls[0][1];
+
+    act(() => onFocus({ event: "tauri://focus", id: 1, payload: null }));
+    unmount();
+    await act(async () => probe.resolve({ installed: null }));
+
+    expect(options.onStatus).not.toHaveBeenCalled();
+    expect(options.onIdentityChanged).not.toHaveBeenCalled();
+  });
+});
 
 describe("installIdentity", () => {
   it("is null for an absent install", () => {

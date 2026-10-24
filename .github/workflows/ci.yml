@@ -22,10 +22,10 @@ jobs:
     name: Frontend
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
         with:
-          node-version: 20
+          node-version: 24
           cache: npm
       - run: npm ci
       - name: Type-check
@@ -45,67 +45,59 @@ jobs:
         os: [macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
         with:
-          node-version: 20
+          node-version: 24
           cache: npm
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4  # stable
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
-        with:
-          workspaces: src-tauri -> target
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
       - run: npm ci
       # tauri-build (frontendDist: ../dist) reads the built frontend at compile
       # time, so produce dist before touching cargo. We deliberately do NOT run
       # `tauri build` here — no bundling, no signing, no notarization.
       - name: Build frontend (for tauri-build)
         run: npm run build
+      # Single Cargo workspace: src-tauri and all three engine crates are
+      # workspace members, so one clippy/test pass at the root now covers
+      # every member (previously the engines were only `cargo test`-ed
+      # standalone and never linted with -D warnings).
       - name: Clippy (deny warnings)
-        run: cargo clippy --manifest-path src-tauri/Cargo.toml --workspace --all-targets -- -D warnings
-      - name: Test (src-tauri)
-        run: cargo test --manifest-path src-tauri/Cargo.toml --workspace
-      # Path deps are not workspace members, so their unit/integration tests are
-      # not covered by the step above. Run each engine crate explicitly so
-      # mac/win pure-logic regressions fail required CI on every PR.
-      - name: Test codex-mac-engine (standalone)
-        run: cargo test --manifest-path crates/codex-mac-engine/Cargo.toml --all-targets
-      - name: Test codex-win-engine (standalone)
-        run: cargo test --manifest-path crates/codex-win-engine/Cargo.toml --all-targets
-      - name: Test codex-theme-engine (standalone)
-        run: cargo test --manifest-path crates/codex-theme-engine/Cargo.toml --all-targets
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Test (workspace)
+        run: cargo test --workspace --all-targets --locked
 
   audit:
-    name: Audit (report)
+    name: Audit
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
         with:
-          node-version: 20
+          node-version: 24
           cache: npm
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
-      - run: npm ci
-      - name: npm audit
-        continue-on-error: true
-        run: npm audit --audit-level=high
-      - name: Install cargo audit tools
-        continue-on-error: true
-        run: cargo install cargo-audit cargo-deny --locked
-      - name: cargo audit
-        continue-on-error: true
-        run: cargo audit --file src-tauri/Cargo.lock
-      - name: cargo deny
-        continue-on-error: true
-        run: cargo deny --manifest-path src-tauri/Cargo.toml check
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4  # stable
+      - name: Audit npm lockfiles
+        run: |
+          npm audit --package-lock-only --audit-level=high
+          npm --prefix website audit --package-lock-only --audit-level=high
+          npm --prefix cloudflare/manager-download-router audit --package-lock-only --audit-level=high
+      - name: Install pinned Rust audit tools
+        run: |
+          cargo install cargo-audit --version 0.22.0 --locked
+          cargo install cargo-deny --version 0.18.9 --locked
+      - name: Audit Rust lockfile
+        run: cargo audit --file Cargo.lock
+      - name: Enforce Rust dependency policy
+        run: cargo deny check
 
   worker-test:
     name: Cloudflare worker tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
 
@@ -135,10 +127,10 @@ jobs:
             echo "No cloudflare/** changes; skipping worker tests."
           fi
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
         if: steps.changes.outputs.run == 'true'
         with:
-          node-version: 20
+          node-version: 24
           cache: npm
           cache-dependency-path: cloudflare/manager-download-router/package-lock.json
 

@@ -34,6 +34,19 @@ function SheetHarness({ dismissable = true }: { dismissable?: boolean }) {
 }
 
 describe("Sheet", () => {
+  it("focuses Close instead of a preceding destructive ghost action", () => {
+    render(
+      <Sheet open labelledBy="skin-title" onDismiss={() => {}}>
+        <h3 id="skin-title">Skin details</h3>
+        <button className="btn primary">Try on</button>
+        <button className="btn ghost danger">Delete</button>
+        <button className="btn ghost">Close</button>
+      </Sheet>,
+    );
+
+    expect(screen.getByRole("button", { name: "Close" })).toHaveFocus();
+  });
+
   it("keeps dialog actions reachable when content overflows (text scaling)", async () => {
     const user = userEvent.setup();
     render(

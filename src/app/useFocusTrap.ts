@@ -66,7 +66,7 @@ export function useFocusTrap(
     const focusables = getFocusable(node);
     const pick = () => {
       if (initialFocus === "dismiss") {
-        return node.querySelector<HTMLElement>(".btn.ghost") ?? focusables[0];
+        return node.querySelector<HTMLElement>(".btn.ghost:not(.danger)") ?? focusables[0];
       }
       if (initialFocus === "primary") {
         return node.querySelector<HTMLElement>(".btn.primary, .btn.danger") ?? focusables[0];

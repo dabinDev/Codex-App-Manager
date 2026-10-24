@@ -36,16 +36,18 @@ export function useFocusRecheck<S extends { installed: unknown }>(opts: {
 
   useEffect(() => {
     let last = 0;
+    let disposed = false;
     let un: (() => void) | undefined;
     void (async () => {
       try {
-        un = await listen("tauri://focus", () => {
+        const unlisten = await listen("tauri://focus", () => {
           const now = Date.now();
-          if (ref.current.isBusy() || now - last < 3000) return;
+          if (disposed || ref.current.isBusy() || now - last < 3000) return;
           last = now;
           void (async () => {
             try {
               const st = await ref.current.fetchStatus();
+              if (disposed) return;
               ref.current.onStatus(st);
               if (
                 ref.current.hasChecked() &&
@@ -58,11 +60,16 @@ export function useFocusRecheck<S extends { installed: unknown }>(opts: {
             }
           })();
         });
+        if (disposed) unlisten();
+        else un = unlisten;
       } catch {
         // Non-Tauri (web preview): no event bus — nothing to clean up.
       }
     })();
-    return () => un?.();
+    return () => {
+      disposed = true;
+      un?.();
+    };
   }, []);
 }
 

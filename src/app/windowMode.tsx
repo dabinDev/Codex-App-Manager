@@ -71,6 +71,7 @@ export function WindowModeProvider({ children }: { children: ReactNode }) {
   const [mode, setModeState] = useState<WindowMode>("expanded");
   const [switching, setSwitching] = useState(false);
   const modeRef = useRef(mode);
+  const focusedModeRef = useRef(mode);
   modeRef.current = mode;
   const inFlight = useRef(false);
   // Last drag-resize not yet persisted (physical px), with the debounce timer
@@ -95,6 +96,18 @@ export function WindowModeProvider({ children }: { children: ReactNode }) {
   // Stamp the mode on <html> so styles.css can key the whole layout on it.
   useEffect(() => {
     document.documentElement.dataset.windowMode = mode;
+    if (focusedModeRef.current !== mode) {
+      focusedModeRef.current = mode;
+      // Restore only after React commits the new chrome. Home stays mounted
+      // behind sub-pages, so scope the fallback to the visible view.
+      const view = Array.from(document.querySelectorAll<HTMLElement>("[data-view]"))
+        .find((element) => getComputedStyle(element).display !== "none");
+      const landing =
+        document.querySelector<HTMLElement>(".rail-item.active:not(:disabled)") ??
+        view?.querySelector<HTMLElement>("[data-page-focus]:not(:disabled)") ??
+        view?.querySelector<HTMLElement>(".topbar button:not(:disabled), .navbar button:not(:disabled)");
+      landing?.focus({ preventScroll: true });
+    }
     return () => {
       delete document.documentElement.dataset.windowMode;
     };
@@ -138,20 +151,6 @@ export function WindowModeProvider({ children }: { children: ReactNode }) {
           // never shows a frame of the old layout in the new window frame.
           root.dataset.windowMode = report.mode;
           setModeState(report.mode);
-          // The control that was activated (expand button / rail collapse)
-          // unmounts with the layout swap while the view stays put, so the
-          // App-level view-change focus restore never runs. Give keyboard
-          // focus a definite landing: the rail's active item when expanding,
-          // the visible view's page target when collapsing.
-          window.requestAnimationFrame(() => {
-            const landing =
-              document.querySelector<HTMLElement>(".rail-item.active") ??
-              document.querySelector<HTMLElement>(
-                '[data-view] [data-page-focus]:not(:disabled)',
-              ) ??
-              document.querySelector<HTMLElement>(".topbar button, .navbar button");
-            landing?.focus({ preventScroll: true });
-          });
         } catch (cause) {
           console.warn("[window-mode] switch failed", cause);
         } finally {

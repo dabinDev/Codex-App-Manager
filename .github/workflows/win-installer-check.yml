@@ -6,7 +6,9 @@ name: Windows installer check
 # install → first launch → upgrade → uninstall.
 #
 # Also probes Authenticode on the installer and installed PE files in
-# non-blocking (optional) mode until OV/EV secrets are configured.
+# non-blocking (optional) mode until a real provider is configured, and proves
+# the signCommand plumbing itself with a throwaway self-signed certificate (no
+# real secrets involved — see docs/windows-signing.md).
 #
 # ARM64 is NOT smoke-tested here: GitHub-hosted runners are x64, and a
 # cross-built ARM64 PE is not runtime verification. See docs/windows-signing.md.
@@ -20,7 +22,8 @@ on:
       - "src-tauri/installer/**"
       - "src-tauri/tauri.conf.json"
       - "src-tauri/Cargo.toml"
-      - "src-tauri/Cargo.lock"
+      - "Cargo.toml"
+      - "Cargo.lock"
       - "src-tauri/src/**"
       - "crates/**"
       - "src/**"
@@ -29,6 +32,7 @@ on:
       - "scripts/windows-*.ps1"
       - "scripts/sign-windows-authenticode.ps1"
       - "scripts/verify-windows-authenticode.ps1"
+      - "scripts/resolve-esigner-cka-installer.ps1"
       - ".github/workflows/win-installer-check.yml"
   workflow_dispatch:
 
@@ -40,35 +44,176 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  esigner-archive-check:
+    name: eSigner CKA archive extraction check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      # Secret-free dry run on every PR that touches this script or its pin:
+      # downloads the real, publicly pinned SSL.com eSigner CKA release
+      # archive, verifies its SHA-256, and asserts the extraction/rename
+      # logic still resolves the shipped, build-stamped executable (e.g.
+      # "SSL.COM eSigner CKA_1.0.6_build_20230829.exe") to the fixed
+      # `eSigner_CKA_Installer.exe` path that release.yml's credentialed
+      # "Provision eSigner CKA certificate" step depends on. No installer is
+      # ever executed here. This is what would have caught (and now
+      # prevents a regression of) the archive-layout mismatch described in
+      # scripts/resolve-esigner-cka-installer.ps1's header comment: a future
+      # SSL.com release that changes the archive layout, or a bad pin bump,
+      # fails here instead of on the first real release attempt.
+      - name: Resolve + assert eSigner CKA installer path
+        shell: pwsh
+        run: |
+          $dest = Join-Path $env:RUNNER_TEMP "esigner-archive-check"
+          $installer = & ./scripts/resolve-esigner-cka-installer.ps1 -DestinationDir $dest -Stage "esigner-archive-check"
+          $expected = Join-Path $dest "eSigner_CKA_Installer.exe"
+          if ($installer -ne $expected) {
+            Write-Host "::error::[esigner-archive-check] resolved path '$installer' does not match expected '$expected'"
+            exit 1
+          }
+          if (-not (Test-Path -LiteralPath $installer -PathType Leaf)) {
+            Write-Host "::error::[esigner-archive-check] resolved installer '$installer' does not exist on disk"
+            exit 1
+          }
+          Write-Host "[esigner-archive-check] OK: $installer"
+
+  # Windows PowerShell 5.1 smoke for the signCommand hook. `tauri build` runs
+  # scripts/sign-windows-authenticode.ps1 with `powershell` (5.1), which reads
+  # BOM-less files as the ANSI code page, so a non-ASCII character in a string
+  # can break parsing there while pwsh 7 (UTF-8 default) parses it fine. Every
+  # other job here uses `shell: pwsh`, so this is the only place 5.1 is
+  # exercised on its own, with no provider configured: the exact
+  # default-release path that must keep working unchanged.
+  signing-hook-ps51:
+    name: signCommand hook under Windows PowerShell 5.1
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Parse signing scripts with Windows PowerShell 5.1
+        shell: powershell
+        run: |
+          Write-Host "PSVersion=$($PSVersionTable.PSVersion)"
+          $failed = $false
+          foreach ($f in "sign-windows-authenticode.ps1", "verify-windows-authenticode.ps1", "resolve-esigner-cka-installer.ps1") {
+            $errors = $null
+            $null = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $PWD "scripts\$f"), [ref]$null, [ref]$errors)
+            if ($errors -and $errors.Count -gt 0) {
+              $failed = $true
+              $errors | ForEach-Object { Write-Host "::error::$f`: $($_.Message) (line $($_.Extent.StartLineNumber))" }
+            }
+            else { Write-Host "OK: $f parses under PS 5.1" }
+          }
+          if ($failed) { exit 1 }
+
+      # Invoke the hook exactly the way tauri.conf.json does (powershell -File,
+      # cwd = src-tauri) so an unset provider is proven to be a clean no-op.
+      - name: signCommand no-provider no-op (default release path)
+        shell: cmd
+        working-directory: src-tauri
+        env:
+          WINDOWS_SIGNING_PROVIDER: ""
+          WINDOWS_CERTIFICATE: ""
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File ../scripts/sign-windows-authenticode.ps1 -Path "%SystemRoot%\System32\notepad.exe"
+          if errorlevel 1 exit /b 1
+
+      - name: signCommand unknown provider fails loudly
+        shell: cmd
+        working-directory: src-tauri
+        env:
+          WINDOWS_SIGNING_PROVIDER: bogus
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File ../scripts/sign-windows-authenticode.ps1 -Path "%SystemRoot%\System32\notepad.exe"
+          if not errorlevel 1 (
+            echo ::error::sign-windows-authenticode.ps1 accepted an unknown provider
+            exit /b 1
+          )
+          exit /b 0
+
   nsis:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
         with:
-          node-version: 20
+          node-version: 24
           cache: npm
 
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4  # stable
         with:
           targets: x86_64-pc-windows-msvc
 
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
-        with:
-          workspaces: src-tauri -> target
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
 
       - run: npm ci
 
+      # ── Create a throwaway self-signed code-signing certificate ───────────
+      #    Generated fresh every run, kept in CurrentUser\My only for the
+      #    seconds it takes to export it below, then removed. Never a real
+      #    secret and never trusted by anything — exported as a base64 PFX
+      #    with a random per-run password purely so the very next step can
+      #    feed it into the build exactly the way a real
+      #    WINDOWS_SIGNING_PROVIDER=local-pfx release would
+      #    (WINDOWS_CERTIFICATE / WINDOWS_CERTIFICATE_PASSWORD).
+      - name: Create throwaway self-signed code-signing certificate
+        id: throwaway-cert
+        shell: pwsh
+        run: |
+          $cert = New-SelfSignedCertificate `
+            -Type CodeSigningCert `
+            -Subject "CN=Codex App Manager CI Signing Proof" `
+            -CertStoreLocation Cert:\CurrentUser\My `
+            -KeyExportPolicy Exportable `
+            -KeyUsage DigitalSignature `
+            -KeyAlgorithm RSA `
+            -KeyLength 2048 `
+            -NotAfter (Get-Date).AddDays(1)
+          $thumbprint = $cert.Thumbprint
+          Write-Host "Created throwaway cert thumbprint=$thumbprint"
+
+          $proofDir = Join-Path $env:RUNNER_TEMP "signcommand-proof"
+          New-Item -ItemType Directory -Force -Path $proofDir | Out-Null
+          $pfxPath = Join-Path $proofDir "proof.pfx"
+          $pfxPassword = [guid]::NewGuid().ToString("n")
+          $securePass = ConvertTo-SecureString -String $pfxPassword -AsPlainText -Force
+          Export-PfxCertificate -Cert $cert -FilePath $pfxPath -Password $securePass | Out-Null
+          Remove-Item -LiteralPath "Cert:\CurrentUser\My\$thumbprint" -ErrorAction SilentlyContinue
+          $pfxBase64 = [Convert]::ToBase64String([IO.File]::ReadAllBytes($pfxPath))
+          Remove-Item -LiteralPath $proofDir -Recurse -Force -ErrorAction SilentlyContinue
+
+          # Throwaway values, but mask them anyway so nothing in this job can
+          # ever echo them (matches the "never log secrets" rule of the
+          # signing script and docs).
+          Write-Host "::add-mask::$pfxPassword"
+          Write-Host "::add-mask::$pfxBase64"
+
+          "thumbprint=$thumbprint" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "THROWAWAY_CERT_PFX_BASE64=$pfxBase64" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "THROWAWAY_CERT_PFX_PASSWORD=$pfxPassword" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
       # NSIS only — just needs to compile the template, resolve the brand images,
-      # and link all languages. NO signing secrets here on purpose: this is a
-      # pull_request trigger running PR-authored code (config/template/hooks), so
-      # exposing TAURI_SIGNING_PRIVATE_KEY / WINDOWS_CERTIFICATE would let a PR
-      # exfiltrate keys. createUpdaterArtifacts is off; Authenticode remains a
-      # release-time concern (release.yml) with optional post-build path.
-      - name: Build NSIS installer
+      # and link all languages. NO real signing secrets here on purpose: this is
+      # a pull_request trigger running PR-authored code (config/template/hooks),
+      # so exposing TAURI_SIGNING_PRIVATE_KEY / a real signing provider's
+      # credentials would let a PR exfiltrate keys. createUpdaterArtifacts is
+      # off. The throwaway certificate above is NOT a real secret — it is
+      # generated fresh in this same job, never chains to a trusted root, and
+      # grants no capability beyond this one run — so feeding it through
+      # WINDOWS_SIGNING_PROVIDER=local-pfx here is safe on a PR trigger and
+      # lets Tauri's own bundle.windows.signCommand hook
+      # (scripts/sign-windows-authenticode.ps1) actually sign all three PE
+      # layers (main exe, NSIS uninstaller, installer) during this real
+      # `tauri build`, rather than only testing the sign script in isolation.
+      - name: Build NSIS installer (signed with throwaway certificate)
         id: build
         shell: bash
+        env:
+          WINDOWS_SIGNING_PROVIDER: local-pfx
+          WINDOWS_CERTIFICATE: ${{ env.THROWAWAY_CERT_PFX_BASE64 }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ env.THROWAWAY_CERT_PFX_PASSWORD }}
         run: |
           echo "::group::[build] tauri nsis x86_64"
           npm run tauri build -- --bundles nsis --target x86_64-pc-windows-msvc
@@ -78,14 +223,14 @@ jobs:
         id: artifact
         shell: pwsh
         run: |
-          $nsis = "src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis"
+          $nsis = "target/x86_64-pc-windows-msvc/release/bundle/nsis"
           $setup = Get-ChildItem -Path $nsis -Filter "*-setup.exe" -ErrorAction Stop |
             Select-Object -First 1
           if (-not $setup) {
             Write-Host "::error::[build] no *-setup.exe under $nsis"
             exit 1
           }
-          $main = "src-tauri/target/x86_64-pc-windows-msvc/release/codex-app-manager.exe"
+          $main = "target/x86_64-pc-windows-msvc/release/codex-app-manager.exe"
           if (-not (Test-Path -LiteralPath $main)) {
             Write-Host "::error::[build] missing main PE: $main"
             exit 1
@@ -98,32 +243,69 @@ jobs:
           & .\scripts\windows-pe-arch.ps1 -Path $main -ExpectMachine 0x8664
           & .\scripts\windows-pe-arch.ps1 -Path $setup.FullName
 
+      # ── Prove the signCommand plumbing end-to-end without a real certificate ─
+      #    Asserts the installer this job just built for real (not a copy)
+      #    carries a signature whose SignerCertificate.Thumbprint matches the
+      #    throwaway cert created above — i.e. that Tauri's own signCommand
+      #    hook actually ran during `tauri build` and actually signed with the
+      #    certificate this job supplied it, not just that the sign script can
+      #    sign something in isolation. Mode=optional because a self-signed
+      #    cert never chains to a trusted root (Status is expected to be
+      #    non-Valid); -ExpectedThumbprint is what makes this a hard assertion
+      #    regardless of Status — see verify-windows-authenticode.ps1's header
+      #    comment.
+      #    Deliberately NOT checked here:
+      #    target/.../release/codex-app-manager.exe. tauri-bundler
+      #    signs a copy of the main exe for embedding in the installer and then
+      #    restores that on-disk build output to its unsigned original (tauri-cli
+      #    2.11.5, bundle.rs "Restore unsigned and unpatched binary"), so it is
+      #    NotSigned by design. The signed main exe and the NSIS uninstaller
+      #    (embedded via `!uninstfinalize`) exist as files only after
+      #    installation, so the packaged lifecycle smoke step below asserts
+      #    them, with the same thumbprint.
+      - name: Assert installer carries the throwaway certificate
+        shell: pwsh
+        run: |
+          & .\scripts\verify-windows-authenticode.ps1 `
+            -Path @("${{ steps.artifact.outputs.installer }}") `
+            -Mode optional `
+            -ExpectedThumbprint "${{ steps.throwaway-cert.outputs.thumbprint }}" `
+            -Stage "sign-proof"
+
+      # Always `optional` here, independent of vars.AUTHENTICODE_REQUIRED: this
+      # job signs with a throwaway self-signed certificate that can never be
+      # Status=Valid, so `required` mode would fail every PR once production
+      # enforcement is switched on. Enforcement applies to release.yml only;
+      # the thumbprint assertions in this job are what prove the signing hook.
       - name: Authenticode probe (optional / non-blocking)
         shell: pwsh
-        env:
-          # Flip to "required" via repo variable once OV/EV is wired into release.
-          AUTHENTICODE_MODE: ${{ vars.AUTHENTICODE_REQUIRED == 'true' && 'required' || 'optional' }}
         run: |
           & .\scripts\verify-windows-authenticode.ps1 `
             -Path "${{ steps.artifact.outputs.installer }}" `
-            -Mode $env:AUTHENTICODE_MODE `
+            -Mode optional `
             -Stage "sign-verify"
 
+      # ── Packaged lifecycle smoke, with the throwaway cert threaded through ──
+      #    -ExpectedThumbprint here is what proves the INSTALLED main exe and
+      #    the NSIS uninstaller were signed with the throwaway certificate:
+      #    both exist as signed files only once install has written them (the
+      #    on-disk build-output main exe is restored to unsigned by
+      #    tauri-bundler) — see windows-packaged-smoke.ps1's "sign-verify
+      #    (installed PE)" stage.
       - name: Packaged lifecycle smoke (install / launch / upgrade / uninstall)
         shell: pwsh
-        env:
-          AUTHENTICODE_MODE: ${{ vars.AUTHENTICODE_REQUIRED == 'true' && 'required' || 'optional' }}
         run: |
           & .\scripts\windows-packaged-smoke.ps1 `
             -Installer "${{ steps.artifact.outputs.installer }}" `
-            -AuthenticodeMode $env:AUTHENTICODE_MODE
+            -AuthenticodeMode optional `
+            -ExpectedThumbprint "${{ steps.throwaway-cert.outputs.thumbprint }}"
 
       # Upload even when smoke fails so the built installer can be inspected.
       # Still requires the build/locate steps to have produced a setup.exe.
       - name: Upload installer
         if: ${{ always() && steps.artifact.outcome == 'success' }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7
         with:
           name: nsis-installer
-          path: src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*-setup.exe
+          path: target/x86_64-pc-windows-msvc/release/bundle/nsis/*-setup.exe
           if-no-files-found: error

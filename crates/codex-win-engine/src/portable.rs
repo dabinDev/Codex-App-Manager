@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -8,10 +9,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::app_version::read_codex_app_version_from_install_root;
 use crate::msix::{parse_appx_manifest_xml, MsixIdentity};
-use crate::process::{
-    hidden_command, run_capturing, spawn_and_require_liveness, LivenessResult, RunLimits,
-    PORTABLE_LIVENESS_WINDOW,
-};
+use crate::process::{hidden_command, LivenessResult, PORTABLE_LIVENESS_WINDOW};
+#[cfg(windows)]
+use crate::process::{run_capturing, RunLimits};
 use crate::EngineError;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,6 +47,19 @@ pub struct PortableUninstallReport {
 struct PreparedPortable {
     payload_dir: PathBuf,
     identity: MsixIdentity,
+}
+
+#[derive(Debug, Clone)]
+struct BlockMapEntry {
+    logical_name: String,
+    output_path: PathBuf,
+    size: u64,
+}
+
+#[derive(Debug)]
+struct BlockMapPaths {
+    by_logical_name: HashMap<String, BlockMapEntry>,
+    remaining: HashSet<String>,
 }
 
 fn io_err(context: &str, err: impl ToString) -> EngineError {
@@ -161,8 +174,7 @@ pub fn remove_directory_all_with_retry(operation: &str, path: &Path) -> io::Resu
 }
 
 fn rename_portable_dir(operation: &str, from: &Path, to: &Path) -> Result<(), EngineError> {
-    rename_directory_with_retry(operation, from, to)
-        .map_err(|err| io_err(operation, err))
+    rename_directory_with_retry(operation, from, to).map_err(|err| io_err(operation, err))
 }
 
 fn copy_dir_all(from: &Path, to: &Path) -> Result<(), EngineError> {
@@ -180,23 +192,296 @@ fn copy_dir_all(from: &Path, to: &Path) -> Result<(), EngineError> {
     Ok(())
 }
 
+const MAX_BLOCK_MAP_BYTES: u64 = 32 * 1024 * 1024;
+
+fn is_windows_reserved_component(component: &str) -> bool {
+    let stem = component
+        .split('.')
+        .next()
+        .unwrap_or(component)
+        .to_ascii_uppercase();
+    matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || stem.strip_prefix("COM").is_some_and(|suffix| {
+            matches!(
+                suffix,
+                "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+            )
+        })
+        || stem.strip_prefix("LPT").is_some_and(|suffix| {
+            matches!(
+                suffix,
+                "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+            )
+        })
+}
+
+fn validate_windows_path_component(component: &str, source: &str) -> Result<(), EngineError> {
+    if component.is_empty() || component == "." || component == ".." {
+        return Err(EngineError::Msix(format!(
+            "unsafe MSIX path component {component:?} in {source}"
+        )));
+    }
+    if component.ends_with([' ', '.']) {
+        return Err(EngineError::Msix(format!(
+            "MSIX path component has a Windows-unsafe trailing space/dot in {source}: {component:?}"
+        )));
+    }
+    if component.chars().any(|ch| {
+        ch == '\0'
+            || ch.is_control()
+            || matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*')
+    }) {
+        return Err(EngineError::Msix(format!(
+            "MSIX path component contains a Windows-unsafe character in {source}: {component:?}"
+        )));
+    }
+    if is_windows_reserved_component(component) {
+        return Err(EngineError::Msix(format!(
+            "MSIX path uses a reserved Windows device name in {source}: {component:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn path_from_components(components: &[String]) -> PathBuf {
+    components.iter().fold(PathBuf::new(), |mut path, part| {
+        path.push(part);
+        path
+    })
+}
+
+fn windows_path_key(components: &[String]) -> String {
+    components
+        .iter()
+        .map(|component| component.to_lowercase())
+        .collect::<Vec<_>>()
+        .join("\\")
+}
+
+fn parse_logical_msix_path(name: &str) -> Result<Vec<String>, EngineError> {
+    if name.is_empty() || name.starts_with(['\\', '/']) || name.contains('/') {
+        return Err(EngineError::Msix(format!(
+            "invalid AppxBlockMap logical path: {name:?}"
+        )));
+    }
+    let components = name.split('\\').map(str::to_string).collect::<Vec<_>>();
+    for component in &components {
+        validate_windows_path_component(component, name)?;
+    }
+    Ok(components)
+}
+
+fn parse_appx_block_map(xml: &str) -> Result<BlockMapPaths, EngineError> {
+    let document = roxmltree::Document::parse(xml)
+        .map_err(|err| EngineError::Msix(format!("AppxBlockMap.xml: {err}")))?;
+    let mut by_logical_name = HashMap::new();
+    let mut windows_names = HashMap::<String, String>::new();
+
+    for file in document
+        .descendants()
+        .filter(|node| node.has_tag_name("File"))
+    {
+        let logical_name = file
+            .attribute("Name")
+            .ok_or_else(|| EngineError::Msix("AppxBlockMap File missing Name".to_string()))?
+            .to_string();
+        let size = file
+            .attribute("Size")
+            .ok_or_else(|| {
+                EngineError::Msix(format!("AppxBlockMap File missing Size: {logical_name}"))
+            })?
+            .parse::<u64>()
+            .map_err(|err| {
+                EngineError::Msix(format!(
+                    "AppxBlockMap File has invalid Size for {logical_name}: {err}"
+                ))
+            })?;
+        let components = parse_logical_msix_path(&logical_name)?;
+        let windows_key = windows_path_key(&components);
+        if let Some(previous) = windows_names.insert(windows_key, logical_name.clone()) {
+            return Err(EngineError::Msix(format!(
+                "AppxBlockMap paths collide on Windows: {previous:?} and {logical_name:?}"
+            )));
+        }
+        let canonical_name = components.join("\\");
+        let entry = BlockMapEntry {
+            logical_name: logical_name.clone(),
+            output_path: path_from_components(&components),
+            size,
+        };
+        if by_logical_name.insert(canonical_name, entry).is_some() {
+            return Err(EngineError::Msix(format!(
+                "duplicate AppxBlockMap path: {logical_name}"
+            )));
+        }
+    }
+
+    if by_logical_name.is_empty() {
+        return Err(EngineError::Msix(
+            "AppxBlockMap.xml contains no payload files".to_string(),
+        ));
+    }
+    let remaining = by_logical_name.keys().cloned().collect();
+    Ok(BlockMapPaths {
+        by_logical_name,
+        remaining,
+    })
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn decode_zip_component(component: &str, source: &str) -> Result<(String, bool), EngineError> {
+    let bytes = component.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut changed = false;
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'%' {
+            decoded.push(bytes[index]);
+            index += 1;
+            continue;
+        }
+        let high = bytes.get(index + 1).and_then(|byte| hex_value(*byte));
+        let low = bytes.get(index + 2).and_then(|byte| hex_value(*byte));
+        let (Some(high), Some(low)) = (high, low) else {
+            return Err(EngineError::Msix(format!(
+                "invalid percent escape in MSIX ZIP path: {source:?}"
+            )));
+        };
+        let value = (high << 4) | low;
+        if matches!(value, 0 | b'/' | b'\\') {
+            return Err(EngineError::Msix(format!(
+                "encoded path separator/NUL is forbidden in MSIX ZIP path: {source:?}"
+            )));
+        }
+        decoded.push(value);
+        changed = true;
+        index += 3;
+    }
+    let decoded = String::from_utf8(decoded).map_err(|err| {
+        EngineError::Msix(format!(
+            "percent-decoded MSIX ZIP path is not UTF-8 ({source:?}): {err}"
+        ))
+    })?;
+    validate_windows_path_component(&decoded, source)?;
+    Ok((decoded, changed))
+}
+
+fn decode_zip_entry_path(name: &str) -> Result<(Vec<String>, bool), EngineError> {
+    if name.is_empty() || name.starts_with(['/', '\\']) || name.contains('\\') {
+        return Err(EngineError::Msix(format!(
+            "invalid MSIX ZIP entry path: {name:?}"
+        )));
+    }
+    let name = name.strip_suffix('/').unwrap_or(name);
+    let mut changed = false;
+    let mut components = Vec::new();
+    for component in name.split('/') {
+        let (decoded, component_changed) = decode_zip_component(component, name)?;
+        changed |= component_changed;
+        components.push(decoded);
+    }
+    Ok((components, changed))
+}
+
+fn read_appx_block_map(
+    zip: &mut zip::ZipArchive<fs::File>,
+) -> Result<Option<BlockMapPaths>, EngineError> {
+    let mut block_map = match zip.by_name("AppxBlockMap.xml") {
+        Ok(file) => file,
+        Err(zip::result::ZipError::FileNotFound) => return Ok(None),
+        Err(err) => return Err(EngineError::Msix(format!("read AppxBlockMap.xml: {err}"))),
+    };
+    if block_map.size() > MAX_BLOCK_MAP_BYTES {
+        return Err(EngineError::Msix(format!(
+            "AppxBlockMap.xml is unexpectedly large: {} bytes",
+            block_map.size()
+        )));
+    }
+    let mut xml = String::new();
+    block_map
+        .read_to_string(&mut xml)
+        .map_err(|err| EngineError::Msix(format!("decode AppxBlockMap.xml: {err}")))?;
+    parse_appx_block_map(&xml).map(Some)
+}
+
 fn extract_msix(msix_path: &Path, dest: &Path) -> Result<String, EngineError> {
     let file = fs::File::open(msix_path).map_err(|e| io_err("open MSIX", e))?;
     let mut zip =
         zip::ZipArchive::new(file).map_err(|e| EngineError::Msix(format!("open zip: {e}")))?;
+    let mut block_map = read_appx_block_map(&mut zip)?;
     let mut manifest_xml = None;
+    let mut written_paths = HashMap::<String, String>::new();
+    let mut logical_path_remaps = 0usize;
 
     for idx in 0..zip.len() {
         let mut file = zip
             .by_index(idx)
             .map_err(|e| EngineError::Msix(format!("read zip entry {idx}: {e}")))?;
-        let Some(enclosed) = file.enclosed_name() else {
-            continue;
-        };
-        let out_path = dest.join(&enclosed);
+        let zip_name = codex_archive::entry_name(&file)
+            .map_err(|e| EngineError::Msix(format!("decode zip entry {idx} name: {e}")))?
+            .into_owned();
+        let (decoded_components, was_percent_encoded) = decode_zip_entry_path(&zip_name)?;
         if file.is_dir() {
-            fs::create_dir_all(&out_path).map_err(|e| io_err("create extracted dir", e))?;
             continue;
+        }
+
+        let decoded_name = decoded_components.join("\\");
+        let output_path = if let Some(paths) = block_map.as_mut() {
+            if let Some(entry) = paths.by_logical_name.get(&decoded_name) {
+                if file.size() != entry.size {
+                    return Err(EngineError::Msix(format!(
+                        "MSIX payload size disagrees with AppxBlockMap for {}: zip={} blockMap={}",
+                        entry.logical_name,
+                        file.size(),
+                        entry.size
+                    )));
+                }
+                paths.remaining.remove(&decoded_name);
+                if was_percent_encoded {
+                    logical_path_remaps += 1;
+                }
+                entry.output_path.clone()
+            } else {
+                if was_percent_encoded {
+                    return Err(EngineError::Msix(format!(
+                        "percent-encoded MSIX ZIP entry is not described by AppxBlockMap.xml: {zip_name}"
+                    )));
+                }
+                path_from_components(&decoded_components)
+            }
+        } else {
+            if was_percent_encoded {
+                return Err(EngineError::Msix(format!(
+                    "cannot safely map percent-encoded MSIX ZIP entry without AppxBlockMap.xml: {zip_name}"
+                )));
+            }
+            path_from_components(&decoded_components)
+        };
+        let output_components = output_path
+            .iter()
+            .map(|component| component.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let output_key = windows_path_key(&output_components);
+        if let Some(previous) = written_paths.insert(output_key, zip_name.clone()) {
+            return Err(EngineError::Msix(format!(
+                "MSIX entries collide on Windows after logical path mapping: {previous:?} and {zip_name:?}"
+            )));
+        }
+
+        let out_path = dest.join(&output_path);
+        if !out_path.starts_with(dest) {
+            return Err(EngineError::Msix(format!(
+                "MSIX logical path escaped extraction root: {}",
+                output_path.display()
+            )));
         }
         if let Some(parent) = out_path.parent() {
             fs::create_dir_all(parent).map_err(|e| io_err("create extracted parent", e))?;
@@ -205,11 +490,11 @@ fn extract_msix(msix_path: &Path, dest: &Path) -> Result<String, EngineError> {
             fs::File::create(&out_path).map_err(|e| io_err("create extracted file", e))?;
         std::io::copy(&mut file, &mut out).map_err(|e| io_err("extract file", e))?;
 
-        if enclosed
+        if output_path
             .file_name()
             .and_then(|s| s.to_str())
             .is_some_and(|s| s.eq_ignore_ascii_case("AppxManifest.xml"))
-            && enclosed.components().count() == 1
+            && output_path.components().count() == 1
         {
             let mut xml = String::new();
             fs::File::open(&out_path)
@@ -219,6 +504,26 @@ fn extract_msix(msix_path: &Path, dest: &Path) -> Result<String, EngineError> {
         }
     }
 
+    if let Some(paths) = block_map {
+        if !paths.remaining.is_empty() {
+            let mut missing = paths.remaining.into_iter().collect::<Vec<_>>();
+            missing.sort();
+            let preview = missing
+                .iter()
+                .take(3)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(EngineError::Msix(format!(
+                "MSIX is missing {} payload file(s) declared by AppxBlockMap.xml: {preview}",
+                missing.len()
+            )));
+        }
+        log::info!(
+            "portable MSIX extraction used AppxBlockMap logical paths remapped_entries={logical_path_remaps}"
+        );
+    }
+
     manifest_xml.ok_or_else(|| EngineError::Msix("MSIX missing AppxManifest.xml".to_string()))
 }
 
@@ -226,6 +531,67 @@ fn extract_msix(msix_path: &Path, dest: &Path) -> Result<String, EngineError> {
 /// Post-merge packages keep a legacy `Codex.exe` next to the real entrypoint,
 /// so `ChatGPT.exe` must win when the manifest can't tell us (it normally can).
 const APP_EXE_CANDIDATES: [&str; 2] = ["ChatGPT.exe", "Codex.exe"];
+
+fn is_manager_launcher(path: &Path) -> bool {
+    // Manager launchers are small; don't read a large official Electron binary
+    // just to exclude aliases from a damaged portable root.
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    if metadata.len() > 4 * 1024 * 1024 {
+        return false;
+    }
+    let Ok(bytes) = fs::read(path) else {
+        return false;
+    };
+    if bytes.get(..2) != Some(b"MZ") {
+        return false;
+    }
+    let u16_at = |offset: usize| {
+        bytes
+            .get(offset..offset.checked_add(2)?)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]) as usize)
+    };
+    let u32_at = |offset: usize| {
+        bytes
+            .get(offset..offset.checked_add(4)?)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)
+    };
+    let Some(pe) = u32_at(0x3c) else {
+        return false;
+    };
+    if pe > bytes.len().saturating_sub(24) || bytes.get(pe..pe + 4) != Some(b"PE\0\0") {
+        return false;
+    }
+    let Some(count) = u16_at(pe + 6) else {
+        return false;
+    };
+    let Some(optional_size) = u16_at(pe + 20) else {
+        return false;
+    };
+    let table = pe + 24 + optional_size;
+    for index in 0..count.min(128) {
+        let offset = table + index * 40;
+        if bytes.get(offset..offset + 8) != Some(b".camlnch") {
+            continue;
+        }
+        let Some(size) = u32_at(offset + 16) else {
+            return false;
+        };
+        let Some(start) = u32_at(offset + 20) else {
+            return false;
+        };
+        return start
+            .checked_add(size)
+            .and_then(|end| bytes.get(start..end))
+            .is_some_and(|section| section.starts_with(&crate::portable_command::LAUNCHER_MARKER));
+    }
+    false
+}
+
+fn is_installed_payload_exe(root: &Path, exe: &Path) -> bool {
+    exe.is_file() && (exe.parent() != Some(root) || !is_manager_launcher(exe))
+}
 
 fn find_exe_named(root: &Path, name: &str) -> Result<Option<PathBuf>, EngineError> {
     let mut stack = vec![root.to_path_buf()];
@@ -285,24 +651,40 @@ fn find_app_exe(root: &Path, manifest_xml: &str) -> Result<PathBuf, EngineError>
 
 /// The entry executable of an installed portable root. Reads the payload's
 /// `AppxManifest.xml` (written at install time) for the declared executable's
-/// basename — the payload root is the exe's directory, so only the basename
-/// applies. A declared-but-missing entry returns `None` (the install is
-/// broken; picking a leftover non-entry binary would mask that). The known
+/// basename. New installations keep the official files in `app/`; older
+/// installations flattened them into the root. Never select a root launcher
+/// alias for a nested installation. A declared-but-missing entry returns `None`
+/// (picking a leftover non-entry binary would mask a broken install). The known
 /// entry names are probed only for roots without a declaring manifest.
 pub fn installed_app_exe(install_root: &Path) -> Option<PathBuf> {
+    let nested = install_root.join(crate::portable_command::APP_DIR_NAME);
+    // The config also identifies a nested install whose app directory was
+    // removed/quarantined. Its remaining root aliases are not app executables.
+    let nested_target =
+        fs::read_to_string(install_root.join(crate::portable_command::LAUNCH_TARGET_NAME))
+            .ok()
+            .and_then(|config| {
+                crate::portable_command::parse_launch_config(&config)
+                    .map(|(target, _)| target.replace('\\', "/").starts_with("app/"))
+            });
+    let app_root = if nested_target.unwrap_or_else(|| nested.is_dir()) {
+        nested.as_path()
+    } else {
+        install_root
+    };
     let manifest = install_root.join("AppxManifest.xml");
     if let Ok(xml) = fs::read_to_string(&manifest) {
         if let Some(declared) = crate::msix::parse_appx_application_executable(&xml) {
             let basename = declared.replace('\\', "/");
             let name = basename.rsplit('/').next()?;
-            let exe = install_root.join(name);
-            return exe.is_file().then_some(exe);
+            let exe = app_root.join(name);
+            return is_installed_payload_exe(install_root, &exe).then_some(exe);
         }
     }
     APP_EXE_CANDIDATES
         .into_iter()
-        .map(|name| install_root.join(name))
-        .find(|exe| exe.is_file())
+        .map(|name| app_root.join(name))
+        .find(|exe| is_installed_payload_exe(install_root, exe))
 }
 
 fn prepare_portable_payload(
@@ -322,19 +704,159 @@ fn prepare_portable_payload(
     let manifest_xml = extract_msix(msix_path, &extracted)?;
     let identity = parse_appx_manifest_xml(&manifest_xml)?;
     let exe = find_app_exe(&extracted, &manifest_xml)?;
-    let exe_dir = exe
-        .parent()
-        .ok_or_else(|| EngineError::Msix("app entry executable had no parent directory".to_string()))?;
+    let exe_dir = exe.parent().ok_or_else(|| {
+        EngineError::Msix("app entry executable had no parent directory".to_string())
+    })?;
 
-    copy_dir_all(exe_dir, &payload)?;
+    // Keep Electron's executable, DLLs and resources together, while the root
+    // contains only Manager launchers. The entire tree is swapped atomically.
+    copy_dir_all(
+        exe_dir,
+        &payload.join(crate::portable_command::APP_DIR_NAME),
+    )?;
     fs::write(payload.join("AppxManifest.xml"), manifest_xml)
         .map_err(|e| io_err("write portable AppxManifest.xml", e))?;
+    ensure_portable_launcher(&payload)?;
 
     Ok(PreparedPortable {
         payload_dir: payload,
         identity,
     })
 }
+
+/// Materialize the Manager-owned native launcher without touching upstream files.
+/// Called inside staging for atomic update/rollback, and on launch to repair old installs.
+pub fn ensure_portable_launcher(root: &Path) -> Result<PathBuf, EngineError> {
+    let exe = installed_app_exe(root).ok_or_else(|| {
+        EngineError::Install(format!("no portable app executable in {}", root.display()))
+    })?;
+    // Validate a required CLI before committing a broken payload, even when no
+    // post-install launch was requested. Older fixture/legacy packages may omit it.
+    portable_launch_command(&exe)?;
+    #[cfg(windows)]
+    {
+        use crate::portable_command::{LAUNCHER_NAME, LAUNCH_TARGET_NAME};
+        const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/LaunchCodex.exe"));
+        let target = exe
+            .strip_prefix(root)
+            .ok()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| EngineError::Install("invalid portable executable name".into()))?;
+        let required = crate::app_version::requires_portable_cli(exe.parent().unwrap_or(root));
+        let config = format!("{target}\nrequire-cli={}", u8::from(required));
+        if crate::portable_command::parse_launch_config(&config) != Some((target, required)) {
+            return Err(EngineError::Install(
+                "invalid portable launch target".into(),
+            ));
+        }
+        let nested =
+            exe.parent() == Some(root.join(crate::portable_command::APP_DIR_NAME).as_path());
+        let names: &[&str] = if nested {
+            // Preserve existing root shortcuts and pins, including shortcuts
+            // that used to point directly at the official ChatGPT executable.
+            &["Codex.exe", "ChatGPT.exe", LAUNCHER_NAME]
+        } else {
+            &[LAUNCHER_NAME]
+        };
+        for name in names {
+            write_portable_entry_file(&root.join(name), BYTES)?;
+        }
+        // New launchers accept old single-line configs. Commit the new format
+        // only after every launcher is upgraded; a failed repair leaves the
+        // original config usable. Atomic replacement avoids truncated files.
+        write_portable_entry_file(&root.join(LAUNCH_TARGET_NAME), config.as_bytes())?;
+        Ok(root.join(names[0]))
+    }
+    #[cfg(not(windows))]
+    Ok(exe)
+}
+
+#[cfg(windows)]
+fn write_portable_entry_file(path: &Path, bytes: &[u8]) -> Result<(), EngineError> {
+    if fs::read(path).ok().as_deref() == Some(bytes) {
+        return Ok(());
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| EngineError::Install("missing launcher parent".into()))?;
+    let temporary = parent.join(format!(".codex-portable-write-{}", uuid::Uuid::new_v4()));
+    let mut created = false;
+    let result = (|| {
+        use std::io::Write;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .map_err(|error| io_err("create portable entry file", error))?;
+        created = true;
+        file.write_all(bytes)
+            .map_err(|error| io_err("write portable entry file", error))?;
+        drop(file);
+        rename_portable_dir("replace portable entry file", &temporary, path)
+    })();
+    if created && result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+pub(crate) fn portable_launch_command(exe: &Path) -> Result<std::process::Command, EngineError> {
+    let root = exe
+        .parent()
+        .ok_or_else(|| EngineError::Install("missing portable directory".into()))?;
+    let mut command = hidden_command(exe);
+    crate::portable_command::configure(
+        &mut command,
+        exe,
+        crate::app_version::requires_portable_cli(root),
+    )
+    .map_err(|e| io_err("configure portable launch", e))?;
+    Ok(command)
+}
+
+pub(crate) fn repair_portable_launch_entry(root: &Path) -> Result<(), EngineError> {
+    ensure_portable_launcher(root)?;
+    if let Err(error) = create_start_menu_shortcut(root) {
+        log::warn!("portable shortcut repair failed: {error}");
+    }
+    #[cfg(windows)]
+    if let Some(appdata) = std::env::var_os("APPDATA") {
+        let programs = PathBuf::from(appdata).join("Microsoft/Windows/Start Menu/Programs");
+        if let Err(error) = repair_legacy_start_menu_icon(root, &programs) {
+            log::warn!("legacy portable shortcut icon repair failed: {error}");
+        }
+    }
+    // Legacy uninstall commands must learn protocol cleanup before its handler
+    // is added. Refreshing them is also required when repairing a flat install.
+    let version = read_codex_app_version_from_install_root(root).or_else(|| {
+        fs::read_to_string(root.join("AppxManifest.xml")).ok()
+            .and_then(|xml| parse_appx_manifest_xml(&xml).ok())
+            .map(|identity| identity.version)
+    }).unwrap_or_default();
+    match register_uninstall_entry(root, &version, None) {
+        Ok(true) => {
+            match register_portable_protocol(root) {
+                Ok(true) => {},
+                Ok(false) => log::warn!("portable protocol repair skipped: existing registration was preserved"),
+                Err(error) => log::warn!("portable protocol repair failed: {error}"),
+            }
+        }
+        Err(error) => log::warn!("portable uninstall metadata repair failed: {error}"),
+        Ok(false) => {}
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn register_portable_protocol(root: &Path) -> Result<bool, EngineError> {
+    let launcher = ensure_portable_launcher(root)?;
+    let Some(icon) = installed_app_exe(root) else { return Ok(false); };
+    crate::portable_protocol::register(&launcher, &icon)
+        .map_err(|error| io_err("register portable protocol", error))
+}
+
+#[cfg(not(windows))]
+fn register_portable_protocol(_root: &Path) -> Result<bool, EngineError> { Ok(false) }
 
 #[cfg(windows)]
 fn ps_quote(value: &str) -> String {
@@ -356,7 +878,7 @@ fn powershell_exe() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("powershell.exe"))
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, not(test)))]
 fn run_powershell(script: &str) -> Result<String, EngineError> {
     // Shortcut/uninstall metadata scripts can wait on COM or registry work; use
     // the install budget so a stuck policy machine cannot hang forever.
@@ -364,12 +886,11 @@ fn run_powershell(script: &str) -> Result<String, EngineError> {
 }
 
 #[cfg(windows)]
-fn run_powershell_with_limits(
-    script: &str,
-    limits: RunLimits,
-) -> Result<String, EngineError> {
+fn run_powershell_with_limits(script: &str, limits: RunLimits) -> Result<String, EngineError> {
     let mut command = hidden_command(powershell_exe());
-    command.args(["-NoProfile", "-NonInteractive", "-Command", script]);
+    let script = format!("try {{ [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false) }} catch {{ }}\n{script}");
+    let encoded = crate::sys::encode_powershell_command(&script);
+    command.args(["-NoProfile", "-NonInteractive", "-EncodedCommand", &encoded]);
     let output = run_capturing(command, limits, None)
         .map_err(|e| EngineError::Install(format!("powershell: {}", e.message())))?;
     if !output.status.success() {
@@ -391,7 +912,148 @@ pub fn codex_running_for_root(root: &Path) -> Result<bool, EngineError> {
     crate::windows_process::codex_processes_running_for_root(root)
 }
 
+/// Only remove the independently created Manager shortcut, preserving links
+/// which the user or the Windows package created at the same location.
 #[cfg(windows)]
+pub fn remove_manager_launch_shortcut() -> Result<(), EngineError> {
+    let Some(appdata) = std::env::var_os("APPDATA") else {
+        return Ok(());
+    };
+    let shortcut = PathBuf::from(appdata).join("Microsoft/Windows/Start Menu/Programs/Codex.lnk");
+    if !shortcut.exists() {
+        return Ok(());
+    }
+    let manager = std::env::current_exe().map_err(|error| io_err("locate Manager", error))?;
+    if crate::portable_shortcut::is_manager_launcher(&shortcut, &manager)
+        .map_err(|error| io_err("inspect Codex shortcut", error))?
+    {
+        fs::remove_file(shortcut).map_err(|error| io_err("remove Codex shortcut", error))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub fn remove_manager_launch_shortcut() -> Result<(), EngineError> {
+    Ok(())
+}
+
+/// Icon for shortcuts that start Codex: the official icon file when shipped,
+/// then the official executable's own icon, then the Manager launcher stub
+/// (which embeds an icon). Never the Manager executable.
+#[cfg(any(windows, test))]
+pub(crate) fn pick_shortcut_icon(
+    app_exe: Option<&Path>,
+    launcher: &Path,
+    exists: impl Fn(&Path) -> bool,
+) -> PathBuf {
+    if let Some(exe) = app_exe {
+        if let Some(dir) = exe.parent() {
+            let ico = dir.join("resources").join("icon-chatgpt.ico");
+            if exists(&ico) {
+                return ico;
+            }
+        }
+        return exe.to_path_buf();
+    }
+    launcher.to_path_buf()
+}
+
+#[cfg(windows)]
+fn shortcut_icon(install_root: &Path) -> PathBuf {
+    let launcher = install_root.join(crate::portable_command::LAUNCHER_NAME);
+    pick_shortcut_icon(installed_app_exe(install_root).as_deref(), &launcher, |p| {
+        p.is_file()
+    })
+}
+
+/// A stable Manager entry activates MSIX with package identity, or launches a
+/// portable build, using the saved arguments. It also works while Manager is closed.
+#[cfg(windows)]
+pub fn create_manager_launch_shortcut(
+    manager_exe: &Path,
+    installed: &Path,
+) -> Result<(), EngineError> {
+    let appdata = std::env::var_os("APPDATA")
+        .ok_or_else(|| EngineError::Io("APPDATA is unavailable".into()))?;
+    let shortcut = PathBuf::from(appdata).join("Microsoft/Windows/Start Menu/Programs/Codex.lnk");
+    if let Some(parent) = shortcut.parent() {
+        fs::create_dir_all(parent).map_err(|error| io_err("create shortcut directory", error))?;
+    }
+    let icon = shortcut_icon(installed);
+    let workdir = manager_exe.parent()
+        .ok_or_else(|| EngineError::Io("Manager executable has no parent directory".into()))?;
+    let spec = crate::portable_shortcut::ShortcutSpec::new(
+        manager_exe,
+        workdir,
+        &icon,
+        "--launch-codex",
+    );
+    // Read-compare-write: an unchanged shortcut is not rewritten on every launch.
+    crate::portable_shortcut::ensure(&shortcut, &spec)
+        .map(|_| ())
+        .map_err(|error| io_err("update Codex shortcut", error))
+}
+
+#[cfg(not(windows))]
+pub fn create_manager_launch_shortcut(
+    _manager_exe: &Path,
+    _installed: &Path,
+) -> Result<(), EngineError> {
+    Ok(())
+}
+
+/// Repair only a legacy link to this installation with a blank or obsolete
+/// default icon. Preserve custom icon sources, including unresolved paths.
+#[cfg(windows)]
+fn repair_legacy_start_menu_icon(install_root: &Path, programs: &Path) -> Result<bool, EngineError> {
+    let shortcut = programs.join("ChatGPT.lnk");
+    if !shortcut.exists() {
+        return Ok(false);
+    }
+    let Some(exe) = installed_app_exe(install_root) else {
+        return Ok(false);
+    };
+    let nested =
+        exe.parent() == Some(install_root.join(crate::portable_command::APP_DIR_NAME).as_path());
+    let Some(app_dir) = exe.parent() else {
+        return Ok(false);
+    };
+    let launcher_paths = [
+        install_root.join(crate::portable_command::LAUNCHER_NAME),
+        install_root.join("Codex.exe"),
+        install_root.join("ChatGPT.exe"),
+    ];
+    let launchers = if nested {
+        &launcher_paths[..]
+    } else {
+        &launcher_paths[..1]
+    };
+    let official_icon_paths = [
+        app_dir.join("resources/icon-chatgpt.ico"),
+        app_dir.join("ChatGPT.exe"),
+        app_dir.join("Codex.exe"),
+    ];
+    crate::portable_shortcut::ensure_icon_if(&shortcut, &shortcut_icon(install_root), |current| {
+        let is_entry = crate::same_windows_path(&current.target, &exe)
+            || launchers
+                .iter()
+                .any(|path| crate::same_windows_path(&current.target, path));
+        if !is_entry {
+            return false;
+        }
+        current.icon.as_os_str().is_empty()
+            || launchers
+                .iter()
+                .any(|path| crate::same_windows_path(&current.icon, path))
+            || (official_icon_paths
+                .iter()
+                .any(|path| crate::same_windows_path(&current.icon, path))
+                && !current.icon.is_file())
+    })
+    .map_err(|error| io_err("repair legacy portable shortcut icon", error))
+}
+
+#[cfg(all(windows, not(test)))]
 fn create_start_menu_shortcut(install_root: &Path) -> Result<bool, EngineError> {
     let Some(exe) = installed_app_exe(install_root) else {
         return Ok(false);
@@ -405,85 +1067,101 @@ fn create_start_menu_shortcut(install_root: &Path) -> Result<bool, EngineError> 
         .join("Start Menu")
         .join("Programs")
         .join("Codex.lnk");
-    let script = format!(
-        r#"
-$shell = New-Object -ComObject WScript.Shell
-$shortcut = $shell.CreateShortcut({shortcut})
-$shortcut.TargetPath = {target}
-$shortcut.WorkingDirectory = {workdir}
-$shortcut.IconLocation = {icon}
-$shortcut.Save()
-"#,
-        shortcut = ps_quote(&shortcut.to_string_lossy()),
-        target = ps_quote(&exe.to_string_lossy()),
-        workdir = ps_quote(&install_root.to_string_lossy()),
-        icon = ps_quote(&format!("{},0", exe.to_string_lossy()))
+    // Repair must not replace the saved-arguments entry, including when the
+    // subsequent launch fails and the user retries from the Start Menu.
+    if shortcut.exists() {
+        let manager = std::env::current_exe().map_err(|error| io_err("locate Manager", error))?;
+        if crate::portable_shortcut::is_manager_launcher(&shortcut, &manager)
+            .map_err(|error| io_err("inspect Codex shortcut", error))?
+        {
+            // Keep the user's arguments; only repair a blank/stale icon.
+            crate::portable_shortcut::ensure_icon(&shortcut, &shortcut_icon(install_root))
+                .map_err(|error| io_err("repair Codex shortcut icon", error))?;
+            return Ok(true);
+        }
+    }
+    if let Some(parent) = shortcut.parent() {
+        fs::create_dir_all(parent).map_err(|error| io_err("create shortcut directory", error))?;
+    }
+    let launcher = ensure_portable_launcher(install_root)?;
+    let spec = crate::portable_shortcut::ShortcutSpec::new(
+        &launcher,
+        install_root,
+        &pick_shortcut_icon(Some(&exe), &launcher, |p| p.is_file()),
+        "",
     );
-    run_powershell(&script)?;
+    crate::portable_shortcut::ensure(&shortcut, &spec)
+        .map_err(|error| io_err("create portable shortcut", error))?;
     Ok(true)
 }
 
-#[cfg(not(windows))]
+#[cfg(any(not(windows), test))]
 fn create_start_menu_shortcut(_install_root: &Path) -> Result<bool, EngineError> {
     Ok(false)
 }
 
+#[cfg(all(windows, not(test)))]
+fn register_uninstall_entry(install_root: &Path, version: &str, estimated_size_kb: Option<u64>) -> Result<bool, EngineError> {
+    let exe=installed_app_exe(install_root).unwrap_or_else(|| install_root.join("Codex.exe"));
+    let launcher=ensure_portable_launcher(install_root)?;
+    run_powershell(&uninstall_metadata_script(install_root,&launcher,&exe,version,estimated_size_kb))?;
+    Ok(true)
+}
+
 #[cfg(windows)]
-fn register_uninstall_entry(
-    install_root: &Path,
-    version: &str,
-    estimated_size_kb: u64,
-) -> Result<bool, EngineError> {
-    // Icon only — the entry works without one, so fall back to the legacy name.
-    let exe = installed_app_exe(install_root).unwrap_or_else(|| install_root.join("Codex.exe"));
+fn uninstall_metadata_script(install_root: &Path, launcher: &Path, exe: &Path, version: &str, estimated_size_kb: Option<u64>) -> String {
     let uninstall_script = format!(
-        "if ($env:APPDATA) {{ $Shortcut = Join-Path $env:APPDATA 'Microsoft\\Windows\\Start Menu\\Programs\\Codex.lnk'; Remove-Item -LiteralPath $Shortcut -Force -ErrorAction SilentlyContinue }}; Remove-Item -LiteralPath '{}' -Recurse -Force -ErrorAction SilentlyContinue; Remove-Item -LiteralPath 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Codex' -Recurse -Force -ErrorAction SilentlyContinue",
+        "{}; if ($env:APPDATA) {{ $Shortcut = Join-Path $env:APPDATA 'Microsoft\\Windows\\Start Menu\\Programs\\Codex.lnk'; Remove-Item -LiteralPath $Shortcut -Force -ErrorAction SilentlyContinue }}; Remove-Item -LiteralPath '{}' -Recurse -Force -ErrorAction SilentlyContinue; Remove-Item -LiteralPath 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Codex' -Recurse -Force -ErrorAction SilentlyContinue",
+        crate::portable_protocol::uninstall_script(launcher),
         install_root.to_string_lossy().replace('\'', "''")
     );
-    // Wrap the script in DOUBLE quotes, not single, so Windows' uninstall entry
-    // actually RUNS it: `-Command '<script>'` makes PowerShell evaluate the text
-    // as one string literal and echo it back; `-Command "<script>"` executes it.
-    // The install path sits in single quotes inside, and Windows paths can't
-    // contain '"', so the outer double quotes stay unambiguous. -ExecutionPolicy
-    // Bypass keeps a restrictive machine policy from blocking the removal.
+    // The protocol cleanup compares a quoted executable command. Encode the
+    // complete script to avoid another Windows command-line quoting layer.
     let uninstall_string = format!(
-        "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \"{uninstall_script}\""
+        "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand {}",
+        crate::sys::encode_powershell_command(&uninstall_script)
     );
+    // Launch repair preserves the existing size (or leaves it unknown). Only
+    // an actual install/update traverses the payload to refresh this estimate.
+    let estimated_size_update = estimated_size_kb.map(|size| format!(
+        "New-ItemProperty -Path $key -Name EstimatedSize -Value {} -PropertyType DWord -Force | Out-Null",
+        size.min(u32::MAX as u64)
+    )).unwrap_or_default();
     let script = format!(
         r#"
 $key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Codex'
+$uninstallCommand = {uninstall_string}
 New-Item -Path $key -Force | Out-Null
 New-ItemProperty -Path $key -Name DisplayName -Value 'Codex' -PropertyType String -Force | Out-Null
 New-ItemProperty -Path $key -Name DisplayVersion -Value {version} -PropertyType String -Force | Out-Null
 New-ItemProperty -Path $key -Name Publisher -Value 'OpenAI' -PropertyType String -Force | Out-Null
 New-ItemProperty -Path $key -Name InstallLocation -Value {install_root} -PropertyType String -Force | Out-Null
 New-ItemProperty -Path $key -Name DisplayIcon -Value {icon} -PropertyType String -Force | Out-Null
-New-ItemProperty -Path $key -Name UninstallString -Value {uninstall_string} -PropertyType String -Force | Out-Null
-New-ItemProperty -Path $key -Name QuietUninstallString -Value {uninstall_string} -PropertyType String -Force | Out-Null
+New-ItemProperty -Path $key -Name UninstallString -Value $uninstallCommand -PropertyType String -Force | Out-Null
+New-ItemProperty -Path $key -Name QuietUninstallString -Value $uninstallCommand -PropertyType String -Force | Out-Null
 New-ItemProperty -Path $key -Name NoModify -Value 1 -PropertyType DWord -Force | Out-Null
 New-ItemProperty -Path $key -Name NoRepair -Value 1 -PropertyType DWord -Force | Out-Null
-New-ItemProperty -Path $key -Name EstimatedSize -Value {estimated_size_kb} -PropertyType DWord -Force | Out-Null
+{estimated_size_update}
 "#,
         version = ps_quote(version),
         install_root = ps_quote(&install_root.to_string_lossy()),
         icon = ps_quote(&format!("{},0", exe.to_string_lossy())),
         uninstall_string = ps_quote(&uninstall_string),
-        estimated_size_kb = estimated_size_kb.min(u32::MAX as u64)
+        estimated_size_update = estimated_size_update
     );
-    run_powershell(&script)?;
-    Ok(true)
+    script
 }
 
-#[cfg(not(windows))]
+#[cfg(any(not(windows), test))]
 fn register_uninstall_entry(
     _install_root: &Path,
     _version: &str,
-    _estimated_size_kb: u64,
+    _estimated_size_kb: Option<u64>,
 ) -> Result<bool, EngineError> {
     Ok(false)
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, not(test)))]
 fn remove_start_menu_shortcut() -> Result<bool, EngineError> {
     let Some(appdata) = std::env::var_os("APPDATA") else {
         return Ok(false);
@@ -502,12 +1180,12 @@ fn remove_start_menu_shortcut() -> Result<bool, EngineError> {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(any(not(windows), test))]
 fn remove_start_menu_shortcut() -> Result<bool, EngineError> {
     Ok(false)
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, not(test)))]
 fn remove_uninstall_entry() -> Result<bool, EngineError> {
     let script = r#"
 $key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Codex'
@@ -521,7 +1199,7 @@ if (Test-Path $key) {
     Ok(run_powershell(script)?.trim().ends_with("removed"))
 }
 
-#[cfg(not(windows))]
+#[cfg(any(not(windows), test))]
 fn remove_uninstall_entry() -> Result<bool, EngineError> {
     Ok(false)
 }
@@ -578,6 +1256,15 @@ fn rollback_install_error(
     observer: &mut PortableObserver<'_>,
     err: EngineError,
 ) -> EngineError {
+    // Give the app layer a durable, pre-rename marker before the only backup is
+    // consumed. The rollback itself still proceeds if bookkeeping fails: disk
+    // safety wins, and RollbackCompleted gets a second chance to persist truth.
+    let intent_error = observer(PortableBoundary::BeforeRollback {
+        install_root: install_root.to_path_buf(),
+        backup: backup.to_path_buf(),
+        had_previous,
+    })
+    .err();
     match restore_previous_install(install_root, backup, had_previous) {
         Ok(()) => {
             let restored = if had_previous {
@@ -585,13 +1272,17 @@ fn rollback_install_error(
             } else {
                 "new install was removed and the absent state was restored"
             };
-            match observer(PortableBoundary::RollbackCompleted {
+            let completion = observer(PortableBoundary::RollbackCompleted {
                 install_root: install_root.to_path_buf(),
                 backup: backup.to_path_buf(),
                 had_previous,
-            }) {
-                Ok(()) => EngineError::Install(format!("{err}; {restored}")),
-                Err(evidence_err) => EngineError::Install(format!(
+            });
+            match (intent_error, completion) {
+                (None, Ok(())) => EngineError::Install(format!("{err}; {restored}")),
+                (Some(intent_err), Ok(())) => EngineError::Install(format!(
+                    "{err}; {restored}, but recording rollback intent failed: {intent_err}"
+                )),
+                (_, Err(evidence_err)) => EngineError::Install(format!(
                     "{err}; {restored}, but recording rollback evidence failed: {evidence_err}"
                 )),
             }
@@ -606,6 +1297,7 @@ fn health_check_portable_install(
     install_root: &Path,
     launch: bool,
     keep_running: bool,
+    arguments: &str,
 ) -> Result<bool, EngineError> {
     let exe = installed_app_exe(install_root).ok_or_else(|| {
         EngineError::Install(format!(
@@ -619,7 +1311,12 @@ fn health_check_portable_install(
     // Spawn alone is not enough: a broken payload can exit immediately after
     // CreateProcess succeeds. Require a short liveness window, then leave the
     // process running (this path is the post-install relaunch).
-    match spawn_and_require_liveness(hidden_command(&exe), PORTABLE_LIVENESS_WINDOW) {
+    let mut command = portable_launch_command(&exe)?;
+    crate::sys::apply_launch_arguments(&mut command, arguments)?;
+    match crate::process::spawn_and_check_startup(
+        command, PORTABLE_LIVENESS_WINDOW,
+        crate::app_version::requires_portable_cli(install_root),
+    ) {
         Ok(LivenessResult::Survived { child }) => {
             if keep_running {
                 // Intentionally leak the Child handle so the relaunched app
@@ -718,6 +1415,12 @@ pub enum PortableBoundary {
         backup: PathBuf,
         had_previous: bool,
     },
+    /// A failure chose rollback; persist that intent before consuming backup.
+    BeforeRollback {
+        install_root: PathBuf,
+        backup: PathBuf,
+        had_previous: bool,
+    },
     /// A later failure was fully rolled back. The install root now matches its
     /// pre-operation state (the old tree was restored, or a fresh tree removed).
     RollbackCompleted {
@@ -779,6 +1482,30 @@ pub fn install_portable_from_msix_with_observer(
     relaunch: bool,
     observer: &mut PortableObserver<'_>,
 ) -> Result<PortableInstallReport, EngineError> {
+    install_portable_from_msix_with_launch_arguments(
+        msix_path,
+        install_root,
+        manage_process,
+        relaunch,
+        "",
+        observer,
+    )
+}
+
+pub fn install_portable_from_msix_with_launch_arguments(
+    msix_path: &Path,
+    install_root: &Path,
+    manage_process: bool,
+    relaunch: bool,
+    arguments: &str,
+    observer: &mut PortableObserver<'_>,
+) -> Result<PortableInstallReport, EngineError> {
+    crate::sys::validate_launch_arguments(arguments)?;
+    if crate::sys::is_msix_package_path(install_root) {
+        return Err(EngineError::Io(
+            "Portable install location cannot be inside WindowsApps; choose a writable folder in Settings".to_string(),
+        ));
+    }
     let install_parent = install_root.parent().unwrap_or(install_root);
     fs::create_dir_all(install_parent).map_err(|e| io_err("create install parent", e))?;
     let operation_id = uuid::Uuid::new_v4();
@@ -893,6 +1620,7 @@ pub fn install_portable_from_msix_with_observer(
         install_root,
         manage_process,
         manage_process && relaunch,
+        arguments,
     ) {
         Ok(relaunched) => relaunched,
         Err(err) => {
@@ -917,7 +1645,7 @@ pub fn install_portable_from_msix_with_observer(
     let uninstall_entry_created = match register_uninstall_entry(
         install_root,
         &prepared.identity.version,
-        dir_size_kb(install_root),
+        Some(dir_size_kb(install_root)),
     ) {
         Ok(created) => created,
         Err(err) => {
@@ -927,6 +1655,13 @@ pub fn install_portable_from_msix_with_observer(
             false
         }
     };
+    if uninstall_entry_created {
+        match register_portable_protocol(install_root) {
+            Ok(true) => {},
+            Ok(false) => notes.push("Codex protocol registration was skipped: existing registration was preserved.".to_string()),
+            Err(err) => notes.push(format!("Codex protocol registration failed: {err}")),
+        }
+    }
 
     let installed_exe = installed_app_exe(install_root);
     let mut backup_path = None;
@@ -985,8 +1720,14 @@ pub fn purge_codex_user_data(notes: &mut Vec<String>) -> Result<bool, EngineErro
 /// Ancillary-only cleanup after the portable app tree is already gone (or
 /// never existed). Retries Start Menu shortcut + Apps & Features entry removal
 /// without touching an install directory. Optional user-data purge.
-pub fn cleanup_portable_metadata(purge_user_data: bool) -> Result<PortableUninstallReport, EngineError> {
+pub fn cleanup_portable_metadata(
+    purge_user_data: bool,
+) -> Result<PortableUninstallReport, EngineError> {
     let mut notes = Vec::new();
+    #[cfg(windows)]
+    if let Err(error) = crate::portable_protocol::unregister() {
+        notes.push(format!("Codex protocol cleanup failed: {error}"));
+    }
     let removed_shortcut = match remove_start_menu_shortcut() {
         Ok(removed) => removed,
         Err(err) => {
@@ -1073,12 +1814,812 @@ mod tests {
 
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 
+    #[test]
+    fn shortcut_icon_prefers_official_ico_then_app_exe_then_launcher() {
+        let root = Path::new(r"C:\Codex");
+        let launcher = root.join("LaunchCodex.exe");
+        let exe = root.join("app").join("ChatGPT.exe");
+        let ico = root.join("app").join("resources").join("icon-chatgpt.ico");
+        assert_eq!(
+            pick_shortcut_icon(Some(&exe), &launcher, |p| p == ico.as_path()),
+            ico
+        );
+        // Nested layout without the ico: the real executable, never the stub.
+        assert_eq!(pick_shortcut_icon(Some(&exe), &launcher, |_| false), exe);
+        assert_eq!(pick_shortcut_icon(None, &launcher, |_| false), launcher);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn legacy_shortcut_icon_repairs_only_this_installs_entry_points() {
+        let parent = temp_test_dir("legacy-shortcut-icon");
+        let root = parent.join("便携 O'Neil & 子目录");
+        let app = root.join("app");
+        fs::create_dir_all(app.join("resources")).unwrap();
+        let exe = app.join("ChatGPT.exe");
+        fs::write(&exe, b"payload fixture").unwrap();
+        let icon = app.join("resources/icon-chatgpt.ico");
+        fs::write(&icon, b"icon fixture").unwrap();
+        let shortcut = parent.join("ChatGPT.lnk");
+        assert!(!repair_legacy_start_menu_icon(&root, &parent).unwrap());
+        assert!(!shortcut.exists());
+
+        for target in [
+            root.join("ChatGPT.exe"),
+            root.join("Codex.exe"),
+            root.join(crate::portable_command::LAUNCHER_NAME),
+            exe.clone(),
+        ] {
+            if !target.exists() {
+                fs::write(&target, b"launcher fixture").unwrap();
+            }
+            crate::portable_shortcut::create_with_arguments(
+                &shortcut,
+                &target,
+                &app,
+                &root.join("ChatGPT.exe"),
+                "--user-flag codex://threads/example",
+            )
+            .unwrap();
+            let before = crate::portable_shortcut::read_spec(&shortcut).unwrap();
+            assert!(repair_legacy_start_menu_icon(&root, &parent).unwrap());
+            let mut expected = before;
+            expected.icon = icon.clone();
+            expected.icon_index = 0;
+            assert_eq!(
+                crate::portable_shortcut::read_spec(&shortcut).unwrap(),
+                expected
+            );
+            let saved = fs::read(&shortcut).unwrap();
+            let modified = fs::metadata(&shortcut).unwrap().modified().unwrap();
+            assert!(!repair_legacy_start_menu_icon(&root, &parent).unwrap());
+            assert_eq!(fs::read(&shortcut).unwrap(), saved);
+            assert_eq!(
+                fs::metadata(&shortcut).unwrap().modified().unwrap(),
+                modified
+            );
+        }
+
+        for target in [
+            parent.join("ChatGPT.exe"),
+            parent.join("other-install/app/ChatGPT.exe"),
+            root.join("tools/helper.exe"),
+            app.join("resources/codex.exe"),
+        ] {
+            fs::create_dir_all(target.parent().unwrap()).unwrap();
+            fs::write(&target, b"unrelated fixture").unwrap();
+            // Use a repairable icon so this checks target ownership rather
+            // than passing because the custom-icon policy skips the link.
+            crate::portable_shortcut::create(
+                &shortcut,
+                &target,
+                &app,
+                &root.join("ChatGPT.exe"),
+            )
+            .unwrap();
+            let saved = fs::read(&shortcut).unwrap();
+            assert!(!repair_legacy_start_menu_icon(&root, &parent).unwrap());
+            assert_eq!(fs::read(&shortcut).unwrap(), saved);
+        }
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn legacy_shortcut_icon_supports_flat_installs_and_missing_payloads() {
+        let root = temp_test_dir("legacy-shortcut-flat");
+        let exe = root.join("ChatGPT.exe");
+        fs::write(&exe, b"legacy payload fixture").unwrap();
+        let shortcut = root.join("ChatGPT.lnk");
+        let stale = root.join("resources/icon-chatgpt.ico");
+        crate::portable_shortcut::create(&shortcut, &exe, &root, &stale).unwrap();
+        assert!(repair_legacy_start_menu_icon(&root, &root).unwrap());
+        assert!(crate::same_windows_path(
+            &crate::portable_shortcut::read_spec(&shortcut).unwrap().icon,
+            &exe,
+        ));
+        crate::portable_shortcut::create(&shortcut, &exe, &root, &stale).unwrap();
+        fs::remove_file(&exe).unwrap();
+        let saved = fs::read(&shortcut).unwrap();
+        assert!(!repair_legacy_start_menu_icon(&root, &root).unwrap());
+        assert_eq!(fs::read(&shortcut).unwrap(), saved);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn legacy_shortcut_icon_repairs_blank_and_missing_default_sources() {
+        let parent = temp_test_dir("legacy-shortcut-default-icon");
+        let root = parent.join("portable");
+        let app = root.join("app");
+        fs::create_dir_all(&app).unwrap();
+        let exe = app.join("ChatGPT.exe");
+        fs::write(&exe, b"payload fixture").unwrap();
+        let shortcut = parent.join("ChatGPT.lnk");
+
+        for icon in [
+            PathBuf::new(),
+            app.join("resources/icon-chatgpt.ico"),
+            app.join("Codex.exe"),
+        ] {
+            crate::portable_shortcut::create_with_arguments(
+                &shortcut,
+                &exe,
+                &app,
+                &icon,
+                "--user-flag",
+            )
+            .unwrap();
+            let mut expected = crate::portable_shortcut::read_spec(&shortcut).unwrap();
+            assert!(repair_legacy_start_menu_icon(&root, &parent).unwrap());
+            expected.icon = exe.clone();
+            expected.icon_index = 0;
+            assert_eq!(
+                crate::portable_shortcut::read_spec(&shortcut).unwrap(),
+                expected
+            );
+            let bytes = fs::read(&shortcut).unwrap();
+            let modified = fs::metadata(&shortcut).unwrap().modified().unwrap();
+            assert!(!repair_legacy_start_menu_icon(&root, &parent).unwrap());
+            assert_eq!(fs::read(&shortcut).unwrap(), bytes);
+            assert_eq!(
+                fs::metadata(&shortcut).unwrap().modified().unwrap(),
+                modified
+            );
+        }
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn legacy_shortcut_icon_preserves_explicit_custom_and_current_icons() {
+        let parent = temp_test_dir("legacy-shortcut-custom-icon");
+        let root = parent.join("portable");
+        let app = root.join("app");
+        fs::create_dir_all(app.join("resources")).unwrap();
+        let exe = app.join("ChatGPT.exe");
+        fs::write(&exe, b"payload fixture").unwrap();
+        let official_icon = app.join("resources/icon-chatgpt.ico");
+        fs::write(&official_icon, b"official icon fixture").unwrap();
+        let custom = root.join("custom.ico");
+        fs::write(&custom, b"custom icon fixture").unwrap();
+        let external = parent.join("custom.ico");
+        fs::write(&external, b"external icon fixture").unwrap();
+        let shortcut = parent.join("ChatGPT.lnk");
+
+        for icon in [
+            custom,
+            external,
+            parent.join("missing-custom.ico"),
+            PathBuf::from("relative.ico"),
+            PathBuf::from(r"%USERPROFILE%\custom.ico"),
+            official_icon,
+            exe.clone(),
+        ] {
+            crate::portable_shortcut::create(&shortcut, &exe, &app, &icon).unwrap();
+            let bytes = fs::read(&shortcut).unwrap();
+            let modified = fs::metadata(&shortcut).unwrap().modified().unwrap();
+            assert!(
+                !repair_legacy_start_menu_icon(&root, &parent).unwrap(),
+                "{icon:?}"
+            );
+            assert_eq!(fs::read(&shortcut).unwrap(), bytes, "{icon:?}");
+            assert_eq!(
+                fs::metadata(&shortcut).unwrap().modified().unwrap(),
+                modified
+            );
+        }
+
+        // In the flat layout ChatGPT.exe is the payload, not a launcher alias.
+        let flat = parent.join("flat");
+        fs::create_dir_all(&flat).unwrap();
+        let flat_exe = flat.join("ChatGPT.exe");
+        fs::write(&flat_exe, b"legacy payload fixture").unwrap();
+        crate::portable_shortcut::create(&shortcut, &flat_exe, &flat, &flat_exe).unwrap();
+        let bytes = fs::read(&shortcut).unwrap();
+        assert!(!repair_legacy_start_menu_icon(&flat, &parent).unwrap());
+        assert_eq!(fs::read(&shortcut).unwrap(), bytes);
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn legacy_shortcut_icon_does_not_replace_malformed_or_other_named_links() {
+        let parent = temp_test_dir("legacy-shortcut-invalid");
+        let root = parent.join("portable");
+        let app = root.join("app");
+        fs::create_dir_all(&app).unwrap();
+        fs::write(app.join("ChatGPT.exe"), b"payload fixture").unwrap();
+        let untouched = b"not a Shell Link";
+        let other = parent.join("Codex.lnk");
+        fs::write(&other, untouched).unwrap();
+        assert!(!repair_legacy_start_menu_icon(&root, &parent).unwrap());
+        assert_eq!(fs::read(&other).unwrap(), untouched);
+        let shortcut = parent.join("ChatGPT.lnk");
+        assert!(!shortcut.exists());
+        fs::write(&shortcut, untouched).unwrap();
+        assert!(repair_legacy_start_menu_icon(&root, &parent).is_err());
+        assert_eq!(fs::read(&shortcut).unwrap(), untouched);
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn portable_shortcut_identity_preserves_its_launcher_target() {
+        let parent = temp_test_dir("shortcut-identity");
+        let root = parent.join("便携 O'Neil & 子目录");
+        fs::create_dir_all(&root).unwrap();
+        let exe = root.join("Codex.exe");
+        fs::write(&exe, b"launcher fixture").unwrap();
+        let shortcut = root.join("Codex.lnk");
+        crate::portable_shortcut::create(&shortcut, &exe, &root, &exe).unwrap();
+        let (target, id) = crate::portable_shortcut::inspect(&shortcut).unwrap();
+        assert_eq!(fs::canonicalize(target).unwrap(), fs::canonicalize(exe).unwrap());
+        assert_eq!(id, crate::portable_shortcut::APP_ID);
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn portable_metadata_script_preserves_unicode_input_and_output() {
+        let root = temp_test_dir("unicode-metadata");
+        let path = root.join("中文 O'Neil & file.txt");
+        let value = "中文 O'Neil & metadata";
+        let output = run_powershell_with_limits(&format!(
+            "$value = {}; [System.IO.File]::WriteAllText({}, $value); $value",
+            ps_quote(value), ps_quote(&path.to_string_lossy())
+        ), RunLimits::probe()).unwrap();
+        assert_eq!(output, value);
+        assert_eq!(fs::read_to_string(path).unwrap(), value);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn encoded_uninstall_metadata_fits_the_windows_command_line() {
+        let root = PathBuf::from(format!(r"C:\便携 O'Neil & long path\{}", "x".repeat(220)));
+        let script = uninstall_metadata_script(&root, &root.join("Codex.exe"),
+            &root.join("app/ChatGPT.exe"), "26.930.31730", Some(900_000));
+        // Include the real transport prefix and leave room for its exe/flags.
+        let wrapped = format!("try {{ [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false) }} catch {{ }}\n{script}");
+        let encoded = crate::sys::encode_powershell_command(&wrapped);
+        assert!(encoded.len() < 30_000, "metadata command is too long: {}", encoded.len());
+    }
+
+    #[test]
+    fn packaged_core_requires_cli_before_install_is_committed() {
+        let root = temp_test_dir("required-cli");
+        fs::create_dir_all(root.join("resources")).unwrap();
+        fs::write(root.join("ChatGPT.exe"), b"app").unwrap();
+        crate::app_version::write_test_asar(&root.join("resources/app.asar"),
+            br#"{"version":"26.915.31029","name":"openai-codex-electron","codexWindowsAppContainedCore":"1"}"#);
+        assert!(crate::app_version::requires_portable_cli(&root));
+        // Explicit user overrides intentionally need no bundled executable.
+        if std::env::var_os("CODEX_CLI_PATH").is_none_or(|v| v.to_string_lossy().trim().is_empty())
+        {
+            assert!(ensure_portable_launcher(&root)
+                .unwrap_err()
+                .to_string()
+                .contains("missing its bundled CLI"));
+        }
+        fs::write(root.join("resources/codex.exe"), b"cli").unwrap();
+        assert!(ensure_portable_launcher(&root).unwrap().is_file());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires a marked disposable nested payload via CODEX_REAL_PORTABLE"]
+    fn real_portable_root_launcher_reaches_main_window() {
+        let root =
+            PathBuf::from(std::env::var_os("CODEX_REAL_PORTABLE").expect("CODEX_REAL_PORTABLE"));
+        assert!(
+            root.join(".codex-manager-smoke").is_file(),
+            "use a marked, disposable copy"
+        );
+        assert!(
+            root.join("app/ChatGPT.exe").is_file(),
+            "use the nested payload layout"
+        );
+        let profile = temp_test_dir("isolated-root-launcher");
+        let launcher = ensure_portable_launcher(&root).unwrap();
+        assert_eq!(launcher, root.join("Codex.exe"));
+        let result = (|| -> Result<(), String> {
+            let mut command = hidden_command(&launcher);
+            command
+                .env_remove("CODEX_CLI_PATH")
+                .env_remove("CODEX_WINDOWS_REGISTERED_CORE")
+                .env("CODEX_HOME", profile.join("home"))
+                .env("CODEX_ELECTRON_USER_DATA_PATH", profile.join("profile"))
+                .arg(format!(
+                    "--user-data-dir={}",
+                    profile.join("profile").display()
+                ));
+            // Do not pipe stdio: Electron inherits it from the launcher and
+            // could keep a capture reader open after the launcher exits.
+            let mut child = command
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .map_err(|error| error.to_string())?;
+            let launcher_deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                match child.try_wait().map_err(|error| error.to_string())? {
+                    Some(status) if status.success() => break,
+                    Some(_) => return Err("launcher exited unsuccessfully".into()),
+                    None if Instant::now() >= launcher_deadline => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err("launcher did not exit within 10 seconds".into());
+                    }
+                    None => thread::sleep(Duration::from_millis(50)),
+                }
+            }
+            // The launcher exits after spawning Electron, so observe the scoped
+            // payload processes rather than accepting the launcher's exit=0.
+            let started = Instant::now();
+            let mut progress = crate::startup_window::StartupProgress::default();
+            while started.elapsed() < Duration::from_secs(30) {
+                let (_, window) = crate::windows_process::startup_window_for_root(&root)
+                    .map_err(|error| error.to_string())?;
+                if progress.observe(started.elapsed(), &window, PORTABLE_LIVENESS_WINDOW)? {
+                    return Ok(());
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+            Err("root launcher did not open a stable main window".into())
+        })();
+        close_codex_gracefully_for_root(30, &root).unwrap();
+        assert!(result.is_ok(), "{result:?}");
+        let _ = fs::remove_dir_all(profile);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires an isolated payload copy via CODEX_REAL_PORTABLE"]
+    fn real_portable_bootstrap_uses_bundled_cli() {
+        let root =
+            PathBuf::from(std::env::var_os("CODEX_REAL_PORTABLE").expect("CODEX_REAL_PORTABLE"));
+        assert!(
+            root.join(".codex-manager-smoke").is_file(),
+            "use a marked, disposable copy"
+        );
+        let profile = temp_test_dir("isolated-bootstrap");
+        let exe = installed_app_exe(&root).unwrap();
+        ensure_portable_launcher(&root).unwrap();
+        let mut command = portable_launch_command(&exe).unwrap();
+        command
+            .env("CODEX_HOME", profile.join("home"))
+            .env("CODEX_ELECTRON_USER_DATA_PATH", profile.join("profile"))
+            .env("CODEX_SPARKLE_ENABLED", "false")
+            .arg(format!(
+                "--user-data-dir={}",
+                profile.join("profile").display()
+            ));
+        let result =
+            crate::process::spawn_and_check_startup(command, PORTABLE_LIVENESS_WINDOW, true);
+        let cleanup = close_codex_gracefully_for_root(30, &root);
+        cleanup.unwrap();
+        assert!(
+            matches!(result, Ok(LivenessResult::Survived { .. })),
+            "{result:?}"
+        );
+        let _ = fs::remove_dir_all(profile);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires official CODEX_REAL_MSIX and a marked disposable CODEX_REAL_MSIX_SMOKE_DIR"]
+    fn real_msix_portable_startup() {
+        let msix = PathBuf::from(std::env::var_os("CODEX_REAL_MSIX").expect("CODEX_REAL_MSIX"));
+        let root = PathBuf::from(
+            std::env::var_os("CODEX_REAL_MSIX_SMOKE_DIR").expect("CODEX_REAL_MSIX_SMOKE_DIR"),
+        );
+        assert!(
+            root.join(".codex-manager-smoke").is_file(),
+            "use a marked disposable directory"
+        );
+        assert!(crate::authenticode::verify_openai_authenticode(&msix)
+            .unwrap()
+            .is_valid_openai());
+        let prepared = prepare_portable_payload(&msix, &root).unwrap();
+        let payload = prepared.payload_dir;
+        ensure_portable_launcher(&payload).unwrap();
+        let mut command = portable_launch_command(&installed_app_exe(&payload).unwrap()).unwrap();
+        command
+            .env("CODEX_HOME", root.join("home"))
+            .env("CODEX_ELECTRON_USER_DATA_PATH", root.join("profile"))
+            .env("CODEX_SPARKLE_ENABLED", "false")
+            .arg(format!(
+                "--user-data-dir={}",
+                root.join("profile").display()
+            ));
+        let result =
+            crate::process::spawn_and_check_startup(command, PORTABLE_LIVENESS_WINDOW, true);
+        let cleanup = close_codex_gracefully_for_root(10, &payload);
+        cleanup.unwrap();
+        assert!(
+            matches!(result, Ok(LivenessResult::Survived { .. })),
+            "{result:?}"
+        );
+        // Keep the marked lab and app logs for investigation. No MSIX install
+        // or shortcut is created. The desktop app itself can register Chrome
+        // hosts; restore lab discovery/manifest entries as documented in #353.
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires an isolated affected 26.915.31029 payload via CODEX_REAL_PORTABLE"]
+    fn real_portable_bootstrap_dialog_is_rejected() {
+        let root =
+            PathBuf::from(std::env::var_os("CODEX_REAL_PORTABLE").expect("CODEX_REAL_PORTABLE"));
+        assert!(
+            root.join(".codex-manager-smoke").is_file(),
+            "use a marked, disposable copy"
+        );
+        let profile = temp_test_dir("isolated-baseline");
+        let mut command = hidden_command(installed_app_exe(&root).unwrap());
+        command
+            .env_remove("CODEX_CLI_PATH")
+            .env_remove("CODEX_WINDOWS_REGISTERED_CORE")
+            .env("CODEX_HOME", profile.join("home"))
+            .env("CODEX_ELECTRON_USER_DATA_PATH", profile.join("profile"))
+            .env("CODEX_SPARKLE_ENABLED", "false")
+            .arg(format!(
+                "--user-data-dir={}",
+                profile.join("profile").display()
+            ));
+        let result =
+            crate::process::spawn_and_check_startup(command, PORTABLE_LIVENESS_WINDOW, true);
+        let cleanup = close_codex_gracefully_for_root(30, &root);
+        cleanup.unwrap();
+        assert!(
+            matches!(result, Err(ref e) if e.message().contains("startup dialog") || e.message().contains("did not open its main window")),
+            "{result:?}"
+        );
+        let _ = fs::remove_dir_all(profile);
+    }
+
+    // Invoked only by the compiled launcher roundtrip below; no test harness flags
+    // are interpreted by our launcher, and all child environment state is isolated.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "child process fixture for portable_launcher_survives_directory_move"]
+    fn portable_launcher_child() {
+        let Some(output) = std::env::var_os("CODEX_TEST_LAUNCH_REPORT") else {
+            return;
+        };
+        let report = serde_json::json!({
+            "cli": std::env::var("CODEX_CLI_PATH").ok(),
+            "registered": std::env::var("CODEX_WINDOWS_REGISTERED_CORE").ok(),
+            "cwd": std::env::current_dir().unwrap(),
+            "args": std::env::args().collect::<Vec<_>>(),
+        });
+        fs::write(output, serde_json::to_vec(&report).unwrap()).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn portable_launcher_survives_directory_move() {
+        let parent = temp_test_dir("launcher-roundtrip");
+        for nested in [false, true] {
+            let original = parent.join(format!("before-{nested}"));
+            let app_root = if nested {
+                original.join("app")
+            } else {
+                original.clone()
+            };
+            fs::create_dir_all(app_root.join("resources")).unwrap();
+            fs::copy(
+                std::env::current_exe().unwrap(),
+                app_root.join("ChatGPT.exe"),
+            )
+            .unwrap();
+            fs::write(app_root.join("resources/codex.exe"), b"cli fixture").unwrap();
+            let original_exe = fs::read(app_root.join("ChatGPT.exe")).unwrap();
+            let launcher = ensure_portable_launcher(&original).unwrap();
+            assert!(
+                is_manager_launcher(&launcher),
+                "native launcher PE identity must survive linking"
+            );
+            assert!(!is_manager_launcher(&app_root.join("ChatGPT.exe")));
+            assert_launcher_has_no_vc_runtime_import(&fs::read(&launcher).unwrap());
+            assert_launcher_embeds_icon(&fs::read(&launcher).unwrap());
+            assert_eq!(
+                fs::read(app_root.join("ChatGPT.exe")).unwrap(),
+                original_exe
+            );
+            assert_eq!(
+                launcher,
+                original.join(if nested {
+                    "Codex.exe"
+                } else {
+                    "LaunchCodex.exe"
+                })
+            );
+            assert_eq!(
+                fs::read_to_string(original.join(crate::portable_command::LAUNCH_TARGET_NAME))
+                    .unwrap(),
+                if nested {
+                    "app\\ChatGPT.exe\nrequire-cli=0"
+                } else {
+                    "ChatGPT.exe\nrequire-cli=0"
+                }
+            );
+            let moved = parent.join(format!("便携 测试's & folder-{nested}"));
+            fs::rename(&original, &moved).unwrap();
+            let moved_app = if nested {
+                moved.join("app")
+            } else {
+                moved.clone()
+            };
+            let names: &[&str] = if nested {
+                &["Codex.exe", "ChatGPT.exe", "LaunchCodex.exe"]
+            } else {
+                &["LaunchCodex.exe"]
+            };
+            for name in names {
+                let output = parent.join(format!("result-{nested}-{name}.json"));
+                let marker = "codex://test/参数 with spaces & \"quotes\"";
+                let mut command = hidden_command(moved.join(name));
+                command
+                    .env_remove("CODEX_CLI_PATH")
+                    .env("CODEX_WINDOWS_REGISTERED_CORE", "1")
+                    .env("CODEX_TEST_LAUNCH_REPORT", &output)
+                    .args([
+                        "--exact",
+                        "portable::tests::portable_launcher_child",
+                        "--ignored",
+                        "--skip",
+                        marker,
+                    ]);
+                assert!(command.status().unwrap().success());
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while !output.exists() && Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(50));
+                }
+                let report: serde_json::Value =
+                    serde_json::from_slice(&fs::read(output).expect("launcher child report"))
+                        .unwrap();
+                assert_eq!(
+                    report["cli"],
+                    moved_app
+                        .join("resources/codex.exe")
+                        .to_string_lossy()
+                        .as_ref()
+                );
+                assert!(report["registered"].is_null());
+                assert_eq!(report["cwd"], moved_app.to_string_lossy().as_ref());
+                assert!(report["args"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|v| v == marker));
+            }
+        }
+        remove_directory_all_with_retry("remove launcher test", &parent).unwrap();
+    }
+
+    #[test]
+    fn failed_layout_upgrade_restores_the_flat_install() {
+        let parent = temp_test_dir("layout-rollback");
+        let root = parent.join("Codex");
+        fs::create_dir_all(root.join("resources")).unwrap();
+        fs::write(root.join("ChatGPT.exe"), b"old official entry").unwrap();
+        fs::write(root.join("resources/app.asar"), b"old official resources").unwrap();
+        let old_launcher = ensure_portable_launcher(&root).unwrap();
+        let old_bytes = fs::read(&old_launcher).unwrap();
+        let msix = parent.join("new.msix");
+        write_fake_rebranded_msix(&msix);
+        let mut saw_new_layout = false;
+        inject_portable_fault(Some(PortableFault::AfterMoveNew));
+        let error =
+            install_portable_from_msix_with_observer(&msix, &root, false, false, &mut |boundary| {
+                if matches!(boundary, PortableBoundary::AfterMoveNew { .. }) {
+                    saw_new_layout = root.join("app/ChatGPT.exe").is_file();
+                }
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(saw_new_layout);
+        assert!(error.to_string().contains("previous install was restored"));
+        assert!(!root.join("app").exists());
+        assert_eq!(
+            fs::read(root.join("ChatGPT.exe")).unwrap(),
+            b"old official entry"
+        );
+        assert_eq!(
+            fs::read(root.join("resources/app.asar")).unwrap(),
+            b"old official resources"
+        );
+        assert_eq!(fs::read(old_launcher).unwrap(), old_bytes);
+        #[cfg(windows)]
+        assert_eq!(
+            fs::read_to_string(root.join(crate::portable_command::LAUNCH_TARGET_NAME)).unwrap(),
+            "ChatGPT.exe\nrequire-cli=0"
+        );
+        remove_directory_all_with_retry("remove layout rollback test", &parent).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn legacy_payload_without_cli_runs_through_each_root_launcher() {
+        let parent = temp_test_dir("launcher-no-cli");
+        for nested in [false, true] {
+            let root = parent.join(format!("legacy-{nested}"));
+            let app = if nested {
+                root.join("app")
+            } else {
+                root.clone()
+            };
+            fs::create_dir_all(&app).unwrap();
+            fs::copy(std::env::current_exe().unwrap(), app.join("ChatGPT.exe")).unwrap();
+            ensure_portable_launcher(&root).unwrap();
+            let names: &[&str] = if nested {
+                &["Codex.exe", "ChatGPT.exe", "LaunchCodex.exe"]
+            } else {
+                &["LaunchCodex.exe"]
+            };
+            for name in names {
+                let output = parent.join(format!("{nested}-{name}.json"));
+                let mut command = hidden_command(root.join(name));
+                command
+                    .env_remove("CODEX_CLI_PATH")
+                    .env("CODEX_TEST_LAUNCH_REPORT", &output)
+                    .args([
+                        "--exact",
+                        "portable::tests::portable_launcher_child",
+                        "--ignored",
+                    ]);
+                assert!(command.status().unwrap().success());
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while !output.exists() && Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(50));
+                }
+                let report: serde_json::Value =
+                    serde_json::from_slice(&fs::read(output).expect("CLI-less child report"))
+                        .unwrap();
+                assert!(
+                    report["cli"].is_null(),
+                    "a legacy payload must not require or invent a CLI"
+                );
+                assert_eq!(report["cwd"], app.to_string_lossy().as_ref());
+            }
+        }
+        remove_directory_all_with_retry("remove CLI-less launcher test", &parent).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn failed_launcher_repair_preserves_the_old_config() {
+        use crate::portable_command::{LAUNCHER_NAME, LAUNCH_TARGET_NAME};
+        use std::os::windows::fs::OpenOptionsExt;
+        let parent = temp_test_dir("launcher-repair-lock");
+        for blocked in [LAUNCHER_NAME, LAUNCH_TARGET_NAME] {
+            let root = parent.join(blocked);
+            fs::create_dir_all(&root).unwrap();
+            fs::write(root.join("ChatGPT.exe"), b"legacy official exe").unwrap();
+            fs::write(root.join(LAUNCHER_NAME), b"old launcher").unwrap();
+            fs::write(root.join(LAUNCH_TARGET_NAME), "ChatGPT.exe").unwrap();
+            let lock = fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0)
+                .open(root.join(blocked))
+                .unwrap();
+            assert!(ensure_portable_launcher(&root).is_err());
+            drop(lock);
+            assert_eq!(
+                fs::read_to_string(root.join(LAUNCH_TARGET_NAME)).unwrap(),
+                "ChatGPT.exe"
+            );
+            if blocked == LAUNCHER_NAME {
+                assert_eq!(fs::read(root.join(LAUNCHER_NAME)).unwrap(), b"old launcher");
+            }
+            assert!(!fs::read_dir(&root).unwrap().any(|entry| entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".codex-portable-write-")));
+            assert!(ensure_portable_launcher(&root).is_ok());
+            assert_eq!(
+                fs::read_to_string(root.join(LAUNCH_TARGET_NAME)).unwrap(),
+                "ChatGPT.exe\nrequire-cli=0"
+            );
+        }
+        remove_directory_all_with_retry("remove locked launcher repair test", &parent).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn lost_payload_and_config_never_adopts_root_aliases() {
+        let parent = temp_test_dir("lost-launcher-layout");
+        let msix = parent.join("codex.msix");
+        write_fake_rebranded_msix(&msix);
+        let root = parent.join("Codex");
+        install_portable_from_msix_inner(&msix, &root, false, false).unwrap();
+        assert_eq!(installed_app_exe(&root), Some(root.join("app/ChatGPT.exe")));
+        fs::remove_dir_all(root.join("app")).unwrap();
+        fs::remove_file(root.join(crate::portable_command::LAUNCH_TARGET_NAME)).unwrap();
+        assert_eq!(installed_app_exe(&root), None);
+        assert!(crate::sys::detect_portable_install(&root).is_none());
+        for config in ["", "broken", "ChatGPT.exe\nrequire-cli=0"] {
+            fs::write(
+                root.join(crate::portable_command::LAUNCH_TARGET_NAME),
+                config,
+            )
+            .unwrap();
+            assert_eq!(installed_app_exe(&root), None);
+        }
+        fs::remove_file(root.join("AppxManifest.xml")).unwrap();
+        assert_eq!(installed_app_exe(&root), None);
+        remove_directory_all_with_retry("remove lost layout test", &parent).unwrap();
+    }
+
+    // Inspect the PE import table, not arbitrary strings in the binary: a native
+    // runner already has VC++ installed and would otherwise hide this regression.
+    #[cfg(windows)]
+    fn assert_launcher_embeds_icon(bytes: &[u8]) {
+        let u16_at = |p| u16::from_le_bytes(bytes[p..p + 2].try_into().unwrap()) as usize;
+        let u32_at = |p| u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap()) as usize;
+        let coff = u32_at(0x3c) + 4;
+        let section_table = coff + 20 + u16_at(coff + 16);
+        let rsrc = (0..u16_at(coff + 2))
+            .map(|i| section_table + i * 40)
+            .find(|s| &bytes[*s..*s + 5] == b".rsrc")
+            .expect("launcher must have a .rsrc section");
+        let dir = u32_at(rsrc + 20);
+        let entries = u16_at(dir + 12) + u16_at(dir + 14);
+        let ids: Vec<usize> = (0..entries)
+            .map(|i| u32_at(dir + 16 + i * 8))
+            .collect();
+        assert!(ids.contains(&3), "RT_ICON missing: {ids:?}");
+        assert!(ids.contains(&14), "RT_GROUP_ICON missing: {ids:?}");
+    }
+
+    #[cfg(windows)]
+    fn assert_launcher_has_no_vc_runtime_import(bytes: &[u8]) {
+        let u16_at = |p| u16::from_le_bytes(bytes[p..p + 2].try_into().unwrap()) as usize;
+        let u32_at = |p| u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap()) as usize;
+        let coff = u32_at(0x3c) + 4;
+        let optional = coff + 20;
+        let section_table = optional + u16_at(coff + 16);
+        let offset = |rva: usize| {
+            (0..u16_at(coff + 2))
+                .find_map(|i| {
+                    let section = section_table + i * 40;
+                    let start = u32_at(section + 12);
+                    let size = u32_at(section + 8).max(u32_at(section + 16));
+                    (rva >= start && rva < start + size).then(|| u32_at(section + 20) + rva - start)
+                })
+                .expect("PE RVA must map to a section")
+        };
+        let directories = optional + if u16_at(optional) == 0x20b { 112 } else { 96 };
+        let mut import = offset(u32_at(directories + 8));
+        let mut count = 0;
+        while u32_at(import + 12) != 0 {
+            let name = offset(u32_at(import + 12));
+            let len = bytes[name..].iter().position(|b| *b == 0).unwrap();
+            let dll = std::str::from_utf8(&bytes[name..name + len])
+                .unwrap()
+                .to_ascii_lowercase();
+            assert!(
+                !dll.starts_with("vcruntime") && !dll.starts_with("msvcp"),
+                "portable launcher must not require the VC++ redistributable: {dll}"
+            );
+            count += 1;
+            import += 20;
+        }
+        assert!(
+            count > 0,
+            "launcher import table must actually be inspected"
+        );
+    }
+
     fn temp_test_dir(name: &str) -> PathBuf {
         let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "codex-portable-{name}-{}-{id}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("codex-portable-{name}-{}-{id}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
@@ -1245,6 +2786,412 @@ mod tests {
         zip.finish().unwrap();
     }
 
+    fn write_block_mapped_msix(
+        path: &Path,
+        block_map_files: &[(&str, u64)],
+        zip_files: &[(&str, &[u8])],
+    ) {
+        let block_map_files = block_map_files
+            .iter()
+            .map(|(name, size)| format!(r#"  <File Name="{name}" Size="{size}" LfhSize="30" />"#))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let block_map = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<BlockMap xmlns="http://schemas.microsoft.com/appx/2010/blockmap" HashMethod="http://www.w3.org/2001/04/xmlenc#sha256">
+{block_map_files}
+</BlockMap>"#
+        );
+        let manifest = br#"<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10">
+  <Identity Name="OpenAI.Codex" Publisher="CN=OpenAI OpCo, LLC" Version="26.803.10989.0" ProcessorArchitecture="x64" />
+  <Applications>
+    <Application Id="App" Executable="app/ChatGPT.exe" EntryPoint="Windows.FullTrustApplication" />
+  </Applications>
+</Package>"#;
+
+        let file = fs::File::create(path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let opts = SimpleFileOptions::default();
+        zip.start_file("AppxBlockMap.xml", opts).unwrap();
+        zip.write_all(block_map.as_bytes()).unwrap();
+        zip.start_file("AppxManifest.xml", opts).unwrap();
+        zip.write_all(manifest).unwrap();
+        for (name, data) in zip_files {
+            zip.start_file(*name, opts).unwrap();
+            zip.write_all(data).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+
+    #[test]
+    fn extracts_legacy_cp437_zip_entry_names() {
+        let root = temp_test_dir("cp437-zip-entry-name");
+        let msix = root.join("codex.msix");
+        let extracted = root.join("extracted");
+        fs::create_dir_all(&extracted).unwrap();
+        let payload = b"legacy filename";
+        write_block_mapped_msix(
+            &msix,
+            &[("café.bin", payload.len() as u64)],
+            &[("cafe.bin", payload)],
+        );
+        let mut bytes = fs::read(&msix).unwrap();
+        let name = b"cafe.bin";
+        let mut replaced = 0;
+        for index in 0..=bytes.len() - name.len() {
+            if bytes[index..index + name.len()] == *name {
+                bytes[index + 3] = 0x82; // CP437 encodes é as one byte.
+                replaced += 1;
+            }
+        }
+        assert_eq!(replaced, 2, "update local and central directory names");
+        fs::write(&msix, bytes).unwrap();
+        extract_msix(&msix, &extracted).unwrap();
+        assert_eq!(
+            fs::read(extracted.join("café.bin")).unwrap(),
+            b"legacy filename"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn extracts_cp437_names_that_are_also_valid_utf8() {
+        use crate::zip_test::{archive, Entry};
+
+        let root = temp_test_dir("ambiguous-cp437");
+        let msix = root.join("codex.msix");
+        let extracted = root.join("extracted");
+        fs::create_dir_all(&extracted).unwrap();
+        let block_map = r#"<BlockMap xmlns="http://schemas.microsoft.com/appx/2010/blockmap">
+            <File Name="app\├⌐.bin" Size="7" LfhSize="30" />
+            </BlockMap>"#;
+        let bytes = archive(&[
+            Entry::new(b"AppxBlockMap.xml", block_map.as_bytes()),
+            Entry::new(b"AppxManifest.xml", b"<Package />"),
+            Entry::new(b"app/\xc3\xa9.bin", b"payload"),
+        ]);
+        fs::write(&msix, bytes).unwrap();
+        extract_msix(&msix, &extracted).unwrap();
+        assert_eq!(fs::read(extracted.join("app/├⌐.bin")).unwrap(), b"payload");
+        assert!(!extracted.join("app/é.bin").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn installs_cp437_utf8_and_unicode_path_block_map_names() {
+        use crate::zip_test::{archive, unicode_path_extra, Entry};
+
+        let raw = b"app/\xc3\xa9.bin";
+        let unicode = unicode_path_extra(raw, "app/资源.bin".as_bytes(), true);
+        let bad_crc = unicode_path_extra(raw, "app/资源.bin".as_bytes(), false);
+        for (flags, extra, expected) in [
+            (0, &[][..], "├⌐.bin"),
+            (1 << 11, &[][..], "é.bin"),
+            (0, unicode.as_slice(), "资源.bin"),
+            (0, bad_crc.as_slice(), "├⌐.bin"),
+        ] {
+            let root = temp_test_dir("encoded-msix-install");
+            let msix = root.join("codex.msix");
+            let installed = root.join("Codex");
+            let block_map = format!(
+                r#"<BlockMap xmlns="http://schemas.microsoft.com/appx/2010/blockmap">
+                <File Name="app\{expected}" Size="7" LfhSize="30" />
+                </BlockMap>"#
+            );
+            let manifest = br#"<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10">
+                <Identity Name="OpenAI.Codex" Publisher="CN=OpenAI OpCo, LLC" Version="26.803.10989.0" ProcessorArchitecture="x64" />
+                <Applications><Application Id="App" Executable="app/ChatGPT.exe" EntryPoint="Windows.FullTrustApplication" /></Applications>
+                </Package>"#;
+            let mut resource = Entry::new(raw, b"payload");
+            resource.flags = flags;
+            resource.extra = extra;
+            fs::write(
+                &msix,
+                archive(&[
+                    Entry::new(b"AppxBlockMap.xml", block_map.as_bytes()),
+                    Entry::new(b"AppxManifest.xml", manifest),
+                    Entry::new(b"app/ChatGPT.exe", b"fake entry exe"),
+                    resource,
+                ]),
+            )
+            .unwrap();
+            let report = install_portable_from_msix_inner(&msix, &installed, false, false).unwrap();
+            assert!(report.success);
+            assert_eq!(
+                fs::read(installed.join("app").join(expected)).unwrap(),
+                b"payload"
+            );
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn rejects_unsafe_unicode_path_during_msix_extraction() {
+        use crate::zip_test::{archive, unicode_path_extra, Entry};
+
+        let raw = b"app/safe.bin";
+        for unsafe_name in [
+            "../escape.bin", r"..\escape.bin", "/absolute", r"C:\escape", "nul\0path",
+        ] {
+            let root = temp_test_dir("unsafe-unicode-msix");
+            let msix = root.join("codex.msix");
+            let extracted = root.join("extracted");
+            fs::create_dir_all(&extracted).unwrap();
+            let extra = unicode_path_extra(raw, unsafe_name.as_bytes(), true);
+            let mut entry = Entry::new(raw, b"payload");
+            entry.extra = &extra;
+            fs::write(
+                &msix,
+                archive(&[Entry::new(b"AppxManifest.xml", b"<Package />"), entry]),
+            )
+            .unwrap();
+            assert!(extract_msix(&msix, &extracted).is_err(), "{unsafe_name:?}");
+            assert!(!root.join("escape.bin").exists());
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn extracts_percent_encoded_payload_to_block_map_logical_paths() {
+        let root = temp_test_dir("block-map-logical-paths");
+        let msix = root.join("codex.msix");
+        let extracted = root.join("extracted");
+        fs::create_dir_all(&extracted).unwrap();
+        let sky = b"sky";
+        let statsig = b"statsig";
+        let chatgpt = b"fake entry";
+        let asar = b"fake asar";
+        write_block_mapped_msix(
+            &msix,
+            &[
+                (r"app\ChatGPT.exe", chatgpt.len() as u64),
+                (r"app\resources\app.asar", asar.len() as u64),
+                (
+                    r"app\resources\cua_node\bin\node_modules\@oai\sky\package.json",
+                    sky.len() as u64,
+                ),
+                (
+                    r"app\resources\cua_node\bin\node_modules\@statsig\client-core\src\$_StatsigGlobal.js",
+                    statsig.len() as u64,
+                ),
+            ],
+            &[
+                ("app/ChatGPT.exe", chatgpt),
+                ("app/resources/app.asar", asar),
+                (
+                    "app/resources/cua_node/bin/node_modules/%40oai/sky/package.json",
+                    sky,
+                ),
+                (
+                    "app/resources/cua_node/bin/node_modules/%40statsig/client-core/src/%24_StatsigGlobal.js",
+                    statsig,
+                ),
+            ],
+        );
+
+        extract_msix(&msix, &extracted).unwrap();
+
+        let modules = extracted.join("app/resources/cua_node/bin/node_modules");
+        assert!(modules.join("@oai/sky/package.json").is_file());
+        assert!(modules
+            .join("@statsig/client-core/src/$_StatsigGlobal.js")
+            .is_file());
+        assert!(!modules.join("%40oai").exists());
+        assert!(!modules.join("%40statsig").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[ignore = "requires CODEX_REAL_MSIX pointing at a current official Codex MSIX"]
+    fn real_msix_uses_computer_use_logical_paths() {
+        let msix = std::env::var_os("CODEX_REAL_MSIX")
+            .map(PathBuf::from)
+            .expect("set CODEX_REAL_MSIX to an official Codex MSIX");
+        assert!(msix.is_file(), "MSIX does not exist: {}", msix.display());
+        #[cfg(windows)]
+        {
+            let signature = crate::authenticode::verify_openai_authenticode(&msix)
+                .expect("verify official MSIX Authenticode signature");
+            assert!(
+                signature.is_valid_openai(),
+                "MSIX is not validly signed by the trusted OpenAI publisher: status={} subject={}",
+                signature.status,
+                signature.subject
+            );
+        }
+        let root = temp_test_dir("real-msix-logical-paths");
+        let prepared = prepare_portable_payload(&msix, &root).unwrap();
+        let modules = prepared
+            .payload_dir
+            .join("app/resources/cua_node/bin/node_modules");
+
+        assert!(modules
+            .join("@oai/sky/dist/project/cua/sky_js/src/targets/windows/internal/computer_use_client_base.js")
+            .is_file());
+        assert!(modules
+            .join("@statsig/client-core/src/$_StatsigGlobal.js")
+            .is_file());
+        assert!(!modules.join("%40oai").exists());
+        assert!(!modules.join("%40statsig").exists());
+        assert!(!modules
+            .join("@statsig/client-core/src/%24_StatsigGlobal.js")
+            .exists());
+
+        #[cfg(windows)]
+        {
+            let node_bin = prepared.payload_dir.join("app/resources/cua_node/bin");
+            let node = node_bin.join("node.exe");
+            assert!(node.is_file(), "bundled cua_node is missing");
+            let output = std::process::Command::new(&node)
+                .arg("-e")
+                .arg(
+                    r#"const root=process.argv[1]; console.log(require.resolve('@oai/sky',{paths:[root]})); console.log(require.resolve('@statsig/client-core',{paths:[root]}));"#,
+                )
+                .arg(&node_bin)
+                .output()
+                .expect("launch bundled cua_node");
+            assert!(
+                output.status.success(),
+                "bundled cua_node module resolution failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(stdout.contains("@oai"), "unexpected resolution: {stdout}");
+            assert!(
+                stdout.contains("@statsig"),
+                "unexpected resolution: {stdout}"
+            );
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[ignore = "requires CODEX_REAL_MSIX pointing at an official Codex MSIX"]
+    fn real_historical_msix_block_map_round_trips() {
+        let msix = std::env::var_os("CODEX_REAL_MSIX")
+            .map(PathBuf::from)
+            .expect("set CODEX_REAL_MSIX to an official Codex MSIX");
+        assert!(msix.is_file(), "MSIX does not exist: {}", msix.display());
+        let root = temp_test_dir("real-historical-msix");
+        let prepared = prepare_portable_payload(&msix, &root).unwrap();
+
+        assert!(prepared.payload_dir.join("AppxManifest.xml").is_file());
+        assert!(
+            installed_app_exe(&prepared.payload_dir).is_some(),
+            "portable entry executable was not reconstructed"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rejects_encoded_separator_and_traversal_components() {
+        for (name, expected) in [
+            ("app/resources/%2Fescape.txt", "encoded path separator"),
+            ("app/resources/%5Cescape.txt", "encoded path separator"),
+            (
+                "app/resources/%2E%2E/escape.txt",
+                "unsafe MSIX path component",
+            ),
+        ] {
+            let root = temp_test_dir("encoded-traversal");
+            let msix = root.join("codex.msix");
+            let extracted = root.join("extracted");
+            fs::create_dir_all(&extracted).unwrap();
+            write_block_mapped_msix(
+                &msix,
+                &[(r"app\resources\escape.txt", 6)],
+                &[(name, b"escape")],
+            );
+
+            let err = extract_msix(&msix, &extracted).unwrap_err();
+            assert!(
+                err.to_string().contains(expected),
+                "unexpected error for {name}: {err}"
+            );
+            assert!(!root.join("escape.txt").exists());
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn rejects_decoded_output_collisions_instead_of_overwriting() {
+        let root = temp_test_dir("decoded-collision");
+        let msix = root.join("codex.msix");
+        let extracted = root.join("extracted");
+        fs::create_dir_all(&extracted).unwrap();
+        write_block_mapped_msix(
+            &msix,
+            &[(r"app\node_modules\@oai\file.js", 4)],
+            &[
+                ("app/node_modules/%40oai/file.js", b"safe"),
+                ("app/node_modules/@oai/file.js", b"evil"),
+            ],
+        );
+
+        let err = extract_msix(&msix, &extracted).unwrap_err();
+        assert!(
+            err.to_string().contains("collide on Windows"),
+            "unexpected error: {err}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rejects_percent_encoded_payload_without_a_block_map() {
+        let root = temp_test_dir("encoded-without-block-map");
+        let msix = root.join("codex.msix");
+        let extracted = root.join("extracted");
+        fs::create_dir_all(&extracted).unwrap();
+        let file = fs::File::create(&msix).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let opts = SimpleFileOptions::default();
+        zip.start_file("AppxManifest.xml", opts).unwrap();
+        zip.write_all(
+            br#"<Package><Identity Name="OpenAI.Codex" Publisher="CN=X" Version="1.0.0.0" ProcessorArchitecture="x64" /></Package>"#,
+        )
+        .unwrap();
+        zip.start_file("app/node_modules/%40oai/file.js", opts)
+            .unwrap();
+        zip.write_all(b"payload").unwrap();
+        zip.finish().unwrap();
+
+        let err = extract_msix(&msix, &extracted).unwrap_err();
+        assert!(
+            err.to_string().contains("without AppxBlockMap.xml"),
+            "unexpected error: {err}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rejects_missing_or_size_mismatched_block_map_payloads() {
+        for (files, expected) in [
+            (
+                vec![("app/present.txt", b"data".as_slice())],
+                "missing 1 payload file",
+            ),
+            (
+                vec![("app/missing.txt", b"short".as_slice())],
+                "payload size disagrees",
+            ),
+        ] {
+            let root = temp_test_dir("block-map-integrity");
+            let msix = root.join("codex.msix");
+            let extracted = root.join("extracted");
+            fs::create_dir_all(&extracted).unwrap();
+            write_block_mapped_msix(&msix, &[(r"app\missing.txt", 10)], &files);
+
+            let err = extract_msix(&msix, &extracted).unwrap_err();
+            assert!(
+                err.to_string().contains(expected),
+                "unexpected error: {err}"
+            );
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
     #[test]
     fn installs_portable_payload_from_msix_layout() {
         let root = std::env::temp_dir().join(format!("codex-portable-test-{}", std::process::id()));
@@ -1256,8 +3203,8 @@ mod tests {
 
         let report = install_portable_from_msix_inner(&msix, &install_root, false, false).unwrap();
         assert!(report.success);
-        assert!(install_root.join("Codex.exe").exists());
-        assert!(install_root.join("resources/app.asar").exists());
+        assert!(install_root.join("app/Codex.exe").exists());
+        assert!(install_root.join("app/resources/app.asar").exists());
         assert!(install_root.join("AppxManifest.xml").exists());
         assert_eq!(report.version, "26.602.3474.0");
 
@@ -1278,19 +3225,31 @@ mod tests {
 
         let report = install_portable_from_msix_inner(&msix, &install_root, false, false).unwrap();
         assert!(report.success);
-        // Payload root is the manifest entry's directory; both exes ride along.
-        assert!(install_root.join("ChatGPT.exe").exists());
-        assert!(install_root.join("Codex.exe").exists());
-        assert!(install_root.join("resources/app.asar").exists());
+        // Both official binaries and their resources remain intact in app/.
+        assert_eq!(
+            fs::read(install_root.join("app/ChatGPT.exe")).unwrap(),
+            b"fake entry exe"
+        );
+        assert_eq!(
+            fs::read(install_root.join("app/Codex.exe")).unwrap(),
+            b"legacy compat exe"
+        );
+        assert!(install_root.join("app/resources/app.asar").exists());
         assert_eq!(report.version, "26.707.3748.0");
         // The entry executable resolves to ChatGPT.exe, not the legacy binary.
         assert_eq!(
             installed_app_exe(&install_root),
-            Some(install_root.join("ChatGPT.exe"))
+            Some(install_root.join("app/ChatGPT.exe"))
         );
         assert_eq!(
             report.executable_path.as_deref(),
-            Some(install_root.join("ChatGPT.exe").to_string_lossy().as_ref())
+            Some(
+                install_root
+                    .join("app")
+                    .join("ChatGPT.exe")
+                    .to_string_lossy()
+                    .as_ref()
+            )
         );
 
         let _ = fs::remove_dir_all(&root);
@@ -1298,10 +3257,8 @@ mod tests {
 
     #[test]
     fn installed_app_exe_prefers_manifest_then_known_names() {
-        let root = std::env::temp_dir().join(format!(
-            "codex-portable-exe-probe-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("codex-portable-exe-probe-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
 
@@ -1334,6 +3291,29 @@ mod tests {
 </Package>"#,
         )
         .unwrap();
+        assert_eq!(installed_app_exe(&root), None);
+
+        // An existing nested payload is authoritative, even if quarantined:
+        // a root launcher alias must never be mistaken for the real app.
+        fs::create_dir_all(root.join("app")).unwrap();
+        fs::write(root.join("app/Gone.exe"), b"nested entry").unwrap();
+        assert_eq!(installed_app_exe(&root), Some(root.join("app/Gone.exe")));
+        for config in ["", "broken", "ChatGPT.exe\nrequire-cli=broken"] {
+            fs::write(
+                root.join(crate::portable_command::LAUNCH_TARGET_NAME),
+                config,
+            )
+            .unwrap();
+            assert_eq!(installed_app_exe(&root), Some(root.join("app/Gone.exe")));
+        }
+        fs::remove_file(root.join("app/Gone.exe")).unwrap();
+        assert_eq!(installed_app_exe(&root), None);
+        fs::write(
+            root.join(crate::portable_command::LAUNCH_TARGET_NAME),
+            "app/Gone.exe",
+        )
+        .unwrap();
+        fs::remove_dir(root.join("app")).unwrap();
         assert_eq!(installed_app_exe(&root), None);
 
         let _ = fs::remove_dir_all(&root);
@@ -1405,7 +3385,7 @@ mod tests {
             .to_string_lossy()
             .starts_with("Codex.rollback")));
         assert!(!install_root.join("old-marker.txt").exists());
-        assert!(install_root.join("resources/app.asar").exists());
+        assert!(install_root.join("app/resources/app.asar").exists());
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -1415,10 +3395,8 @@ mod tests {
     fn health_check_detects_immediate_exit_entry() {
         // whoami.exe exits instantly — models a broken payload that CreateProcess
         // accepts then immediately dies. The health check must fail closed.
-        let root = std::env::temp_dir().join(format!(
-            "codex-portable-liveness-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("codex-portable-liveness-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         let windir = std::env::var_os("WINDIR").unwrap_or_else(|| "C:\\Windows".into());
@@ -1437,7 +3415,7 @@ mod tests {
         )
         .unwrap();
 
-        let err = health_check_portable_install(&root, true, true).unwrap_err();
+        let err = health_check_portable_install(&root, true, true, "").unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("exited immediately"),
@@ -1486,8 +3464,7 @@ mod tests {
         fs::write(install_root.join("old-marker.txt"), b"old").unwrap();
 
         inject_portable_fault(Some(PortableFault::AfterMoveOld));
-        let err =
-            install_portable_from_msix_inner(&msix, &install_root, false, false).unwrap_err();
+        let err = install_portable_from_msix_inner(&msix, &install_root, false, false).unwrap_err();
         assert!(err.to_string().contains("after-move-old"));
         // Crash window: install missing, rollback backup present, staging payload present.
         assert!(!install_root.exists());
@@ -1521,8 +3498,7 @@ mod tests {
         fs::write(install_root.join("old-marker.txt"), b"old").unwrap();
 
         inject_portable_fault(Some(PortableFault::BeforeMoveOld));
-        let err =
-            install_portable_from_msix_inner(&msix, &install_root, false, false).unwrap_err();
+        let err = install_portable_from_msix_inner(&msix, &install_root, false, false).unwrap_err();
         assert!(err.to_string().contains("before-move-old"));
         assert!(install_root.join("old-marker.txt").exists());
 
@@ -1531,32 +3507,25 @@ mod tests {
 
     #[test]
     fn observer_sees_rename_boundaries() {
-        let root = std::env::temp_dir().join(format!(
-            "codex-portable-observer-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("codex-portable-observer-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         let msix = root.join("codex.msix");
         let install_root = root.join("Codex");
         write_fake_msix(&msix);
         let mut kinds = Vec::new();
-        install_portable_from_msix_with_observer(
-            &msix,
-            &install_root,
-            false,
-            false,
-            &mut |b| {
-                kinds.push(match b {
-                    PortableBoundary::BeforeMoveOld { .. } => "before-old",
-                    PortableBoundary::AfterMoveOld { .. } => "after-old",
-                    PortableBoundary::BeforeMoveNew { .. } => "before-new",
-                    PortableBoundary::AfterMoveNew { .. } => "after-new",
-                    PortableBoundary::RollbackCompleted { .. } => "rollback-completed",
-                });
-                Ok(())
-            },
-        )
+        install_portable_from_msix_with_observer(&msix, &install_root, false, false, &mut |b| {
+            kinds.push(match b {
+                PortableBoundary::BeforeMoveOld { .. } => "before-old",
+                PortableBoundary::AfterMoveOld { .. } => "after-old",
+                PortableBoundary::BeforeMoveNew { .. } => "before-new",
+                PortableBoundary::AfterMoveNew { .. } => "after-new",
+                PortableBoundary::BeforeRollback { .. } => "before-rollback",
+                PortableBoundary::RollbackCompleted { .. } => "rollback-completed",
+            });
+            Ok(())
+        })
         .unwrap();
         assert_eq!(
             kinds,
@@ -1590,6 +3559,7 @@ mod tests {
                     PortableBoundary::AfterMoveOld { .. } => "after-old",
                     PortableBoundary::BeforeMoveNew { .. } => "before-new",
                     PortableBoundary::AfterMoveNew { .. } => "after-new",
+                    PortableBoundary::BeforeRollback { .. } => "before-rollback",
                     PortableBoundary::RollbackCompleted { .. } => "rollback-completed",
                 });
                 Ok(())
@@ -1605,6 +3575,7 @@ mod tests {
                 "after-old",
                 "before-new",
                 "after-new",
+                "before-rollback",
                 "rollback-completed"
             ]
         );
@@ -1650,7 +3621,20 @@ mod tests {
         );
 
         assert!(err.to_string().contains("rollback backup is missing"));
-        assert!(boundaries.is_empty(), "failed rollback must emit no evidence");
+        assert_eq!(boundaries.len(), 1);
+        assert!(matches!(
+            boundaries[0],
+            PortableBoundary::BeforeRollback {
+                had_previous: true,
+                ..
+            }
+        ));
+        assert!(
+            !boundaries
+                .iter()
+                .any(|boundary| matches!(boundary, PortableBoundary::RollbackCompleted { .. })),
+            "failed rollback must not emit completion evidence"
+        );
         assert!(
             install_root.join("new-marker.txt").exists(),
             "failed rollback must preserve the current tree for recovery"
@@ -1673,6 +3657,7 @@ mod tests {
         fs::write(install_root.join("new-marker.txt"), b"new").unwrap();
         fs::create_dir_all(&backup).unwrap();
         fs::write(backup.join("old-marker.txt"), b"old").unwrap();
+        let mut boundaries = Vec::new();
         let mut saw_restored_tree = false;
 
         let err = rollback_install_error(
@@ -1680,22 +3665,34 @@ mod tests {
             &backup,
             true,
             &mut |boundary| {
-                assert!(matches!(
-                    boundary,
-                    PortableBoundary::RollbackCompleted {
-                        had_previous: true,
-                        ..
+                match boundary {
+                    PortableBoundary::BeforeRollback {
+                        had_previous: true, ..
+                    } => {
+                        boundaries.push("before-rollback");
+                        assert!(install_root.join("new-marker.txt").exists());
+                        assert!(backup.join("old-marker.txt").exists());
                     }
-                ));
-                saw_restored_tree = install_root.join("old-marker.txt").exists()
-                    && !install_root.join("new-marker.txt").exists();
+                    PortableBoundary::RollbackCompleted {
+                        had_previous: true, ..
+                    } => {
+                        boundaries.push("rollback-completed");
+                        saw_restored_tree = install_root.join("old-marker.txt").exists()
+                            && !install_root.join("new-marker.txt").exists();
+                    }
+                    other => panic!("unexpected rollback boundary: {other:?}"),
+                }
                 Ok(())
             },
             portable_fault_err("after-move-new"),
         );
 
         assert!(err.to_string().contains("previous install was restored"));
-        assert!(saw_restored_tree, "evidence must follow the completed restore");
+        assert_eq!(boundaries, ["before-rollback", "rollback-completed"]);
+        assert!(
+            saw_restored_tree,
+            "evidence must follow the completed restore"
+        );
         assert!(!backup.exists());
 
         let _ = fs::remove_dir_all(&root);

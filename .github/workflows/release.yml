@@ -42,11 +42,41 @@ name: Release
 # The old MANAGER_*_ACCESS_KEY_ID / SECRET_ACCESS_KEY names must stay deleted;
 # otherwise a historical workflow revision could still perform unconditional writes.
 #
-# Optional Windows Authenticode (non-blocking until configured; see docs/windows-signing.md):
-#   WINDOWS_CERTIFICATE          base64 of OV/EV code-signing .pfx
-#   WINDOWS_CERTIFICATE_PASSWORD password for that .pfx
-#   vars.AUTHENTICODE_REQUIRED   set to "true" to fail release when PE is unsigned
-#   vars.WINDOWS_TIMESTAMP_URL   optional RFC3161 timestamp URL override
+# Optional Windows Authenticode signing (non-blocking until configured; see
+# docs/windows-signing.md and docs/code-signing-policy.md). Provider-agnostic:
+# scripts/sign-windows-authenticode.ps1 is wired as Tauri's
+# bundle.windows.signCommand and dispatches on vars.WINDOWS_SIGNING_PROVIDER,
+# so the main exe, the generated uninstaller, and the final installer are all
+# signed in one pass during `tauri build`. win-installer-check.yml's PR-time
+# NSIS build never sets the repo variable vars.WINDOWS_SIGNING_PROVIDER — a PR
+# cannot select or reach a real provider here — but it does hardcode
+# WINDOWS_SIGNING_PROVIDER=local-pfx with a throwaway self-signed certificate
+# generated fresh in that same job, purely to prove this signCommand hook is
+# actually wired up end to end (see docs/windows-signing.md). That throwaway
+# certificate is never trusted by anything, so it does not change whether a
+# release build here would be considered "signed" in any way that matters.
+#   vars.WINDOWS_SIGNING_PROVIDER  "" (default/unsigned) | "esigner" (recommended,
+#                                   SSL.com eSigner CKA) | "certum" (fallback,
+#                                   Certum SimplySign) | "local-pfx" (testing)
+#   ESIGNER_USERNAME / ESIGNER_PASSWORD / ESIGNER_TOTP_SECRET
+#                                   SSL.com account credentials (provider=esigner)
+#   CERTUM_USERNAME / CERTUM_TOTP_SECRET
+#                                   Certum SimplySign credentials (provider=certum)
+#   vars.CERTUM_ACTION_AUDITED     must be "true" before provider=certum will run
+#                                   (see docs/windows-signing.md#certum-action-audit —
+#                                   jay0lee/certum-cloud-code-sign is a third-party
+#                                   action that receives real account credentials
+#                                   and must be independently audited or vendored
+#                                   first; a deliberate second opt-in, separate
+#                                   from selecting the provider itself)
+#   WINDOWS_CERTIFICATE / WINDOWS_CERTIFICATE_PASSWORD
+#                                   base64 PFX + password (provider=local-pfx only;
+#                                   legacy scaffold, kept for testing/fallback)
+#   vars.AUTHENTICODE_REQUIRED     set to "true" to fail release when a PE is
+#                                   unsigned — flip only after a real provider
+#                                   has been verified end to end (3 PE layers,
+#                                   both archs; see docs/code-signing-policy.md)
+#   vars.WINDOWS_TIMESTAMP_URL     optional RFC3161 timestamp URL override
 
 on:
   # `workflow_run` always loads this credentialed workflow from the repository
@@ -217,13 +247,13 @@ jobs:
             exit 1
           }
 
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: 20
+          node-version: 24
 
       # Resolve the live tag through the API before any tag checkout. A
       # workflow_run must still point at the exact SHA carried by the successful
@@ -239,7 +269,7 @@ jobs:
       # The root checkout contains only the trusted default-branch workflow and
       # release scripts. Check out application source separately by the already
       # verified commit SHA, never by a mutable tag name.
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ steps.tag_source.outputs.release_source_sha }}
           path: release-source
@@ -347,11 +377,11 @@ jobs:
             exit 1
           }
 
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.prepare.outputs.release_source_sha }}
           path: release-source
@@ -374,19 +404,19 @@ jobs:
           node ../scripts/check-release-version.mjs source "$RELEASE_TAG" .
           bash ../scripts/check-release-source-ancestor.sh . "$RELEASE_SOURCE_SHA" "$DEFAULT_BRANCH"
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: 20
+          node-version: 24
           cache: npm
           cache-dependency-path: release-source/package-lock.json
 
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           targets: ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          workspaces: release-source/src-tauri -> target
+          workspaces: release-source -> target
 
       - run: npm ci
 
@@ -416,16 +446,187 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KC"
           security list-keychains -d user -s "$KC" $(security list-keychains -d user | sed s/\"//g)
 
-      # ── Build WITHOUT a tauri signingIdentity; we sign inside-out after ────
-      - name: Build (Tauri, unsigned)
+      # ── Windows: assert the manual-approval gate before any signing secret is used ─
+      #    docs/code-signing-policy.md requires per-request human approval
+      #    (a required-reviewers rule on the `release` Environment) before an
+      #    automated cloud-HSM login may sign anything. That rule is repository
+      #    configuration, not workflow code, so without this step forgetting to
+      #    configure it would silently sign with a stored credential and no
+      #    approval. Only runs when a cloud provider is selected — never in
+      #    today's unsigned default. Best effort by construction, and likely
+      #    INERT with the default token: GITHUB_TOKEN has no `environments`
+      #    permission, so this call is expected to fail and only warn (rule
+      #    not verified) - it is a tripwire, not the control. The real control
+      #    is the manual checklist in docs/windows-signing.md (step 2). Only a
+      #    readable answer with no required_reviewers rule (including no
+      #    protection rules at all) is a hard failure.
+      - name: Assert release environment requires reviewers (cloud signing)
+        if: matrix.os == 'windows' && (vars.WINDOWS_SIGNING_PROVIDER == 'esigner' || vars.WINDOWS_SIGNING_PROVIDER == 'certum')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WINDOWS_SIGNING_PROVIDER: ${{ vars.WINDOWS_SIGNING_PROVIDER }}
+        run: |
+          $raw = & gh api "repos/$env:GITHUB_REPOSITORY/environments/release" 2>&1
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::warning::Could not read the release environment's protection rules with the workflow token, so the required-reviewers gate is NOT verified by this run. Confirm it manually (docs/windows-signing.md, step 2)."
+            return
+          }
+          $rules = @((($raw | Out-String) | ConvertFrom-Json).protection_rules)
+          if (-not ($rules | Where-Object { $_.type -eq "required_reviewers" })) {
+            Write-Host "::error::WINDOWS_SIGNING_PROVIDER=$env:WINDOWS_SIGNING_PROVIDER but the release environment has no required-reviewers rule (rules seen: $($rules.Count)). docs/code-signing-policy.md requires per-request human approval before a cloud signing credential is used; add a required reviewer (Settings > Environments > release) first."
+            exit 1
+          }
+          Write-Host "release environment has a required-reviewers rule."
+
+      # ── Windows: provision the eSigner CKA certificate (recommended provider) ─
+      #    Only runs when vars.WINDOWS_SIGNING_PROVIDER == 'esigner'. No-op
+      #    (and no secrets touched) for every other value, including the
+      #    default empty string — matching today's unsigned release exactly.
+      #    Authenticates to SSL.com and installs a CNG-backed certificate into
+      #    the runner's CurrentUser certificate store *before* `tauri build`
+      #    runs, so the signCommand hook (scripts/sign-windows-authenticode.ps1)
+      #    can sign with plain signtool.exe. Only the resulting certificate
+      #    thumbprint — not a secret — is exported to WINDOWS_SIGNING_THUMBPRINT.
+      #    Flags follow SSL.com's published eSigner CKA CI/CD guide; validate
+      #    against a real SSL.com account before relying on this in production
+      #    (see docs/windows-signing.md).
+      #    The downloaded release archive's SHA-256 is pinned and verified
+      #    before extraction: this step runs in the credentialed `release`
+      #    environment (ESIGNER_* secrets), so a replaced/compromised GitHub
+      #    release asset must not be able to execute inside it unnoticed.
+      #    Download/verify/extract/rename is factored into
+      #    scripts/resolve-esigner-cka-installer.ps1 (shared with the
+      #    secret-free CI dry run in win-installer-check.yml) — see that
+      #    script's header for why the extracted installer must be renamed.
+      #    Update its -Version / -ExpectedSha256 defaults together in a
+      #    reviewed PR when bumping the eSigner CKA release.
+      - name: Provision eSigner CKA certificate
+        if: matrix.os == 'windows' && vars.WINDOWS_SIGNING_PROVIDER == 'esigner'
+        shell: pwsh
+        env:
+          ESIGNER_USERNAME: ${{ secrets.ESIGNER_USERNAME }}
+          ESIGNER_PASSWORD: ${{ secrets.ESIGNER_PASSWORD }}
+          ESIGNER_TOTP_SECRET: ${{ secrets.ESIGNER_TOTP_SECRET }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ([string]::IsNullOrWhiteSpace($env:ESIGNER_USERNAME) -or [string]::IsNullOrWhiteSpace($env:ESIGNER_PASSWORD) -or [string]::IsNullOrWhiteSpace($env:ESIGNER_TOTP_SECRET)) {
+            Write-Host "::error::WINDOWS_SIGNING_PROVIDER=esigner but ESIGNER_USERNAME/ESIGNER_PASSWORD/ESIGNER_TOTP_SECRET are not fully configured on the release environment"
+            exit 1
+          }
+          $installDir = Join-Path $env:RUNNER_TEMP "eSignerCKA"
+          $installer = & ./scripts/resolve-esigner-cka-installer.ps1 -DestinationDir $installDir -Stage "esigner-provision"
+          & $installer /CURRENTUSER /VERYSILENT /SUPPRESSMSGBOXES "/DIR=$installDir" | Out-Null
+          $tool = Join-Path $installDir "eSignerCKATool.exe"
+          $masterKey = Join-Path $installDir "master.key"
+          & $tool config -mode "product" -user "$env:ESIGNER_USERNAME" -pass "$env:ESIGNER_PASSWORD" -totp "$env:ESIGNER_TOTP_SECRET" -key "$masterKey" -r
+          & $tool unload
+          # Identify the certificate THIS step loads by diffing the store
+          # before/after `load`, rather than blindly taking the first
+          # CurrentUser\My code-signing cert — a runner (self-hosted, or a
+          # future change that provisions another cert earlier in the job)
+          # could otherwise have an unrelated code-signing certificate
+          # already present, silently signing the release with the wrong
+          # publisher.
+          $beforeThumbprints = @(Get-ChildItem Cert:\CurrentUser\My -CodeSigningCert -ErrorAction SilentlyContinue | ForEach-Object Thumbprint)
+          & $tool load
+          $afterCerts = @(Get-ChildItem Cert:\CurrentUser\My -CodeSigningCert -ErrorAction SilentlyContinue)
+          $newCerts = @($afterCerts | Where-Object { $beforeThumbprints -notcontains $_.Thumbprint })
+          if ($newCerts.Count -eq 0) {
+            Write-Host "::error::eSigner CKA load did not add a new code-signing certificate to CurrentUser\My (pre-existing: $($beforeThumbprints -join ', '))"
+            exit 1
+          }
+          if ($newCerts.Count -gt 1) {
+            Write-Host "::error::eSigner CKA load added more than one code-signing certificate to CurrentUser\My; cannot unambiguously pick one ($((($newCerts | ForEach-Object Thumbprint)) -join ', '))"
+            exit 1
+          }
+          $cert = $newCerts[0]
+          Write-Host "eSigner CKA certificate loaded: thumbprint=$($cert.Thumbprint) subject=$($cert.Subject)"
+          "WINDOWS_SIGNING_THUMBPRINT=$($cert.Thumbprint)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      # ── Windows: provision the Certum SimplySign certificate (fallback) ────
+      #    Only runs when vars.WINDOWS_SIGNING_PROVIDER == 'certum'. Uses the
+      #    community-maintained, SHA-pinned jay0lee/certum-cloud-code-sign
+      #    action to authenticate to SimplySign and install the certificate.
+      #    Only its cert-thumbprint output (not a secret) feeds the signCommand
+      #    hook. See docs/windows-signing.md for setup and the risk note about
+      #    depending on a third-party action.
+      #
+      #    That action is a single-author, unaudited-by-us repository that
+      #    GUI-automates the SimplySign Desktop client via its own
+      #    install/auth/verify scripts, and it receives the real Certum
+      #    account credentials (CERTUM_USERNAME + CERTUM_TOTP_SECRET), not a
+      #    scoped signing token. SHA-pinning stops the pinned commit from
+      #    changing under us, but it does not substitute for actually
+      #    reading that commit's scripts. Require an explicit, separate
+      #    opt-in (vars.CERTUM_ACTION_AUDITED=true) so enabling the certum
+      #    fallback is a deliberate decision made only after a maintainer
+      #    has read jay0lee/certum-cloud-code-sign@a3324503 (or vendored a
+      #    reviewed fork of it) — see docs/windows-signing.md#certum-action-audit.
+      - name: Require Certum action audit acknowledgment
+        if: matrix.os == 'windows' && vars.WINDOWS_SIGNING_PROVIDER == 'certum' && vars.CERTUM_ACTION_AUDITED != 'true'
+        shell: pwsh
+        run: |
+          Write-Host "::error::WINDOWS_SIGNING_PROVIDER=certum requires vars.CERTUM_ACTION_AUDITED=true. jay0lee/certum-cloud-code-sign is a third-party action that receives real Certum account credentials; read docs/windows-signing.md#certum-action-audit and audit (or vendor) that action before setting this variable."
+          exit 1
+
+      # GitHub 在执行 if 之前校验所有外部 action。尚未启用的 Certum action
+      # 不在本仓库允许列表中，直接引用也会阻止默认的未签名发布启动。
+      # 保留 provider 的明确错误，待供应商接入完成审核后再加入本地实现。
+      - name: Require reviewed local Certum provisioning
+        if: matrix.os == 'windows' && vars.WINDOWS_SIGNING_PROVIDER == 'certum'
+        shell: pwsh
+        run: |
+          Write-Host "::error::Certum 备用方案尚未接入：本仓库 action 策略禁止直接调用外部 Certum action。请先审核并接入本地证书预配实现，再启用 certum provider。"
+          exit 1
+
+      # ── Build (macOS: signed inside-out after; Windows: signed inline via ──
+      #    the signCommand hook — scripts/sign-windows-authenticode.ps1 — when
+      #    vars.WINDOWS_SIGNING_PROVIDER selects a provider; unsigned no-op
+      #    otherwise, which is today's exact default behavior) ────────────────
+      - name: Build (Tauri)
         shell: bash
+        # These are only ever read by signCommand on the Windows legs (see
+        # scripts/sign-windows-authenticode.ps1). Gate every value on
+        # matrix.os == 'windows' — not just the provider selector — so the
+        # code-signing PFX and its password never land in the macOS build
+        # process's environment, where a compromised npm/cargo build-time
+        # script (postinstall hook, build.rs, etc.) could read and exfiltrate
+        # them even though that leg never uses them. The PFX secrets are
+        # further limited to provider local-pfx (which signs with them) and
+        # to an unset/"none" provider (so the migration guard in the signing
+        # script can still see a leftover WINDOWS_CERTIFICATE and fail loudly);
+        # with esigner/certum a retained legacy PFX is never exposed to the
+        # build process.
+        env:
+          WINDOWS_SIGNING_PROVIDER: ${{ matrix.os == 'windows' && vars.WINDOWS_SIGNING_PROVIDER || '' }}
+          WINDOWS_CERTIFICATE: ${{ matrix.os == 'windows' && contains(fromJSON('["","none","local-pfx"]'), vars.WINDOWS_SIGNING_PROVIDER) && secrets.WINDOWS_CERTIFICATE || '' }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ matrix.os == 'windows' && contains(fromJSON('["","none","local-pfx"]'), vars.WINDOWS_SIGNING_PROVIDER) && secrets.WINDOWS_CERTIFICATE_PASSWORD || '' }}
+          WINDOWS_TIMESTAMP_URL: ${{ matrix.os == 'windows' && vars.WINDOWS_TIMESTAMP_URL || '' }}
+          # The signing script writes this file when signing fails (see
+          # Write-FailureMarker in scripts/sign-windows-authenticode.ps1) so the
+          # retry loop below can tell a deterministic signing failure from a
+          # transient toolchain download failure.
+          WINDOWS_SIGNING_FAILURE_MARKER: ${{ matrix.os == 'windows' && format('{0}/signing-failed.marker', runner.temp) || '' }}
         # Bundling downloads toolchains on the fly (e.g. the NSIS archive from
         # GitHub) which occasionally 504s and fails the whole release. Retry a
         # few times so a transient download hiccup doesn't sink the run — cargo
         # output is cached, so a retry mostly just re-runs the bundling step.
         run: |
+          marker=""
+          if [ -n "${WINDOWS_SIGNING_FAILURE_MARKER:-}" ]; then
+            marker="$(cygpath -u "$WINDOWS_SIGNING_FAILURE_MARKER" 2>/dev/null || printf '%s' "$WINDOWS_SIGNING_FAILURE_MARKER")"
+          fi
           for attempt in 1 2 3; do
+            [ -z "$marker" ] || rm -f "$marker"
             npm run tauri build -- --target ${{ matrix.target }} && exit 0
+            # Authenticode signing failed: deterministic, and each repeat would
+            # re-run (and, with a cloud provider, re-bill) every signing call.
+            # Do not retry; surface the real error instead.
+            if [ -n "$marker" ] && [ -e "$marker" ]; then
+              echo "::error::tauri build failed during Windows signing (not retrying): $(cat "$marker")"
+              exit 1
+            fi
             echo "::warning::tauri build attempt ${attempt} failed (often a transient NSIS/toolchain download, e.g. HTTP 504) — retrying in 20s"
             sleep 20
           done
@@ -438,7 +639,7 @@ jobs:
       - name: Assert BinaryDelta inside the bundle
         if: matrix.os == 'macos'
         run: |
-          APP="$(find "src-tauri/target/${{ matrix.target }}/release/bundle/macos" -maxdepth 1 -name '*.app' | head -1)"
+          APP="$(find "target/${{ matrix.target }}/release/bundle/macos" -maxdepth 1 -name '*.app' | head -1)"
           BD="$APP/Contents/Resources/resources/BinaryDelta"
           [ -x "$BD" ] || { echo "::error::BinaryDelta missing or not executable at $BD — macOS delta updates would silently fall back to full downloads"; exit 1; }
           arches="$(lipo -archs "$BD")"
@@ -475,8 +676,8 @@ jobs:
         shell: pwsh
         run: |
           $target = "${{ matrix.target }}"
-          $main = "src-tauri/target/$target/release/codex-app-manager.exe"
-          $setup = @(Get-ChildItem "src-tauri/target/$target/release/bundle/nsis/*-setup.exe" -ErrorAction SilentlyContinue)
+          $main = "target/$target/release/codex-app-manager.exe"
+          $setup = @(Get-ChildItem "target/$target/release/bundle/nsis/*-setup.exe" -ErrorAction SilentlyContinue)
           if (-not (Test-Path -LiteralPath $main)) {
             Write-Host "::error::[build] missing main PE: $main"
             exit 1
@@ -489,41 +690,84 @@ jobs:
             & .\scripts\windows-pe-arch.ps1 -Path @($setup | ForEach-Object { $_.FullName })
           }
           if ($target -like "aarch64-*") {
-            Write-Host "::notice::ARM64 main PE asserted machine=0xAA64 (cross-build on x64). Full install/launch smoke remains x64-only until ARM64 runners or trusted virtualization is available."
+            Write-Host "::notice::ARM64 main PE asserted machine=0xAA64 (cross-build on x64). Full Manager installer smoke remains x64-only; native ARM64 portable MSIX extraction and cua_node module resolution run in windows-portable-msix-e2e.yml."
           }
 
-      # ── Windows: optional Authenticode (OV/EV) on final NSIS installer ────
-      #    Non-blocking until WINDOWS_CERTIFICATE is configured in the release
-      #    environment. When present, signs the published -setup.exe. Full
-      #    inside-out signing of main binary + uninstaller should eventually
-      #    move into tauri build via certificateThumbprint (docs/windows-signing.md).
-      #    This is independent of the Tauri updater minisign key below.
-      - name: Authenticode-sign Windows installer (optional)
-        if: matrix.os == 'windows'
-        shell: pwsh
-        env:
-          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
-          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
-          WINDOWS_TIMESTAMP_URL: ${{ vars.WINDOWS_TIMESTAMP_URL }}
-        run: |
-          $setup = Get-ChildItem "src-tauri/target/${{ matrix.target }}/release/bundle/nsis/*-setup.exe" -ErrorAction Stop
-          & .\scripts\sign-windows-authenticode.ps1 -Path $setup.FullName -Stage "sign"
-
+      # ── Windows: verify Authenticode on the final NSIS installer ───────────
+      #    Signing itself already happened inline during `tauri build` via the
+      #    signCommand hook (scripts/sign-windows-authenticode.ps1), covering
+      #    the main binary, the generated uninstaller (via NSIS
+      #    !uninstfinalize), and the final -setup.exe — see
+      #    src-tauri/tauri.conf.json bundle.windows.signCommand.
+      #    Only the installer is checked here, deliberately NOT
+      #    target/<target>/release/codex-app-manager.exe: tauri-bundler
+      #    signs a copy of the main exe for embedding and then restores that
+      #    on-disk file to its unsigned, unpatched original after each bundle
+      #    type (tauri-cli 2.11.5, tauri-bundler bundle.rs, "Restore unsigned
+      #    and unpatched binary"), so that path is NotSigned even on a fully
+      #    signed release. The signed main exe and the uninstaller exist as
+      #    files only once the installer is installed — the next step verifies
+      #    them (x64). ARM64 cannot install on an x64 runner, so its main exe
+      #    and uninstaller stay on the manual checklist in
+      #    docs/windows-signing.md.
+      #    Optional until vars.AUTHENTICODE_REQUIRED=true; unsigned
+      #    (NotSigned) is expected and non-blocking while no
+      #    WINDOWS_SIGNING_PROVIDER is configured.
+      #    -ExpectedThumbprint pins the check to the specific certificate the
+      #    esigner/certum provisioning step loaded and exported as
+      #    WINDOWS_SIGNING_THUMBPRINT (see docs/code-signing-policy.md's "from
+      #    the expected publisher" requirement) — Valid + timestamp alone
+      #    would still pass for a trusted certificate belonging to someone
+      #    else. Empty for local-pfx/no provider, matching today's behavior.
       - name: Verify Authenticode on Windows installer
         if: matrix.os == 'windows'
         shell: pwsh
         env:
           AUTHENTICODE_MODE: ${{ vars.AUTHENTICODE_REQUIRED == 'true' && 'required' || 'optional' }}
         run: |
-          $setup = Get-ChildItem "src-tauri/target/${{ matrix.target }}/release/bundle/nsis/*-setup.exe" -ErrorAction Stop
+          $setup = Get-ChildItem "target/${{ matrix.target }}/release/bundle/nsis/*-setup.exe" -ErrorAction Stop
           & .\scripts\verify-windows-authenticode.ps1 `
-            -Path $setup.FullName `
+            -Path @($setup.FullName) `
             -Mode $env:AUTHENTICODE_MODE `
+            -ExpectedThumbprint $env:WINDOWS_SIGNING_THUMBPRINT `
             -Stage "sign-verify"
 
+      # ── Windows (x64 only): installed main exe + uninstaller Authenticode
+      #    gate on the real, signed release artifact ──────────────────────────
+      #    docs/code-signing-policy.md requires all three project-owned PE
+      #    layers (main exe, uninstaller, installer) to verify before
+      #    publication. The signed main exe and the uninstaller only exist as
+      #    files once the installer has been installed (NSIS writes the
+      #    uninstaller during install; the on-disk build-output main exe is
+      #    restored to unsigned by tauri-bundler), so this reuses the packaged
+      #    lifecycle smoke script win-installer-check.yml already proves on
+      #    PRs (throwaway-cert builds there) — here against the just-built
+      #    -setup.exe, before this job publishes anything. It runs whenever a
+      #    cloud provider is selected (mode optional/required follows
+      #    AUTHENTICODE_REQUIRED), so the recommended "run 1-2 releases in
+      #    optional mode first" rollout still hard-checks that every layer
+      #    carries the provider's certificate, while a default unsigned
+      #    release (no provider, enforcement off) skips this extra
+      #    install/launch/upgrade/uninstall pass entirely, exactly as today.
+      #    A failure here blocks the release. windows-latest is x64, so a
+      #    cross-built ARM64 installer cannot install/run here — see
+      #    docs/windows-signing.md's ARM64 runtime-verification checklist
+      #    (item 6) for the manual check that covers that architecture.
+      - name: Installed main exe + uninstaller Authenticode gate (x64)
+        if: matrix.os == 'windows' && matrix.target == 'x86_64-pc-windows-msvc' && (vars.AUTHENTICODE_REQUIRED == 'true' || vars.WINDOWS_SIGNING_PROVIDER == 'esigner' || vars.WINDOWS_SIGNING_PROVIDER == 'certum')
+        shell: pwsh
+        env:
+          AUTHENTICODE_MODE: ${{ vars.AUTHENTICODE_REQUIRED == 'true' && 'required' || 'optional' }}
+        run: |
+          $setup = Get-ChildItem "target/${{ matrix.target }}/release/bundle/nsis/*-setup.exe" -ErrorAction Stop
+          & .\scripts\windows-packaged-smoke.ps1 `
+            -Installer $setup.FullName `
+            -AuthenticodeMode $env:AUTHENTICODE_MODE `
+            -ExpectedThumbprint $env:WINDOWS_SIGNING_THUMBPRINT
+
       # ── Windows: sign the NSIS installer for the updater ──────────────────
-      #    The build is intentionally unsigned for Authenticode (until OV/EV is
-      #    configured), so Tauri emits no updater `.sig` during build. In Tauri 2
+      #    Tauri never emits an updater `.sig` on its own during build; this is
+      #    unrelated to whether Authenticode signing is configured. In Tauri 2
       #    the Windows updater ships the `-setup.exe` itself, so signing it here
       #    with the updater key — exactly what finalize-macos.sh does for the
       #    .app.tar.gz — is equivalent to `createUpdaterArtifacts` and is what
@@ -539,7 +783,7 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
           echo "::group::[sign] Tauri updater signature (.sig)"
-          B="src-tauri/target/${{ matrix.target }}/release/bundle"
+          B="target/${{ matrix.target }}/release/bundle"
           shopt -s nullglob
           signed=0
           for exe in "$B"/nsis/*-setup.exe; do
@@ -559,7 +803,7 @@ jobs:
         run: |
           echo "::group::[build] collect final publishable artifacts"
           DST="$GITHUB_WORKSPACE/dist-artifacts"; mkdir -p "$DST"
-          B="src-tauri/target/${{ matrix.target }}/release/bundle"
+          B="target/${{ matrix.target }}/release/bundle"
           ARCH="${{ matrix.target }}"; ARCH="${ARCH%%-*}"
           shopt -s nullglob
           if [ "${{ matrix.os }}" = "macos" ]; then
@@ -600,7 +844,7 @@ jobs:
           fi
           echo "::endgroup::"
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: bundle-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: dist-artifacts/*
@@ -695,7 +939,7 @@ jobs:
             exit 1
           }
 
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -716,9 +960,9 @@ jobs:
             exit 1
           fi
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: 20
+          node-version: 24
 
       # Re-resolve tag policy on every release-job attempt. For manual recovery
       # this independently resolves the immutable tag; a signal run must still
@@ -734,7 +978,7 @@ jobs:
       # Re-run this gate inside every release-job attempt. GitHub's "Re-run
       # failed jobs" does not re-run prepare, and no immutable publication may
       # rely only on a previous attempt's source or ancestry decision.
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ steps.tag_source.outputs.release_source_sha }}
           path: release-source
@@ -1010,7 +1254,7 @@ jobs:
       - name: Attest fresh build provenance
         id: attest_fresh
         if: ${{ steps.release_source.outputs.existing != 'true' }}
-        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: |
             dist/*
@@ -1019,7 +1263,7 @@ jobs:
       - name: Attest fresh release source binding
         id: attest_binding
         if: ${{ steps.release_source.outputs.existing != 'true' }}
-        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-path: |
             dist/*
@@ -1217,7 +1461,7 @@ jobs:
           sha256sum release-binding.json >> SHA256SUMS
           cat SHA256SUMS
 
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
 
       - name: Generate SBOMs
         id: sbom
@@ -1267,7 +1511,7 @@ jobs:
       - name: Upload GitHub Release draft
         id: upload_release_draft
         if: ${{ steps.provenance.outputs.ready == 'true' && steps.release_source.outputs.existing != 'true' }}
-        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           tag_name: ${{ env.RELEASE_TAG }}
           draft: true
@@ -1301,7 +1545,7 @@ jobs:
       - name: Publish GitHub Release
         id: publish_release
         if: ${{ steps.provenance.outputs.ready == 'true' && steps.release_source.outputs.existing != 'true' }}
-        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           tag_name: ${{ env.RELEASE_TAG }}
 
@@ -1405,8 +1649,8 @@ jobs:
       # The release above is created with GITHUB_TOKEN, which by design does not
       # trigger other workflows — so winget.yml's `on: release` never fires.
       # Dispatch it explicitly (stable releases only). winget.yml no-ops cleanly
-      # without WINGET_TOKEN, and winget-releaser skips versions already present,
-      # so a re-run is harmless.
+      # without WINGET_TOKEN, and Komac checks for an existing version or PR, so
+      # a re-run is harmless.
       - name: Trigger winget submission
         id: winget
         if: ${{ success() && steps.provenance.outputs.ready == 'true' && !contains(env.RELEASE_TAG, '-') }}
@@ -1436,7 +1680,7 @@ jobs:
 
       - name: Upload release audit records
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: release-audit-${{ env.RELEASE_TAG }}-${{ github.run_attempt }}
           path: |

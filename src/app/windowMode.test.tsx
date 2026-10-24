@@ -2,7 +2,7 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { useState } from "react";
 import { describe, expect, it } from "vitest";
 
-import { TopBar } from "./components";
+import { NavBar, TopBar } from "./components";
 import { useI18n, I18nProvider } from "./i18n";
 import { acquireNavLock } from "./navLock";
 import { Rail, type RailSection } from "./Rail";
@@ -19,8 +19,17 @@ function Harness() {
     <ThemeProvider>
       <I18nProvider>
         <WindowModeProvider>
-          <TopBar />
           <Rail section={section} onNavigate={setSection} />
+          <div data-view="home" style={{ display: section === "home" ? "contents" : "none" }}>
+            <TopBar>
+              <button data-page-focus onClick={() => setSection("settings")}>Home settings</button>
+            </TopBar>
+          </div>
+          {section !== "home" ? (
+            <div data-view={section}>
+              <NavBar title={section} onBack={() => setSection("home")} />
+            </div>
+          ) : null}
           <ActiveSection section={section} />
         </WindowModeProvider>
       </I18nProvider>
@@ -99,6 +108,16 @@ describe("window modes", () => {
     render(<Bare />);
     expect(screen.queryByTitle(/expand workspace/i)).not.toBeInTheDocument();
     expect(screen.queryByRole("navigation")).not.toBeInTheDocument();
+  });
+
+  it("restores focus to the visible page when collapsing from settings", async () => {
+    render(<Harness />);
+    await expand();
+    fireEvent.click(screen.getByRole("button", { name: /^settings$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /collapse workspace/i }));
+
+    await waitFor(() => expect(screen.queryByRole("navigation")).not.toBeInTheDocument());
+    await waitFor(() => expect(screen.getByRole("button", { name: /back/i })).toHaveFocus());
   });
 
   it("nav lock disables rail navigation but not collapse", async () => {

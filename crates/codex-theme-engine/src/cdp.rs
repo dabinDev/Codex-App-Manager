@@ -385,9 +385,9 @@ pub async fn cdp_http_ready(port: u16) -> bool {
 /// unmounts — an `app://` page whose title still identifies Codex.
 pub const PROBE_EXPRESSION: &str = r#"(() => {
     const markers = {
-      shell: Boolean(document.querySelector('main.main-surface')),
+      shell: Boolean(document.querySelector('main[data-app-shell-main-surface], main.main-surface')),
       sidebar: Boolean(document.querySelector('.app-shell-left-panel')),
-      composer: Boolean(document.querySelector('.composer-surface-chrome')),
+      composer: Boolean(document.querySelector('.composer-surface-chrome, [data-codex-composer-root] [data-composer-surface-variant][data-composer-layout]')),
       main: Boolean(document.querySelector('[role="main"]')),
     };
     const shellMatch = markers.shell && markers.sidebar && (markers.composer || markers.main);
@@ -525,5 +525,16 @@ mod tests {
                 "unexpected exclusion: {url}"
             );
         }
+    }
+
+    #[test]
+    fn shell_probe_accepts_current_and_legacy_main_surfaces() {
+        let current = PROBE_EXPRESSION
+            .find("main[data-app-shell-main-surface]")
+            .expect("current main-surface selector");
+        let legacy = PROBE_EXPRESSION
+            .find("main.main-surface")
+            .expect("legacy main-surface selector");
+        assert!(current < legacy, "current semantic marker must be probed first");
     }
 }

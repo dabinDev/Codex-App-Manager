@@ -57,7 +57,11 @@ export function crashBodyForSnapshot(
   if (snap.phase === "committing" || snap.phase === "finishing" || !snap.interruptible) {
     return strings["crash.bodyCritical"];
   }
-  if (snap.kind === "install" || snap.kind === "update") {
+  if (
+    snap.kind === "install" ||
+    snap.kind === "update" ||
+    snap.kind === "manager-update"
+  ) {
     return strings["crash.bodyActive"];
   }
   return strings["crash.body"];
@@ -139,7 +143,7 @@ export class ErrorBoundary extends Component<{ children: ReactNode }, State> {
   private copy = async () => {
     try {
       const diagnostics = await managerApi.getDiagnostics();
-      await navigator.clipboard.writeText(formatDiagnostics(diagnostics, this.state.error));
+      await managerApi.writeClipboardText(formatDiagnostics(diagnostics, this.state.error));
       this.setState({ copied: true });
     } catch {
       // The crash screen must never throw while trying to help.

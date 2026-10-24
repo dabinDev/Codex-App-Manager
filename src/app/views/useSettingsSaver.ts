@@ -44,7 +44,6 @@ export function useSettingsSaver(initial: AppSettings) {
   const [error, setError] = useState<string | null>(null);
   const [hydrated, setHydrated] = useState(false);
 
-  const seqRef = useRef(0);
   const inFlightRef = useRef(false);
   const pendingRef = useRef<AppSettings | null>(null);
   const lastValueRef = useRef(initial);
@@ -62,19 +61,20 @@ export function useSettingsSaver(initial: AppSettings) {
 
     pendingRef.current = null;
     inFlightRef.current = true;
-    const mySeq = ++seqRef.current;
     setStatus("saving");
     setError(null);
 
     try {
-      const saved = await managerApi.setSettings(next);
-      if (mySeq === seqRef.current && pendingRef.current == null) {
-        lastValueRef.current = saved;
-        setValue((prev) => mergeSavedKeepingCustomDraft(prev, saved));
+      const saved = await managerApi.setSettings(settingsPayloadForSave(next, lastValueRef.current));
+      lastValueRef.current = saved;
+      if (pendingRef.current == null) {
+        // A response only owns the draft it submitted. Typing into a custom
+        // field does not enqueue a write until blur, but still supersedes it.
+        setValue((prev) => prev === next ? mergeSavedKeepingCustomDraft(prev, saved) : prev);
         setStatus("idle");
       }
     } catch (cause) {
-      if (mySeq === seqRef.current && pendingRef.current == null) {
+      if (pendingRef.current == null) {
         setStatus("error");
         setError(errorMessage(cause));
       }
@@ -90,7 +90,7 @@ export function useSettingsSaver(initial: AppSettings) {
     (next: AppSettings) => {
       dirtyRef.current = true;
       setValue(next);
-      pendingRef.current = settingsPayloadForSave(next, lastValueRef.current);
+      pendingRef.current = next;
       void flush();
     },
     [flush],
@@ -103,10 +103,7 @@ export function useSettingsSaver(initial: AppSettings) {
 
   const retry = useCallback(() => {
     dirtyRef.current = true;
-    pendingRef.current = settingsPayloadForSave(
-      pendingRef.current ?? value,
-      lastValueRef.current,
-    );
+    pendingRef.current = pendingRef.current ?? value;
     void flush();
   }, [flush, value]);
 

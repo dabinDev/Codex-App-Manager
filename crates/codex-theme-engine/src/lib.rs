@@ -13,9 +13,16 @@
 //! - [`native`] — `~/.codex/config.toml` appearance sections (`native-theme.mjs`)
 //! - [`daemon`] — in-process keeper that re-injects across reloads/new targets
 //!
-//! The injected renderer runtime (`src/runtime/theme-runtime.js`) is the
-//! studio's file verbatim — it encodes hard-won flicker/idempotence/route
-//! discipline (see that file's comments) and must be edited there, not here.
+//! The injected renderer runtime (`src/runtime/theme-runtime.js` and
+//! `src/runtime/composer-overflow.mjs`) is authored here — this crate is now
+//! the single canonical implementation. It encodes hard-won
+//! flicker/idempotence/route discipline (see those files' comments) and must
+//! be edited here, not in the studio repo. `awesome-codex-skins`'s
+//! `studio/src/runtime/theme-runtime.js` and `studio/src/composer-overflow.mjs`
+//! are generated, vendored copies pinned to a commit of this crate (see that
+//! repo's `studio/RUNTIME_SOURCE.json` and `SPEC.md` §5); the relationship
+//! used to run the other way (this was a Rust port of the studio's file) but
+//! the studio now syncs *from* here instead.
 
 pub mod cdp;
 pub mod codex_theme;
@@ -27,6 +34,10 @@ pub mod native_hot;
 pub mod payload;
 pub mod theme;
 pub mod transaction;
+
+#[cfg(test)]
+#[path = "../../test-support/zip.rs"]
+mod zip_test;
 
 /// Engine version stamped into every payload; the renderer's verify pass
 /// checks it, so an engine upgrade re-injects on the next daemon tick.

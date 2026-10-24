@@ -17,19 +17,31 @@ pub mod authenticode;
 pub mod capability;
 pub mod checksums;
 pub mod download;
+mod github_rate_limit;
 pub mod limits;
 pub mod manifest;
 pub mod msix;
 pub mod network;
 pub mod plan;
 pub mod portable;
+mod portable_command;
+#[cfg(windows)]
+mod portable_shortcut;
+#[cfg(windows)]
+mod portable_protocol;
 mod process;
+mod startup_window;
 pub mod sys;
 pub mod version;
 mod windows_process;
 
+#[cfg(test)]
+#[path = "../../test-support/zip.rs"]
+mod zip_test;
+
 pub use app_version::{
     read_codex_app_version_from_asar, read_codex_app_version_from_install_root,
+    read_codex_app_version_from_msix,
 };
 pub use authenticode::{
     verify_openai_authenticode, AuthenticodeReport, OPENAI_MARKETPLACE_PUBLISHER_SUBJECT,
@@ -45,9 +57,9 @@ pub use download::{
 };
 pub use manifest::{parse_manifest, WindowsRelease};
 pub use msix::{
-    framework_dependencies, is_framework_dependency, parse_appx_manifest_dependencies,
-    parse_appx_manifest_xml, read_msix_dependencies, read_msix_identity, validate_codex_identity,
-    MsixIdentity, MsixPackageDependency,
+    canonical_codex_package_moniker, framework_dependencies, is_framework_dependency,
+    parse_appx_manifest_dependencies, parse_appx_manifest_xml, read_msix_dependencies,
+    read_msix_identity, validate_codex_identity, MsixIdentity, MsixPackageDependency,
 };
 pub use network::NetworkConfig;
 pub use plan::{plan_update, WinInstallRoute, WindowsUpdatePlan};
@@ -61,7 +73,8 @@ pub use portable::{
 pub use sys::{
     close_msix_codex_processes, detect_installed_codex, detect_portable_install, fetch_text,
     fetch_text_with_network, launch_codex, launch_codex_with_options, probe_capabilities,
-    remove_msix_package, InstalledWindowsCodex, LaunchOptions, MsixRemoveReport,
+    registered_msix_package_full_name, remove_msix_package, InstalledWindowsCodex, LaunchOptions,
+    MsixRemoveReport,
 };
 pub use sys::{
     install_msix_sideload, install_msix_sideload_with_observer, precheck_msix_dependencies,

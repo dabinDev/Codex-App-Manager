@@ -139,6 +139,47 @@ describe("useSettingsSaver", () => {
     expect(result.current.settings.askBefore).toBe(false);
   });
 
+  it("keeps a URL being edited when an earlier save finishes", async () => {
+    const write = deferred<AppSettings>();
+    setSettings.mockReturnValueOnce(write.promise);
+    const initial = {
+      ...DEFAULT_SETTINGS,
+      source: "custom" as const,
+      customUrl: "https://old.example/feed",
+    };
+    const { result } = renderHook(() => useSettingsSaver(initial));
+    const submitted = { ...initial, askBefore: false };
+    const draft = { ...submitted, customUrl: "https://new.example/feed" };
+
+    act(() => result.current.update(submitted));
+    act(() => result.current.setDraft(draft));
+    await act(async () => write.resolve(submitted));
+
+    expect(result.current.status).toBe("idle");
+    expect(result.current.settings).toEqual(draft);
+    expect(setSettings).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps a draft being edited while the latest queued save finishes", async () => {
+    const first = deferred<AppSettings>();
+    const second = deferred<AppSettings>();
+    setSettings.mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise);
+    const { result } = renderHook(() => useSettingsSaver(DEFAULT_SETTINGS));
+    const older = { ...DEFAULT_SETTINGS, askBefore: false };
+    const queued = { ...older, confirmClose: false };
+    const draft = { ...queued, proxyMode: "custom" as const, customProxyUrl: "http://localhost:7890" };
+
+    act(() => result.current.update(older));
+    act(() => result.current.update(queued));
+    act(() => result.current.setDraft(draft));
+    await act(async () => first.resolve(older));
+    expect(setSettings).toHaveBeenCalledTimes(2);
+    await act(async () => second.resolve(queued));
+
+    expect(result.current.status).toBe("idle");
+    expect(result.current.settings).toEqual(draft);
+  });
+
   it("does not let a slow hydrate overwrite user edits", async () => {
     const { result } = renderHook(() => useSettingsSaver(DEFAULT_SETTINGS));
     const edited = { ...DEFAULT_SETTINGS, source: "mirror" as const };

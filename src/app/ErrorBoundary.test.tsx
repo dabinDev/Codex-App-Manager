@@ -24,6 +24,7 @@ vi.mock("../services/managerApi", () => ({
   },
   managerApi: {
     getDiagnostics: vi.fn(),
+    writeClipboardText: vi.fn((text: string) => navigator.clipboard.writeText(text)),
     reportFrontendError: vi.fn(() => Promise.resolve()),
     getOperationSnapshot: vi.fn(() => Promise.resolve(null)),
     confirmQuit: vi.fn(() => Promise.resolve()),
@@ -286,6 +287,11 @@ describe("ErrorBoundary", () => {
   });
 
   it("renders a crash screen and copies diagnostics with the JS error", async () => {
+    getDiagnostics.mockResolvedValue({
+      ...diagnostics,
+      os: "windows",
+      windowsRuntime: ["bundled_executable_relocation_failed errorCode=EACCES"],
+    });
     const user = userEvent.setup();
     const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
     const writeText = vi.spyOn(navigator.clipboard, "writeText").mockResolvedValue(undefined);
@@ -308,6 +314,8 @@ describe("ErrorBoundary", () => {
     await user.click(screen.getByRole("button", { name: CATALOG.en["crash.copy"] }));
     await waitFor(() => expect(writeText).toHaveBeenCalled());
     expect(writeText.mock.calls[0][0]).toContain("## Frontend error");
+    expect(writeText.mock.calls[0][0]).toContain("## Windows Codex runtime");
+    expect(writeText.mock.calls[0][0]).toContain("bundled_executable_relocation_failed errorCode=EACCES");
     expect(
       screen.getByRole("button", { name: CATALOG.en["crash.copied"] }),
     ).toBeInTheDocument();
@@ -482,5 +490,33 @@ describe("crashBodyForSnapshot", () => {
         interruptible: true,
       }),
     ).toBe(en["crash.bodyPaused"]);
+  });
+
+  it("treats a Manager self-update the same as a Codex install/update", () => {
+    // Regression: `manager-update` is a real `OperationKind` (the Manager's
+    // own self-update), but this used to fall through to the generic "idle"
+    // copy — implying quitting was always safe, including mid-install.
+    expect(
+      crashBodyForSnapshot(en, {
+        id: "1",
+        kind: "manager-update",
+        phase: "downloading",
+        progress: null,
+        paused: false,
+        cancellable: false,
+        interruptible: true,
+      }),
+    ).toBe(en["crash.bodyActive"]);
+    expect(
+      crashBodyForSnapshot(en, {
+        id: "1",
+        kind: "manager-update",
+        phase: "committing",
+        progress: null,
+        paused: false,
+        cancellable: false,
+        interruptible: false,
+      }),
+    ).toBe(en["crash.bodyCritical"]);
   });
 });
