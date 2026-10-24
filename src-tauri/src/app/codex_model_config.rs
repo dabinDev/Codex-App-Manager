@@ -7,7 +7,7 @@ use thiserror::Error;
 use crate::app::brand::SERVICE_NAME;
 
 pub const CATALOG_NAME: &str = "app-manager-model-catalog.json";
-const MANAGED_MARKER: &str = "# Codex App Manager managed setting";
+pub const MANAGED_PROVIDER: &str = "app_manager";
 const MAX_MODELS: usize = 256;
 const MAX_MODEL_ID_BYTES: usize = 512;
 
@@ -122,7 +122,7 @@ pub fn ensure_codex_models(models: &[String]) -> Result<(), CodexModelConfigErro
 pub fn all_models_with_default(
     current: &[String],
 ) -> Result<(Vec<String>, String), CodexModelConfigError> {
-    let models = normalize_model_selection(current)?;
+    let models = normalize_model_selection(&codex_models(current))?;
     let default_model = models
         .first()
         .cloned()
@@ -130,29 +130,57 @@ pub fn all_models_with_default(
     Ok((models, default_model))
 }
 
+pub fn codex_models(current: &[String]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    current
+        .iter()
+        .map(|model| model.trim())
+        .filter(|model| model.to_ascii_lowercase().starts_with("gpt-"))
+        .filter(|model| seen.insert((*model).to_owned()))
+        .map(str::to_owned)
+        .collect()
+}
+
 pub fn build_model_catalog(models: &[String]) -> Result<Vec<u8>, CodexModelConfigError> {
     let models = normalize_model_selection(models)?;
+    let official: serde_json::Value =
+        serde_json::from_str(include_str!("../../data/codex-models-0.164.0.json"))
+            .expect("versioned official model catalog must be valid JSON");
     let entries = models
         .iter()
         .enumerate()
         .map(|(index, slug)| {
-            json!({
-                "slug": slug,
-                "display_name": slug,
-                "description": format!("{slug} via {SERVICE_NAME}"),
-                "shell_type": "unified_exec",
-                "visibility": "list",
-                "supported_in_api": true,
-                "priority": index + 1,
-                "base_instructions": "You are a helpful coding assistant.",
-                "supported_reasoning_levels": [
-                    {"effort": "low", "description": "Fast responses"},
-                    {"effort": "medium", "description": "Balanced reasoning"},
-                    {"effort": "high", "description": "Deeper reasoning"},
-                    {"effort": "xhigh", "description": "Maximum supported reasoning"}
-                ],
-                "default_reasoning_level": "high"
-            })
+            let mut entry = official["models"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["slug"].as_str() == Some(slug.as_str()))
+                .cloned()
+                .unwrap_or_else(|| {
+                    json!({
+                        "slug": slug,
+                        "display_name": slug,
+                        "description": format!("{slug} via {SERVICE_NAME}"),
+                        "shell_type": "unified_exec",
+                        "visibility": "list",
+                        "supported_in_api": true,
+                        "priority": index + 1,
+                    "base_instructions": "You are a helpful coding assistant.",
+                        "supported_reasoning_levels": [],
+                        "default_reasoning_level": null,
+                        "support_verbosity": false,
+                        "truncation_policy": { "mode": "bytes", "limit": 10000 },
+                        "experimental_supported_tools": [],
+                        "input_modalities": ["text"]
+                    })
+                });
+            // Only advertise selected, available models. Keep known model tool/prompt
+            // metadata intact; unknown IDs use conservative optional capabilities.
+            entry["visibility"] = json!("list");
+            entry["supported_in_api"] = json!(true);
+            entry["priority"] = json!(index + 1);
+            entry["upgrade"] = serde_json::Value::Null;
+            entry
         })
         .collect::<Vec<_>>();
     serde_json::to_vec_pretty(&json!({ "models": entries }))
@@ -180,56 +208,124 @@ pub fn merge_codex_config(
 
     let content = std::str::from_utf8(existing.unwrap_or_default())
         .map_err(|_| CodexModelConfigError::InvalidConfig)?;
-    if !content.trim().is_empty() {
-        toml::from_str::<toml::Value>(content).map_err(|_| CodexModelConfigError::InvalidConfig)?;
-    }
     let eol = dominant_eol(content);
     let normalized = content.replace("\r\n", "\n");
-    let mut lines = normalized
-        .split('\n')
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-
-    let root_end = lines
-        .iter()
-        .position(|line| is_table_header(line))
-        .unwrap_or(lines.len());
-    let mut root_index = 0;
-    lines.retain(|line| {
-        let at_root = root_index < root_end;
-        root_index += 1;
-        if !at_root {
-            return true;
+    let mut document = normalized
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|_| CodexModelConfigError::InvalidConfig)?;
+    let active_profile = document
+        .get("profile")
+        .and_then(|item| item.as_str())
+        .map(str::to_owned);
+    set_model_settings(document.as_table_mut(), &catalog_path, default_model);
+    document["openai_base_url"] = toml_edit::value(base_url);
+    document["cli_auth_credentials_store"] = toml_edit::value("file");
+    document["forced_login_method"] = toml_edit::value("api");
+    if let Some(profile) = active_profile {
+        let table = document
+            .get_mut("profiles")
+            .and_then(|item| item.get_mut(&profile))
+            .and_then(|item| item.as_table_like_mut())
+            .ok_or(CodexModelConfigError::InvalidConfig)?;
+        set_model_settings(table, &catalog_path, default_model);
+        // Codex 0.164 rejects the legacy root `profile` selector. Materialize
+        // its supported settings without activating formerly ignored fields.
+        let entries = table
+            .iter()
+            .filter(|(key, _)| {
+                matches!(
+                    *key,
+                    "analytics"
+                        | "approval_policy"
+                        | "approvals_reviewer"
+                        | "chatgpt_base_url"
+                        | "experimental_compact_prompt_file"
+                        | "experimental_use_unified_exec_tool"
+                        | "features"
+                        | "include_apps_instructions"
+                        | "include_collaboration_mode_instructions"
+                        | "include_environment_context"
+                        | "include_environment_context_time"
+                        | "include_permissions_instructions"
+                        | "model"
+                        | "model_catalog_json"
+                        | "model_instructions_file"
+                        | "model_provider"
+                        | "oss_provider"
+                        | "personality"
+                        | "plan_mode_reasoning_effort"
+                        | "sandbox_mode"
+                        | "tools"
+                        | "tui"
+                        | "web_search"
+                        | "windows"
+                )
+            })
+            .map(|(key, item)| (key.to_owned(), item.clone()))
+            .collect::<Vec<_>>();
+        for (key, item) in entries {
+            merge_profile_item(document.as_table_mut(), &key, item);
         }
-        let key = assignment_key(line);
-        if line.trim() == MANAGED_MARKER
-            || matches!(
-                key,
-                Some("openai_base_url" | "model_catalog_json" | "model")
-            )
-        {
-            return false;
-        }
-        true
-    });
-
-    let first_table = lines.iter().position(|line| is_table_header(line));
-    let mut insert_at = first_table.unwrap_or(lines.len());
-    while insert_at > 0 && lines[insert_at - 1].trim().is_empty() {
-        insert_at -= 1;
+        document.remove("profile");
     }
-    let managed = [
-        MANAGED_MARKER.to_owned(),
-        format!("openai_base_url = {}", toml_string(base_url)),
-        format!("model_catalog_json = {}", toml_string(&catalog_path)),
-        format!("model = {}", toml_string(default_model)),
-        String::new(),
-    ];
-    lines.splice(insert_at..insert_at, managed);
-
-    let merged = lines.join("\n");
+    let mut provider = toml_edit::Table::new();
+    provider["name"] = toml_edit::value(SERVICE_NAME);
+    provider["base_url"] = toml_edit::value(base_url);
+    provider["wire_api"] = toml_edit::value("responses");
+    provider["requires_openai_auth"] = toml_edit::value(true);
+    provider["supports_websockets"] = toml_edit::value(false);
+    if document.get("model_providers").is_none() {
+        document["model_providers"] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+    document
+        .get_mut("model_providers")
+        .and_then(|item| item.as_table_like_mut())
+        .ok_or(CodexModelConfigError::InvalidConfig)?
+        .insert(MANAGED_PROVIDER, toml_edit::Item::Table(provider));
+    let merged = document.to_string();
     toml::from_str::<toml::Value>(&merged).map_err(|_| CodexModelConfigError::InvalidConfig)?;
     Ok(apply_eol(&merged, eol).into_bytes())
+}
+
+fn merge_profile_item(table: &mut dyn toml_edit::TableLike, key: &str, item: toml_edit::Item) {
+    if let Some(previous) = table.get_mut(key) {
+        if let (Some(target), Some(source)) = (previous.as_table_like_mut(), item.as_table_like()) {
+            for (child_key, child) in source.iter() {
+                merge_profile_item(target, child_key, child.clone());
+            }
+        } else {
+            *previous = item;
+        }
+    } else {
+        table.insert(key, item);
+    }
+}
+
+fn set_model_settings(table: &mut dyn toml_edit::TableLike, catalog: &str, model: &str) {
+    set_string_preserving_comments(table, "model_provider", MANAGED_PROVIDER);
+    set_string_preserving_comments(table, "model", model);
+    set_string_preserving_comments(table, "model_catalog_json", catalog);
+    // The selected model's metadata supplies its defaults, not the previous model.
+    for key in [
+        "model_reasoning_effort",
+        "model_reasoning_summary",
+        "model_verbosity",
+        "service_tier",
+    ] {
+        table.remove(key);
+    }
+}
+
+fn set_string_preserving_comments(table: &mut dyn toml_edit::TableLike, key: &str, value: &str) {
+    if let Some(item) = table.get_mut(key) {
+        if let Some(previous) = item.as_value_mut() {
+            let decor = previous.decor().clone();
+            *previous = toml_edit::Value::from(value);
+            *previous.decor_mut() = decor;
+            return;
+        }
+    }
+    table.insert(key, toml_edit::value(value));
 }
 
 pub fn merge_codex_auth(
@@ -239,16 +335,17 @@ pub fn merge_codex_auth(
     if api_key.trim().is_empty() {
         return Err(CodexModelConfigError::EmptyKey);
     }
-    let mut value = match existing {
+    let value = match existing {
         Some(bytes) => serde_json::from_slice::<serde_json::Value>(bytes)
             .map_err(|_| CodexModelConfigError::InvalidAuth)?,
         None => json!({}),
     };
-    let object = value
-        .as_object_mut()
-        .ok_or(CodexModelConfigError::InvalidAuth)?;
-    object.insert("OPENAI_API_KEY".into(), json!(api_key));
-    serde_json::to_vec_pretty(&value).map_err(|_| CodexModelConfigError::InvalidAuth)
+    if !value.is_object() {
+        return Err(CodexModelConfigError::InvalidAuth);
+    }
+    // Match Codex login_with_api_key: do not retain another authentication mode.
+    serde_json::to_vec_pretty(&json!({ "auth_mode": "apikey", "OPENAI_API_KEY": api_key }))
+        .map_err(|_| CodexModelConfigError::InvalidAuth)
 }
 
 fn validate_codex_base_url(base_url: &str) -> Result<(), CodexModelConfigError> {
@@ -284,28 +381,91 @@ fn apply_eol(content: &str, eol: &str) -> String {
     }
 }
 
-fn assignment_key(line: &str) -> Option<&str> {
-    let trimmed = line.trim_start();
-    if trimmed.starts_with('#') {
-        return None;
-    }
-    let (key, _) = trimmed.split_once('=')?;
-    let key = key.trim();
-    (!key.is_empty()).then_some(key)
-}
-
-fn is_table_header(line: &str) -> bool {
-    let trimmed = line.trim();
-    trimmed.starts_with('[') && trimmed.ends_with(']')
-}
-
-fn toml_string(value: &str) -> String {
-    serde_json::to_string(value).expect("serializing a string cannot fail")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn write_selects_managed_provider_in_active_profile_and_file_auth() {
+        let before = br#"profile = "work"
+model_provider = "previous"
+cli_auth_credentials_store = "keyring"
+forced_login_method = "chatgpt"
+[profiles.work] # preserve active workflow
+model_provider = "previous"
+model = "old"
+model_catalog_json = "C:/old.json"
+sandbox_mode = "workspace-write"
+[model_providers.previous]
+name = "Previous"
+base_url = "http://127.0.0.1:9/v1"
+wire_api = "responses"
+"#;
+        let bytes = merge_codex_config(
+            Some(before),
+            "https://tomato.beinai.cc/v1",
+            Path::new("C:/catalog.json"),
+            "gpt-6.1-sol",
+        )
+        .unwrap();
+        let config: toml::Value = toml::from_str(std::str::from_utf8(&bytes).unwrap()).unwrap();
+        assert_eq!(config["model_provider"].as_str(), Some("app_manager"));
+        assert!(config.get("profile").is_none());
+        assert_eq!(config["sandbox_mode"].as_str(), Some("workspace-write"));
+        assert_eq!(
+            config["profiles"]["work"]["model_provider"].as_str(),
+            Some("app_manager")
+        );
+        assert_eq!(
+            config["profiles"]["work"]["model"].as_str(),
+            Some("gpt-6.1-sol")
+        );
+        assert_eq!(
+            config["profiles"]["work"]["model_catalog_json"].as_str(),
+            Some("C:/catalog.json")
+        );
+        assert_eq!(
+            config["profiles"]["work"]["sandbox_mode"].as_str(),
+            Some("workspace-write")
+        );
+        assert_eq!(config["cli_auth_credentials_store"].as_str(), Some("file"));
+        assert_eq!(config["forced_login_method"].as_str(), Some("api"));
+        assert_eq!(
+            config["model_providers"]["app_manager"]["base_url"].as_str(),
+            Some("https://tomato.beinai.cc/v1")
+        );
+        assert_eq!(
+            config["model_providers"]["previous"]["base_url"].as_str(),
+            Some("http://127.0.0.1:9/v1")
+        );
+    }
+
+    #[test]
+    fn api_key_login_removes_conflicting_auth_material() {
+        let existing = br#"{"auth_mode":"chatgpt","tokens":{},"last_refresh":"2026-01-01T00:00:00Z","personal_access_token":"old","agent_identity":{},"bedrock_api_key":"old"}"#;
+        let bytes = merge_codex_auth(Some(existing), "sk-test-only").unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            value,
+            json!({"auth_mode":"apikey","OPENAI_API_KEY":"sk-test-only"})
+        );
+    }
+
+    #[test]
+    fn catalog_has_current_required_fields_without_inventing_unknown_model_reasoning() {
+        let value: serde_json::Value = serde_json::from_slice(
+            &build_model_catalog(&["gpt-6.1-sol".into(), "gpt-unknown-test".into()]).unwrap(),
+        )
+        .unwrap();
+        for model in value["models"].as_array().unwrap() {
+            assert!(model["support_verbosity"].is_boolean());
+            assert!(model["truncation_policy"].is_object());
+            assert!(model["experimental_supported_tools"].is_array());
+        }
+        assert_eq!(value["models"][0]["default_reasoning_level"], "low");
+        assert_eq!(value["models"][1]["supported_reasoning_levels"], json!([]));
+        assert!(value["models"][1]["default_reasoning_level"].is_null());
+    }
 
     #[test]
     fn config_merge_preserves_unowned_tables_comments_and_crlf() {
@@ -353,7 +513,7 @@ model_provider = "personal"
         .unwrap();
         let text = String::from_utf8(after).unwrap();
 
-        assert!(text.contains("model_provider = \"OpenAI\""));
+        assert!(text.contains("model_provider = \"app_manager\""));
         assert!(text.contains("[model_providers.OpenAI]"));
         assert!(text.contains("review_model = \"keep-me\""));
         assert!(text.contains("[profiles.mine]\nmodel_provider = \"personal\""));
@@ -371,7 +531,7 @@ model_provider = "personal"
     }
 
     #[test]
-    fn auth_merge_replaces_only_the_openai_key() {
+    fn auth_merge_replaces_previous_login_with_api_key_auth() {
         let after = merge_codex_auth(
             Some(br#"{"OPENAI_API_KEY":"old","tokens":{"keep":true}}"#),
             "sk-new",
@@ -380,7 +540,8 @@ model_provider = "personal"
         let value: serde_json::Value = serde_json::from_slice(&after).unwrap();
 
         assert_eq!(value["OPENAI_API_KEY"], "sk-new");
-        assert_eq!(value["tokens"]["keep"], true);
+        assert_eq!(value["auth_mode"], "apikey");
+        assert!(value.get("tokens").is_none());
     }
 
     #[test]
@@ -412,8 +573,9 @@ model_provider = "personal"
         let (models, default_model) =
             all_models_with_default(&["claude-sonnet-4".into(), "gpt-5.5".into()]).unwrap();
 
-        assert_eq!(models, vec!["claude-sonnet-4", "gpt-5.5"]);
-        assert_eq!(default_model, "claude-sonnet-4");
+        assert_eq!(models, vec!["gpt-5.5"]);
+        assert_eq!(default_model, "gpt-5.5");
+        assert!(all_models_with_default(&["grok-3".into()]).is_err());
     }
 
     #[test]

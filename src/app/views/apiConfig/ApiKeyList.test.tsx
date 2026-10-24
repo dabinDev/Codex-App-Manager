@@ -24,6 +24,7 @@ vi.mock("../../../services/managerApi", async (importOriginal) => {
       apiConfigLogout: vi.fn(),
       apiConfigImportCcs: vi.fn(),
       apiConfigWriteLocal: vi.fn(),
+      apiConfigModels: vi.fn(),
       apiConfigRestartCodex: vi.fn(),
     },
   };
@@ -101,6 +102,7 @@ describe("ApiKeyList", () => {
     api.apiConfigLogout.mockReset();
     api.apiConfigImportCcs.mockReset();
     api.apiConfigWriteLocal.mockReset();
+    api.apiConfigModels.mockReset().mockResolvedValue(["gpt-6.1-sol"]);
     api.apiConfigRestartCodex.mockReset();
     api.apiConfigKeys.mockResolvedValue(list([activeKey({ enabled: true })]));
     api.apiConfigSession.mockResolvedValue({
@@ -115,7 +117,36 @@ describe("ApiKeyList", () => {
     api.apiConfigRestartCodex.mockResolvedValue(undefined);
   });
 
-  it("marks the local key enabled and disables unusable actions", () => {
+  it("shows only verified GPT keys in Codex and all keys in TraeCode", async () => {
+    api.apiConfigModels.mockImplementation(async (id) => id === 1 ? ["gpt-6.1-sol", "claude-sonnet-4"] : ["grok-3"]);
+    renderKeyList(list([activeKey(), activeKey({id: 2, name: "Grok key", groupName: "Grok"})]));
+    expect(screen.queryByTestId("api-key-2")).not.toBeInTheDocument();
+    expect(await screen.findByTestId("api-key-1")).toBeVisible();
+    await waitFor(() => expect(api.apiConfigModels).toHaveBeenCalledWith(2));
+    expect(screen.queryByTestId("api-key-2")).not.toBeInTheDocument();
+    await userEvent.setup().click(screen.getByRole("tab", {name: "TraeCode"}));
+    expect(screen.getByTestId("api-key-2")).toBeVisible();
+    expect(screen.queryByRole("button", {name: "Import to CCS"})).not.toBeInTheDocument();
+  });
+
+  it("filters GPT keys before pagination even when they follow a full page of other keys", async () => {
+    api.apiConfigModels.mockImplementation(async (id) => id > 20 ? ["gpt-6.1-sol"] : ["gemini-2.5-pro"]);
+    renderKeyList(list(Array.from({length: 22}, (_, index) => activeKey({id: index + 1, name: `Key ${index + 1}`}))));
+    expect(await screen.findByTestId("api-key-22")).toBeVisible();
+    expect(screen.getAllByTestId(/^api-key-/)).toHaveLength(2);
+    expect(screen.queryByRole("button", {name: "Next"})).not.toBeInTheDocument();
+  });
+
+  it("never shows an unverified key when model discovery fails", async () => {
+    api.apiConfigModels.mockRejectedValue({code: "orange_network"});
+    renderKeyList(list([activeKey()]));
+    expect(screen.queryByTestId("api-key-1")).not.toBeInTheDocument();
+    expect(await screen.findByRole("alert")).toHaveTextContent("could not be reached");
+    expect(screen.queryByTestId("api-key-1")).not.toBeInTheDocument();
+    expect(await screen.findByText("No verified GPT keys. Refresh to check available models.")).toBeVisible();
+  });
+
+  it("shows verified GPT keys and keeps unavailable keys only in TraeCode", async () => {
     renderKeyList(
       list([
         activeKey({ id: 1, enabled: true }),
@@ -123,20 +154,57 @@ describe("ApiKeyList", () => {
       ]),
     );
 
-    const enabled = screen.getByTestId("api-key-1");
+    const enabled = await screen.findByTestId("api-key-1");
     expect(within(enabled).getByText("Enabled")).toBeInTheDocument();
+    expect(screen.queryByTestId("api-key-2")).not.toBeInTheDocument();
+    await userEvent.setup().click(screen.getByRole("tab", {name: "TraeCode"}));
     const inactive = screen.getByTestId("api-key-2");
-    expect(within(inactive).getByRole("button", { name: "Import to CCS" })).toBeDisabled();
-    expect(within(inactive).getByRole("button", { name: "Write to computer" })).toBeDisabled();
+    expect(within(inactive).getByRole("button", { name: "Choose TraeCode models" })).toBeDisabled();
   });
 
-  it("renders an invalid expiry value without crashing the key list", () => {
+  it("hides local Codex write for a key without GPT models", async () => {
+    api.apiConfigModels.mockResolvedValue(["grok-3", "gemini-2.5-pro"]);
+    renderKeyList(list([activeKey({groupName: "Grok"})]));
+    await waitFor(() => expect(api.apiConfigModels).toHaveBeenCalledWith(1));
+    await waitFor(() => expect(screen.queryByRole("button", {name: "Write to computer"})).not.toBeInTheDocument());
+    expect(api.apiConfigWriteLocal).not.toHaveBeenCalled();
+  });
+
+  it("bounds background discovery and cancels remaining keys when changing tabs", async () => {
+    let finish!: (models: string[]) => void;
+    api.apiConfigModels.mockImplementation(() => new Promise((resolve) => { finish = resolve; }));
+    renderKeyList(list([activeKey(), activeKey({id: 2, name: "Second"})]));
+    await waitFor(() => expect(api.apiConfigModels).toHaveBeenCalledTimes(1));
+    await userEvent.setup().click(screen.getByRole("tab", {name: "TraeCode"}));
+    finish(["gpt-6.1-sol"]);
+    await waitFor(() => expect(screen.getByRole("tab", {name: "TraeCode"})).toHaveAttribute("aria-selected", "true"));
+    expect(api.apiConfigModels).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps one discovery in flight when returning to Codex before a request settles", async () => {
+    let finish!: (models: string[]) => void;
+    api.apiConfigModels.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    const user = userEvent.setup();
+    renderKeyList(list([activeKey()]));
+    await waitFor(() => expect(api.apiConfigModels).toHaveBeenCalledTimes(1));
+    for (let round = 0; round < 3; round++) {
+      await user.click(screen.getByRole("tab", {name: "TraeCode"}));
+      await user.click(screen.getByRole("tab", {name: "Codex"}));
+    }
+    expect(api.apiConfigModels).toHaveBeenCalledTimes(1);
+    finish(["gpt-6.1-sol"]);
+    expect(await screen.findByTestId("api-key-1")).toBeVisible();
+    expect(api.apiConfigModels).toHaveBeenCalledTimes(2);
+  });
+
+  it("renders an invalid expiry value without crashing the key list", async () => {
     renderKeyList(list([activeKey({ expiresAt: "not-a-date", actionable: false })]));
 
+    await userEvent.setup().click(screen.getByRole("tab", {name: "TraeCode"}));
     expect(screen.getByText("not-a-date")).toBeInTheDocument();
   });
 
-  it("keeps key actions stable and the logout footer outside list rows", () => {
+  it("keeps key actions stable and the logout footer outside list rows", async () => {
     const { container } = render(
       <ThemeProvider>
         <I18nProvider>
@@ -152,7 +220,7 @@ describe("ApiKeyList", () => {
       </ThemeProvider>,
     );
 
-    expect(container.querySelectorAll(".api-key-actions")).toHaveLength(2);
+    await waitFor(() => expect(container.querySelectorAll(".api-key-actions")).toHaveLength(2));
     expect(container.querySelector(".api-key-list .api-config-logout")).toBeNull();
     expect(container.querySelector(".api-config-connected")).toHaveClass(
       "api-config-with-footer",
@@ -166,6 +234,7 @@ describe("ApiKeyList", () => {
     );
     renderKeyList(list(items));
 
+    await screen.findByText("Page 1 of 2");
     expect(screen.getAllByTestId(/^api-key-/)).toHaveLength(20);
     expect(screen.getByText("Page 1 of 2")).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Next" }));
@@ -182,7 +251,7 @@ describe("ApiKeyList", () => {
 
     expect(screen.getByText("Primary")).toBeInTheDocument();
     expect(await screen.findByRole("alert")).toHaveTextContent(
-      "OrangeAPI could not be reached. Check the network or proxy.",
+      "could not be reached. Check the network or proxy.",
     );
     expect(screen.queryByText("secret backend text")).not.toBeInTheDocument();
   });
@@ -248,9 +317,8 @@ describe("ApiKeyList", () => {
     );
     expect(screen.getByText("Showing the last available list. Refresh failed.")).toBeInTheDocument();
     expect(screen.getByText("Connection interrupted")).toBeInTheDocument();
-    const staleRow = screen.getByTestId("api-key-1");
-    expect(within(staleRow).getByRole("button", { name: "Import to CCS" })).toBeDisabled();
-    expect(within(staleRow).getByRole("button", { name: "Write to computer" })).toBeDisabled();
+    expect(screen.queryByTestId("api-key-1")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Write to computer" })).not.toBeInTheDocument();
 
     rerender(
       <ThemeProvider>
@@ -266,7 +334,7 @@ describe("ApiKeyList", () => {
         </I18nProvider>
       </ThemeProvider>,
     );
-    expect(screen.getByText("No OpenAI API keys")).toBeInTheDocument();
+    expect(screen.getByText("No API keys available")).toBeInTheDocument();
   });
 
   it("imports by key ID and keeps other key actions available while busy", async () => {
@@ -279,7 +347,7 @@ describe("ApiKeyList", () => {
     );
     renderKeyList(list([activeKey({ id: 1 }), activeKey({ id: 2, name: "Secondary" })]));
 
-    const first = screen.getByTestId("api-key-1");
+    const first = await screen.findByTestId("api-key-1");
     await user.click(within(first).getByRole("button", { name: "Import to CCS" }));
     expect(api.apiConfigImportCcs).toHaveBeenCalledWith(1);
     expect(within(screen.getByTestId("api-key-2")).getByRole("button", { name: "Write to computer" })).toBeEnabled();
@@ -292,7 +360,7 @@ describe("ApiKeyList", () => {
     api.apiConfigKeys.mockResolvedValue(list([activeKey({ enabled: true })]));
     renderKeyList(list([activeKey()]));
 
-    await user.click(screen.getByRole("button", { name: "Write to computer" }));
+    await user.click(await screen.findByRole("button", { name: "Write to computer" }));
     const dialog = screen.getByRole("dialog", { name: "Replace local Codex configuration?" });
     expect(dialog).toHaveTextContent("config.toml");
     expect(dialog).toHaveTextContent("auth.json");
@@ -319,7 +387,7 @@ describe("ApiKeyList", () => {
     });
     renderKeyList(list([activeKey()]));
 
-    await user.click(screen.getByRole("button", { name: "Write to computer" }));
+    await user.click(await screen.findByRole("button", { name: "Write to computer" }));
     await user.click(screen.getByRole("button", { name: "Back up and replace" }));
 
     expect(await screen.findByRole("alert")).toHaveTextContent(message);
@@ -342,7 +410,7 @@ describe("ApiKeyList", () => {
     });
     renderKeyList(list([activeKey()]));
 
-    await user.click(screen.getByRole("button", { name: "Write to computer" }));
+    await user.click(await screen.findByRole("button", { name: "Write to computer" }));
     await user.click(screen.getByRole("button", { name: "Back up and replace" }));
 
     expect(await screen.findByRole("alert")).toBeVisible();
@@ -360,7 +428,7 @@ describe("ApiKeyList", () => {
     });
     renderKeyList(list([activeKey()]));
 
-    await user.click(screen.getByRole("button", { name: "Write to computer" }));
+    await user.click(await screen.findByRole("button", { name: "Write to computer" }));
     await user.click(screen.getByRole("button", { name: "Back up and replace" }));
 
     expect(await screen.findByRole("alert")).toBeVisible();
@@ -373,7 +441,7 @@ describe("ApiKeyList", () => {
       .mockRejectedValueOnce({ code: "internal_error", message: "no" })
       .mockResolvedValueOnce(undefined);
     renderKeyList(list([activeKey()]));
-    await user.click(screen.getByRole("button", { name: "Write to computer" }));
+    await user.click(await screen.findByRole("button", { name: "Write to computer" }));
     await user.click(screen.getByRole("button", { name: "Back up and replace" }));
     const restart = await screen.findByRole("button", { name: "Restart Codex" });
 

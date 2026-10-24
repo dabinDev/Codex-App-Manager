@@ -232,6 +232,46 @@ pub fn write_provider_files(
     )
 }
 
+/// Use this key's current GPT catalog, retaining the user's default when it is still available.
+pub fn write_available_provider_files(
+    permit: ProviderWritePermit,
+    api_key: &str,
+    available: &[String],
+    codex_was_running: bool,
+) -> Result<ProviderWriteReport, ProviderWriteError> {
+    let (models, fallback) = crate::app::codex_model_config::all_models_with_default(available)?;
+    let config_path = permit.paths.codex_home.join("config.toml");
+    let existing = match read_optional(&config_path) {
+        Ok(existing) => existing,
+        Err(error) => {
+            return Ok(failed_before_mutation_report(
+                &config_path,
+                &permit.paths.codex_home.join("auth.json"),
+                &permit.paths.codex_home.join(CATALOG_NAME),
+                models,
+                fallback,
+                codex_was_running,
+                None,
+                &error,
+            ));
+        }
+    };
+    let preferred = existing
+        .as_deref()
+        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+        .and_then(|text| toml::from_str::<toml::Value>(text).ok())
+        .and_then(|config| {
+            let profile = config.get("profile").and_then(toml::Value::as_str);
+            let model = profile
+                .and_then(|profile| config.get("profiles")?.get(profile)?.get("model"))
+                .or_else(|| config.get("model"))?;
+            model.as_str().map(str::to_owned)
+        })
+        .filter(|model| models.contains(model))
+        .unwrap_or(fallback);
+    write_model_provider_files(permit, api_key, &models, &preferred, codex_was_running)
+}
+
 pub fn write_provider_files_at(
     paths: &ProviderPaths,
     api_key: &str,
@@ -929,6 +969,57 @@ mod tests {
     }
 
     #[test]
+    fn available_write_keeps_supported_default_and_rejects_non_gpt_keys() {
+        let (root, paths) = fixture("available-models");
+        fs::write(
+            paths.codex_home.join("config.toml"),
+            "model = \"gpt-6-luna\"\n",
+        )
+        .unwrap();
+        let report = write_available_provider_files(
+            begin_provider_write_at(&paths).unwrap(),
+            "test-key",
+            &["gpt-6.1-sol".into(), "gpt-6-luna".into()],
+            false,
+        )
+        .unwrap();
+        assert_eq!(report.outcome, ProviderWriteOutcome::Committed);
+        assert_eq!(report.default_model, "gpt-6-luna");
+        let before = fs::read(paths.codex_home.join("config.toml")).unwrap();
+        assert!(write_available_provider_files(
+            begin_provider_write_at(&paths).unwrap(),
+            "test-key",
+            &["grok-3".into()],
+            false
+        )
+        .is_err());
+        assert_eq!(
+            fs::read(paths.codex_home.join("config.toml")).unwrap(),
+            before
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn available_write_read_failure_preserves_restart_report() {
+        let (root, paths) = fixture("available-read-failure");
+        fs::remove_file(paths.codex_home.join("config.toml")).unwrap();
+        fs::create_dir(paths.codex_home.join("config.toml")).unwrap();
+        let report = write_available_provider_files(
+            begin_provider_write_at(&paths).unwrap(),
+            "test-key",
+            &["gpt-6.1-sol".into()],
+            true,
+        )
+        .expect("failures after closing Codex must retain a structured restart report");
+        assert_eq!(report.outcome, ProviderWriteOutcome::FailedBeforeMutation);
+        assert!(report.codex_was_running);
+        assert!(!report.write_verified);
+        assert_eq!(report.error_code.as_deref(), Some("provider_io"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn sha256_manifest_hash_uses_lowercase_hex() {
         assert_eq!(
             sha256_hex(b"abc"),
@@ -988,7 +1079,8 @@ mod tests {
         let auth: serde_json::Value =
             serde_json::from_slice(&fs::read(paths.codex_home.join("auth.json")).unwrap()).unwrap();
         assert_eq!(auth["OPENAI_API_KEY"], "secret-key");
-        assert_eq!(auth["tokens"]["keep"], true);
+        assert_eq!(auth["auth_mode"], "apikey");
+        assert!(auth.get("tokens").is_none());
         let _ = fs::remove_dir_all(root);
     }
 

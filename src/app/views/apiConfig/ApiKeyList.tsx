@@ -1,4 +1,4 @@
-import { useEffect, useId, useMemo, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 
 import { errorCode, managerApi } from "../../../services/managerApi";
 import type {
@@ -15,6 +15,14 @@ import { apiConfigErrorText, apiConfigWarningText } from "./errors";
 import { ModelImportSheet } from "./ModelImportSheet";
 
 const PAGE_SIZE = 20;
+const NO_MODELS: Record<number, string[]> = {};
+
+interface CodexDiscovery {
+  source: ApiConfigKey[];
+  models: Record<number, string[]>;
+  loading: boolean;
+  error: string | null;
+}
 
 const STATUS_KEYS = {
   active: "config.status.active",
@@ -63,6 +71,8 @@ export function ApiKeyList({
   const [ccsNotice, setCcsNotice] = useState<number | null>(null);
   const [writeReport, setWriteReport] = useState<ApiConfigWriteReport | null>(null);
   const [modelImportKey, setModelImportKey] = useState<ApiConfigKey | null>(null);
+  const [codexDiscovery, setCodexDiscovery] = useState<CodexDiscovery | null>(null);
+  const discoveryInFlight = useRef<Promise<void> | null>(null);
   const confirmTitleId = useId();
   const confirmBodyId = useId();
 
@@ -70,15 +80,70 @@ export function ApiKeyList({
     setActionError(initialErrorCode);
   }, [initialErrorCode]);
 
-  const pageCount = Math.max(1, Math.ceil(keys.items.length / PAGE_SIZE));
+  // Never show an unverified key, including while a refreshed list is loading.
+  const discovery = codexDiscovery?.source === keys.items ? codexDiscovery : null;
+  const codexModels = discovery?.models ?? NO_MODELS;
+  const codexLoading = destination === "codex" && !keys.stale
+    && keys.items.some((key) => key.actionable) && (discovery == null || discovery.loading);
+  const filteredKeys = useMemo(
+    () => destination === "codex"
+      ? keys.items.filter((key) => (codexModels[key.id]?.length ?? 0) > 0)
+      : keys.items,
+    [destination, keys.items, codexModels],
+  );
+  const pageCount = Math.max(1, Math.ceil(filteredKeys.length / PAGE_SIZE));
   useEffect(() => {
     setPage((current) => Math.min(current, pageCount));
   }, [pageCount]);
 
   const visibleKeys = useMemo(
-    () => keys.items.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE),
-    [keys.items, page],
+    () => filteredKeys.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE),
+    [filteredKeys, page],
   );
+
+  useEffect(() => {
+    let cancelled = false;
+    if (destination !== "codex" || keys.stale) return;
+    setCodexDiscovery({source: keys.items, models: {}, loading: true, error: null});
+    void (async () => {
+      // The backend serializes session operations. Keep only one discovery in
+      // flight so queued foreground actions can run between keys.
+      for (const key of keys.items) {
+        if (cancelled) return;
+        if (!key.actionable) continue;
+        // Effect cleanup cannot cancel an IPC request already sent to Rust.
+        // New scans wait for it instead of queuing more session operations.
+        while (discoveryInFlight.current) {
+          await discoveryInFlight.current;
+          if (cancelled) return;
+        }
+        const request = Promise.resolve().then(() => managerApi.apiConfigModels(key.id));
+        const settled = request.then(() => undefined, () => undefined);
+        discoveryInFlight.current = settled;
+        try {
+          const models = await request;
+          if (!cancelled) {
+            setCodexDiscovery((current) => current && ({
+              ...current,
+              models: {
+                ...current.models,
+                [key.id]: models.filter((model) => model.trim().toLowerCase().startsWith("gpt-")),
+              },
+            }));
+          }
+        } catch (cause) {
+          // An unknown capability must not enable a local write. Refresh retries discovery.
+          if (!cancelled) setCodexDiscovery((current) => current && ({
+            ...current, error: errorCode(cause) ?? "unknown",
+          }));
+        } finally {
+          if (discoveryInFlight.current === settled) discoveryInFlight.current = null;
+        }
+      }
+      if (!cancelled) setCodexDiscovery((current) => current && ({...current, loading: false}));
+    })();
+    return () => { cancelled = true; };
+  }, [destination, keys.stale, keys.items]);
 
   const refresh = async () => {
     if (refreshing) return;
@@ -123,7 +188,7 @@ export function ApiKeyList({
   };
 
   const writeLocal = async (key: ApiConfigKey) => {
-    if (keys.stale || writingId != null) return;
+    if (keys.stale || writingId != null || !codexModels[key.id]?.length) return;
     setConfirmKey(null);
     setWritingId(key.id);
     setActionError(null);
@@ -176,7 +241,9 @@ export function ApiKeyList({
     }
   };
 
-  const errorText = apiConfigErrorText(actionError, t);
+  const errorText = apiConfigErrorText(
+    actionError ?? (destination === "codex" ? discovery?.error ?? null : null), t,
+  );
   const persistentWarning = [
     "orange_credential_store",
     "orange_refresh_unavailable",
@@ -213,7 +280,7 @@ export function ApiKeyList({
             type="button"
             role="tab"
             aria-selected={destination === value}
-            onClick={() => setDestination(value)}
+            onClick={() => { setDestination(value); setPage(1); }}
           >
             {value === "codex" ? t("config.destinationCodex") : t("config.destinationTraeCode")}
           </button>
@@ -291,10 +358,16 @@ export function ApiKeyList({
         </div>
       ) : null}
 
-      {keys.items.length === 0 ? (
+      {codexLoading ? (
+        <div className="api-model-state" role="status">
+          <Icon name="loader" />
+          <span>{t("config.modelsLoading")}</span>
+        </div>
+      ) : null}
+      {filteredKeys.length === 0 && !codexLoading ? (
         <div className="api-config-empty">
           <Icon name="key" />
-          <span>{t("config.empty")}</span>
+          <span>{t(destination === "codex" && keys.items.length > 0 ? "config.codexKeysEmpty" : "config.empty")}</span>
         </div>
       ) : (
         <ul className="api-key-list">
@@ -343,11 +416,11 @@ export function ApiKeyList({
                     <Icon name="download" />
                     {t(destination === "codex" ? "config.chooseCodexModels" : "config.chooseTraeCodeModels")}
                   </button>
-                  {destination === "codex" ? (
+                  {destination === "codex" && codexModels[key.id]?.length !== 0 ? (
                     <button
                       className="btn"
                       type="button"
-                      disabled={keys.stale || !key.actionable || writing}
+                      disabled={keys.stale || !key.actionable || writing || !codexModels[key.id]?.length}
                       onClick={() => setConfirmKey(key)}
                     >
                       <Icon name={writing ? "loader" : "download"} />

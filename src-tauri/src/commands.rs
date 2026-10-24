@@ -1271,17 +1271,12 @@ pub async fn api_config_models(
     state: State<'_, ManagerState>,
     key_id: u64,
 ) -> Result<Vec<String>, CommandError> {
-    let api_key = state
+    let models = state
         .orange
-        .full_key(key_id)
+        .models_for_key(key_id)
         .await
         .map_err(orange_command_error)?;
-    Ok(state
-        .opencodex
-        .discover_models(&api_key)
-        .await
-        .map_err(opencodex_command_error)?
-        .models)
+    Ok(crate::app::codex_model_config::codex_models(&models))
 }
 
 #[tauri::command]
@@ -1316,11 +1311,10 @@ pub async fn api_config_import_codex(
         .await
         .map_err(orange_command_error)?;
     let current = state
-        .opencodex
-        .discover_models(&api_key)
+        .orange
+        .models_for_key(key_id)
         .await
-        .map_err(opencodex_command_error)?
-        .models;
+        .map_err(orange_command_error)?;
     crate::app::codex_model_config::ensure_models_are_current(&selected, &current)
         .map_err(codex_model_config_command_error)?;
     let _operation = begin_guard(&state, OperationKind::ProviderWrite)?;
@@ -1399,9 +1393,7 @@ pub async fn api_config_import_traecode(
     let transport = crate::app::traecode_import::TraeCodeCdpModelTransport::new(
         cdp,
         api_key,
-        crate::app::traecode_import::traecode_chat_completions_url(
-            crate::app::brand::SERVICE_BASE_URL,
-        ),
+        crate::app::traecode_import::traecode_base_url(crate::app::brand::SERVICE_BASE_URL),
     );
     crate::app::traecode_import::import_traecode_models(
         &transport,
@@ -1457,6 +1449,13 @@ pub async fn api_config_write_local(
     state: State<'_, ManagerState>,
     key_id: u64,
 ) -> Result<crate::app::codex_provider::ProviderWriteReport, CommandError> {
+    let available = state
+        .orange
+        .models_for_key(key_id)
+        .await
+        .map_err(orange_command_error)?;
+    let (models, _) = crate::app::codex_model_config::all_models_with_default(&available)
+        .map_err(codex_model_config_command_error)?;
     let api_key = state
         .orange
         .full_key(key_id)
@@ -1473,8 +1472,13 @@ pub async fn api_config_write_local(
             crate::app::codex_provider::begin_provider_write().map_err(provider_command_error)?;
         let was_running = crate::app::codex_theme::stop_for_external_config_write()
             .map_err(CommandError::from)?;
-        crate::app::codex_provider::write_provider_files(permit, &api_key, was_running)
-            .map_err(provider_command_error)
+        crate::app::codex_provider::write_available_provider_files(
+            permit,
+            &api_key,
+            &models,
+            was_running,
+        )
+        .map_err(provider_command_error)
     })
     .await
     .map_err(|error| AppError::Internal(format!("Codex provider task failed: {error}")))??;

@@ -48,7 +48,7 @@ async function traecodeModelImport(operation, payload) {
         device_id: "",
         agent_version: "V3",
         ide_version: "",
-        access_type: 0,
+        access_type: Number.isInteger(payload.accessType) ? payload.accessType : 1,
         connect_check_param: {
           model_name: payload.model,
           provider: "custom_openai_compatible",
@@ -56,6 +56,8 @@ async function traecodeModelImport(operation, payload) {
           auth_type: 0,
           ak: payload.apiKey,
           base_url: payload.baseUrl,
+          config_detail: payload.configDetail,
+          no_encrypt: payload.noEncrypt === true,
         },
       }));
     }

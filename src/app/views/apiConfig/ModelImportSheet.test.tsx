@@ -72,4 +72,18 @@ describe("ModelImportSheet", () => {
     await waitFor(() => expect(api.apiConfigTraeCodeModels).toHaveBeenCalledWith(KEY.id));
     expect(managerApi.apiConfigModels).not.toHaveBeenCalled();
   });
+
+  it("shows only GPT models in the Codex model selector", async () => {
+    vi.mocked(managerApi.apiConfigModels).mockResolvedValue(["gpt-6.1-sol", "grok-3", "gemini-2.5-pro", "claude-sonnet-4"]);
+    render(
+      <ThemeProvider><I18nProvider>
+        <ModelImportSheet destination="codex" apiKey={KEY} onClose={vi.fn()} onCodexReport={vi.fn()} />
+      </I18nProvider></ThemeProvider>,
+    );
+    expect(await screen.findByText("gpt-6.1-sol")).toBeVisible();
+    for (const model of ["grok-3", "gemini-2.5-pro", "claude-sonnet-4"]) {
+      expect(screen.queryByText(model)).not.toBeInTheDocument();
+    }
+    expect(api.apiConfigTraeCodeModels).not.toHaveBeenCalled();
+  });
 });

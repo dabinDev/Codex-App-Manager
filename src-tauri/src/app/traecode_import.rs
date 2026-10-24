@@ -52,7 +52,6 @@ pub struct TraeCodeImportReport {
 }
 
 pub(crate) trait TraeCodeModelTransport {
-    async fn test_connectivity(&self, model: &TraeCodeCustomModel) -> Result<(), TraeCodeError>;
     async fn model_list_from_cache(&self) -> Result<Vec<TraeCodeModelRecord>, TraeCodeError>;
     async fn delete_custom_model(&self, model: &TraeCodeModelRecord) -> Result<(), TraeCodeError>;
     async fn add_custom_model(&self, model: &TraeCodeCustomModel) -> Result<(), TraeCodeError>;
@@ -94,21 +93,6 @@ impl<T> TraeCodeCdpModelTransport<T> {
 }
 
 impl<T: TraeCodeScriptCaller> TraeCodeModelTransport for TraeCodeCdpModelTransport<T> {
-    async fn test_connectivity(&self, model: &TraeCodeCustomModel) -> Result<(), TraeCodeError> {
-        let result = self
-            .cdp
-            .call_script(
-                "test",
-                vec![custom_model_payload(model, &self.api_key, &self.base_url)],
-            )
-            .await?;
-        if service_operation_succeeded(&result) {
-            Ok(())
-        } else {
-            Err(TraeCodeError::ConnectivityRejected)
-        }
-    }
-
     async fn model_list_from_cache(&self) -> Result<Vec<TraeCodeModelRecord>, TraeCodeError> {
         let result = self.cdp.call_script("list", Vec::new()).await?;
         parse_model_records(result)
@@ -153,11 +137,13 @@ impl<T: TraeCodeScriptCaller> TraeCodeModelTransport for TraeCodeCdpModelTranspo
 
 const DISPLAY_NAME_MAX_UTF16: usize = 32;
 const TRAECODE_CUSTOM_MODEL_PREFIX: &str = "custom_openai_compatible//";
+const TRAECODE_SOLO_LITE_ACCESS_TYPE: u8 = 1;
 
-fn normalized_custom_model_id(model_id: &str) -> &str {
+fn normalized_custom_model_id(model_id: &str) -> String {
     model_id
         .strip_prefix(TRAECODE_CUSTOM_MODEL_PREFIX)
         .unwrap_or(model_id)
+        .to_owned()
 }
 
 fn truncate_utf16(value: &str, max_units: usize) -> String {
@@ -180,17 +166,21 @@ fn build_custom_models(models: &[String]) -> Vec<TraeCodeCustomModel> {
     let mut used = HashSet::with_capacity(models.len());
     models
         .iter()
-        .map(|model_id| {
-            let mut display_name = truncate_utf16(model_id, DISPLAY_NAME_MAX_UTF16);
+        .map(|requested_model_id| {
+            let mut display_name = truncate_utf16(requested_model_id, DISPLAY_NAME_MAX_UTF16);
             let mut duplicate = 2;
             while !used.insert(display_name.clone()) {
                 let suffix = format!("~{duplicate}");
                 let prefix_units = DISPLAY_NAME_MAX_UTF16 - suffix.encode_utf16().count();
-                display_name = format!("{}{}", truncate_utf16(model_id, prefix_units), suffix);
+                display_name = format!(
+                    "{}{}",
+                    truncate_utf16(requested_model_id, prefix_units),
+                    suffix
+                );
                 duplicate += 1;
             }
             TraeCodeCustomModel {
-                model_id: model_id.clone(),
+                model_id: requested_model_id.clone(),
                 display_name,
             }
         })
@@ -199,11 +189,15 @@ fn build_custom_models(models: &[String]) -> Vec<TraeCodeCustomModel> {
 
 fn custom_model_payload(model: &TraeCodeCustomModel, api_key: &str, base_url: &str) -> Value {
     json!({
+        // TraeCode's native model service expects the exact model_name entered
+        // by the user. Namespaced and bare IDs are distinct upstream models.
         "model": model.model_id,
         "displayName": model.display_name,
         "apiKey": api_key,
-        "baseUrl": base_url,
+        "baseUrl": traecode_base_url(base_url),
+        "accessType": TRAECODE_SOLO_LITE_ACCESS_TYPE,
         "configDetail": { "multimodal": false },
+        "noEncrypt": false,
     })
 }
 
@@ -280,8 +274,13 @@ fn service_operation_succeeded(value: &Value) -> bool {
         || value.as_bool() == Some(true)
 }
 
-pub(crate) fn traecode_chat_completions_url(base_url: &str) -> String {
-    format!("{}/v1/chat/completions", base_url.trim_end_matches('/'))
+// TraeCode's UI resolves the full endpoint before calling addCustomModel.
+// The native service does not append the OpenAI route for us.
+pub(crate) fn traecode_base_url(base_url: &str) -> String {
+    let base = base_url.trim_end_matches('/');
+    let base = base.strip_suffix("/chat/completions").unwrap_or(base);
+    let base = base.strip_suffix("/v1").unwrap_or(base);
+    format!("{base}/v1/chat/completions")
 }
 
 pub(crate) async fn import_traecode_models<T: TraeCodeModelTransport>(
@@ -294,28 +293,11 @@ pub(crate) async fn import_traecode_models<T: TraeCodeModelTransport>(
         .map(|model| normalized_custom_model_id(model.model_id.as_str()))
         .collect::<HashSet<_>>();
 
-    for model in &models {
-        if let Err(error) = transport.test_connectivity(model).await {
-            let error_code = error.code().to_owned();
-            return Ok(TraeCodeImportReport {
-                outcome: TraeCodeImportOutcome::FailedBeforeMutation,
-                removed_count: 0,
-                added_models: Vec::new(),
-                failed_models: vec![TraeCodeImportFailure {
-                    model_id: model.model_id.clone(),
-                    error_code: error_code.clone(),
-                }],
-                restarted: request.restarted,
-                error_code: Some(error_code),
-            });
-        }
-    }
-
     let existing = transport.model_list_from_cache().await?;
     let mut removed_count = 0;
     for model in existing.iter().filter(|model| {
         model.personal_custom
-            && selected_model_ids.contains(normalized_custom_model_id(model.model_id.as_str()))
+            && selected_model_ids.contains(&normalized_custom_model_id(model.model_id.as_str()))
     }) {
         match transport.delete_custom_model(model).await {
             Ok(()) => removed_count += 1,
@@ -387,7 +369,6 @@ mod tests {
     struct RecordingState {
         models: Vec<TraeCodeModelRecord>,
         operations: Vec<String>,
-        connectivity_failure: Option<String>,
         delete_failure: Option<String>,
         add_failure: Option<String>,
         refresh_failure: bool,
@@ -412,17 +393,11 @@ mod tests {
                         })
                         .collect(),
                     operations: Vec::new(),
-                    connectivity_failure: None,
                     delete_failure: None,
                     add_failure: None,
                     refresh_failure: false,
                 }),
             }
-        }
-
-        fn failing_connectivity(self, model: &str) -> Self {
-            self.state.lock().unwrap().connectivity_failure = Some(model.to_owned());
-            self
         }
 
         fn with_builtin_model(self, model: &str) -> Self {
@@ -477,19 +452,6 @@ mod tests {
     }
 
     impl TraeCodeModelTransport for RecordingTraeCode {
-        async fn test_connectivity(
-            &self,
-            model: &TraeCodeCustomModel,
-        ) -> Result<(), TraeCodeError> {
-            let mut state = self.state.lock().unwrap();
-            state.operations.push(format!("test:{}", model.model_id));
-            if state.connectivity_failure.as_deref() == Some(model.model_id.as_str()) {
-                Err(TraeCodeError::ConnectivityRejected)
-            } else {
-                Ok(())
-            }
-        }
-
         async fn model_list_from_cache(&self) -> Result<Vec<TraeCodeModelRecord>, TraeCodeError> {
             let mut state = self.state.lock().unwrap();
             state.operations.push("list".into());
@@ -543,30 +505,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_connectivity_preserves_every_existing_custom_model() {
-        let transport =
-            RecordingTraeCode::with_custom_models(["old-a", "old-b"]).failing_connectivity("new-b");
+    async fn custom_model_import_does_not_require_a_connectivity_probe() {
+        let transport = RecordingTraeCode::with_custom_models(["old-a", "old-b"]);
 
         let report = import_traecode_models(&transport, request(["new-a", "new-b"]))
             .await
             .unwrap();
 
-        assert_eq!(report.outcome, TraeCodeImportOutcome::FailedBeforeMutation);
+        assert_eq!(report.outcome, TraeCodeImportOutcome::Committed);
         assert_eq!(report.removed_count, 0);
-        assert!(report.added_models.is_empty());
+        assert_eq!(report.added_models, vec!["new-a", "new-b"]);
+        assert!(report.failed_models.is_empty());
+        assert_eq!(report.error_code, None);
         assert_eq!(
-            report.failed_models,
-            vec![TraeCodeImportFailure {
-                model_id: "new-b".into(),
-                error_code: "traecode_connectivity_rejected".into(),
-            }]
+            transport.persisted_custom_models(),
+            vec!["old-a", "old-b", "new-a", "new-b"]
         );
         assert_eq!(
-            report.error_code.as_deref(),
-            Some("traecode_connectivity_rejected")
+            transport.operations(),
+            vec!["list", "add:new-a", "add:new-b", "refresh"]
         );
-        assert_eq!(transport.persisted_custom_models(), vec!["old-a", "old-b"]);
-        assert_eq!(transport.operations(), vec!["test:new-a", "test:new-b"]);
     }
 
     #[tokio::test]
@@ -589,14 +547,7 @@ mod tests {
         );
         assert_eq!(
             transport.operations(),
-            vec![
-                "test:new-a",
-                "test:new-b",
-                "list",
-                "add:new-a",
-                "add:new-b",
-                "refresh",
-            ]
+            vec!["list", "add:new-a", "add:new-b", "refresh",]
         );
     }
 
@@ -605,6 +556,7 @@ mod tests {
         let transport = RecordingTraeCode::with_custom_models([
             "gemini-2.5-pro",
             "custom_openai_compatible//grok-3",
+            "custom_openai_compatible//x-ai/grok-3",
         ]);
 
         let report = import_traecode_models(&transport, request(["grok-3"]))
@@ -617,12 +569,15 @@ mod tests {
         assert!(report.failed_models.is_empty());
         assert_eq!(
             transport.persisted_custom_models(),
-            vec!["gemini-2.5-pro", "grok-3"]
+            vec![
+                "gemini-2.5-pro",
+                "custom_openai_compatible//x-ai/grok-3",
+                "grok-3"
+            ]
         );
         assert_eq!(
             transport.operations(),
             vec![
-                "test:grok-3",
                 "list",
                 "delete:custom_openai_compatible//grok-3",
                 "add:grok-3",
@@ -655,14 +610,7 @@ mod tests {
         assert_eq!(transport.persisted_models(), vec!["old-b", "builtin-model"]);
         assert_eq!(
             transport.operations(),
-            vec![
-                "test:old-a",
-                "test:old-b",
-                "list",
-                "delete:old-a",
-                "delete:old-b",
-                "refresh",
-            ]
+            vec!["list", "delete:old-a", "delete:old-b", "refresh",]
         );
     }
 
@@ -691,16 +639,7 @@ mod tests {
         );
         assert_eq!(
             transport.operations(),
-            vec![
-                "test:new-a",
-                "test:new-b",
-                "test:new-c",
-                "list",
-                "add:new-a",
-                "add:new-b",
-                "add:new-c",
-                "refresh",
-            ]
+            vec!["list", "add:new-a", "add:new-b", "add:new-c", "refresh",]
         );
     }
 
@@ -734,6 +673,28 @@ mod tests {
         assert_eq!(custom[2].model_id, models[2]);
     }
 
+    #[test]
+    fn custom_model_payload_preserves_requested_grok_model_id() {
+        let models = build_custom_models(&["grok-4.5".into(), "x-ai/grok-4.6".into()]);
+
+        assert_eq!(models[0].model_id, "grok-4.5");
+        assert_eq!(models[0].display_name, "grok-4.5");
+        assert_eq!(models[1].model_id, "x-ai/grok-4.6");
+        assert_eq!(models[1].display_name, "x-ai/grok-4.6");
+        assert_eq!(
+            custom_model_payload(&models[0], "key", "https://example.test"),
+            serde_json::json!({
+                "model": "grok-4.5",
+                "displayName": "grok-4.5",
+                "apiKey": "key",
+                "baseUrl": "https://example.test/v1/chat/completions",
+                "accessType": 1,
+                "configDetail": { "multimodal": false },
+                "noEncrypt": false,
+            })
+        );
+    }
+
     #[tokio::test]
     async fn refresh_failure_reports_mutated_state_instead_of_losing_the_result() {
         let transport = RecordingTraeCode::with_custom_models(["old-a"]).failing_refresh();
@@ -753,7 +714,7 @@ mod tests {
         assert_eq!(transport.persisted_custom_models(), vec!["old-a"]);
         assert_eq!(
             transport.operations(),
-            vec!["test:old-a", "list", "delete:old-a", "add:old-a", "refresh"]
+            vec!["list", "delete:old-a", "add:old-a", "refresh"]
         );
     }
 
@@ -764,11 +725,8 @@ mod tests {
             display_name: "model-v2".into(),
         };
 
-        let payload = custom_model_payload(
-            &model,
-            "sk-secret-value",
-            "https://tomato.beinai.cc/v1/chat/completions",
-        );
+        let payload =
+            custom_model_payload(&model, "sk-secret-value", "https://tomato.beinai.cc/v1");
 
         assert_eq!(
             payload,
@@ -777,7 +735,9 @@ mod tests {
                 "displayName": "model-v2",
                 "apiKey": "sk-secret-value",
                 "baseUrl": "https://tomato.beinai.cc/v1/chat/completions",
+                "accessType": 1,
                 "configDetail": { "multimodal": false },
+                "noEncrypt": false,
             })
         );
     }
@@ -938,7 +898,7 @@ mod tests {
         let transport = TraeCodeCdpModelTransport::new(
             script,
             "sk-secret-value".into(),
-            "https://tomato.beinai.cc/v1/chat/completions".into(),
+            "https://tomato.beinai.cc/v1".into(),
         );
 
         let report = import_traecode_models(&transport, request(["vendor/new-a"]))
@@ -950,16 +910,6 @@ mod tests {
         assert_eq!(
             calls.as_slice(),
             [
-                (
-                    "test".into(),
-                    vec![serde_json::json!({
-                        "model": "vendor/new-a",
-                        "displayName": "vendor/new-a",
-                        "apiKey": "sk-secret-value",
-                        "baseUrl": "https://tomato.beinai.cc/v1/chat/completions",
-                        "configDetail": { "multimodal": false },
-                    })],
-                ),
                 ("list".into(), vec![]),
                 ("delete".into(), vec![serde_json::json!({ "id": "old-42" })]),
                 (
@@ -969,7 +919,9 @@ mod tests {
                         "displayName": "vendor/new-a",
                         "apiKey": "sk-secret-value",
                         "baseUrl": "https://tomato.beinai.cc/v1/chat/completions",
+                        "accessType": 1,
                         "configDetail": { "multimodal": false },
+                        "noEncrypt": false,
                     })],
                 ),
                 ("refresh".into(), vec![]),
@@ -978,13 +930,17 @@ mod tests {
     }
 
     #[test]
-    fn traecode_request_url_uses_the_full_openai_endpoint() {
+    fn request_url_matches_traecode_native_resolved_url() {
         assert_eq!(
-            traecode_chat_completions_url("https://tomato.beinai.cc"),
+            traecode_base_url("https://tomato.beinai.cc"),
             "https://tomato.beinai.cc/v1/chat/completions"
         );
         assert_eq!(
-            traecode_chat_completions_url("https://token.cylonai.cn/"),
+            traecode_base_url("https://token.cylonai.cn/"),
+            "https://token.cylonai.cn/v1/chat/completions"
+        );
+        assert_eq!(
+            traecode_base_url("https://token.cylonai.cn/v1/chat/completions"),
             "https://token.cylonai.cn/v1/chat/completions"
         );
     }
