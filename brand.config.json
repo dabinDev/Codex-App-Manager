@@ -29,8 +29,8 @@
   },
   "icons": {
     "frontend": {
-      "light": "src/app/assets/logo-light.png",
-      "dark": "src/app/assets/logo-dark.png"
+      "light": "src/app/assets/orange-logo.png",
+      "dark": "src/app/assets/orange-logo.png"
     },
     "bundle": [
       "icons/32x32.png",
