@@ -1,22 +1,22 @@
 {
-  "productName": "Codex App Manager",
-  "serviceName": "OrangeAPI",
+  "productName": "烂番茄安装器",
+  "serviceName": "tomato.beinai.cc · OpenAI",
   "displayNames": {
-    "en": "Codex App Manager",
-    "zh-CN": "Codex App 管理器",
-    "zh-TW": "Codex App 管理員",
-    "ja": "Codex App マネージャー",
-    "ko": "Codex App 관리자",
-    "fr": "Gestionnaire Codex",
-    "de": "Codex App Manager",
-    "es": "Codex App Manager",
-    "pt-BR": "Gerenciador do Codex App",
-    "ru": "Менеджер Codex App",
-    "ar": "مدير تطبيق Codex"
+    "en": "烂番茄安装器",
+    "zh-CN": "烂番茄安装器",
+    "zh-TW": "烂番茄安装器",
+    "ja": "烂番茄安装器",
+    "ko": "烂番茄安装器",
+    "fr": "烂番茄安装器",
+    "de": "烂番茄安装器",
+    "es": "烂番茄安装器",
+    "pt-BR": "烂番茄安装器",
+    "ru": "烂番茄安装器",
+    "ar": "烂番茄安装器"
   },
   "sites": {
     "support": "https://github.com/Wangnov/Codex-App-Manager",
-    "service": "https://token.cylonai.cn",
+    "service": "https://tomato.beinai.cc",
     "mirror": "https://codexapp.agentsmirror.com",
     "skins": "https://skins.agentsmirror.com",
     "updater": [

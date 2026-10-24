@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Codex App Manager",
+  "productName": "烂番茄安装器",
   "mainBinaryName": "codex-app-manager",
   "version": "0.5.16",
   "identifier": "io.github.wangnov.codexappmanager",
@@ -16,7 +16,7 @@
       {
         "label": "main",
         "create": false,
-        "title": "Codex App Manager",
+        "title": "烂番茄安装器",
         "width": 1100,
         "height": 720,
         "minWidth": 960,
