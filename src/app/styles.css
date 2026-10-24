@@ -4839,3 +4839,37 @@ button.row.danger:hover {
 [data-platform="windows"] .microcue {
   font-weight: 450;
 }
+
+/* API model import UI */
+.sheet-frame:has(.api-model-sheet) { height: min(90%, 720px); }
+.sheet.api-model-sheet,.api-model-sheet { display: flex; flex-direction: column; overflow: hidden; min-height:0; }
+.api-config-tabs { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:4px; padding:3px; border:1px solid var(--line); border-radius:var(--r-sm); background:var(--surface-2); }
+.api-config-tabs button { min-height:36px; border:1px solid transparent; border-radius:var(--r-sm); background:transparent; color:var(--text-soft); font-size:var(--fs-label); font-weight:650; }
+.api-config-tabs button[aria-selected="true"] { border-color:var(--line-2); background:var(--surface-3); color:var(--text); box-shadow:var(--elev-1); }
+.api-config-tabs button:hover:not([aria-selected="true"]) { background:var(--surface); color:var(--text); }
+.api-model-sheet-heading { display:grid; gap:4px; padding-bottom:var(--space-sm); border-bottom:1px solid var(--line); }
+.api-model-sheet-heading h3 { margin:0; color:var(--text); font-size:var(--fs-lg); line-height:1.25; }
+.api-model-sheet-heading p { margin:4px 0 0; color:var(--text-faint); font-size:var(--fs-caption); overflow-wrap:anywhere; }
+.api-model-list { flex:1 1 auto; min-height:0; min-width:0; display:grid; gap:4px; overflow:auto; padding:2px; overscroll-behavior:contain; }
+.api-model-row { min-width:0; display:grid; grid-template-columns:minmax(0,1fr) auto; align-items:center; gap:var(--space-sm); padding:8px 10px; border:1px solid var(--line); border-radius:var(--r-sm); background:var(--surface-2); }
+.api-model-row > label:first-child { min-width:0; display:flex; align-items:center; gap:9px; }
+.api-model-row input { flex:0 0 auto; width:17px; height:17px; accent-color:var(--accent); }
+.api-model-row code { min-width:0; overflow-wrap:anywhere; color:var(--text); font-family:var(--mono); font-size:var(--fs-label); line-height:1.4; }
+.api-model-state,.api-model-replacement-warning,.api-model-confirm,.api-model-result { display:flex; align-items:flex-start; gap:9px; min-width:0; padding:10px; border:1px solid var(--line); border-radius:var(--r-sm); color:var(--text-soft); font-size:var(--fs-sm); line-height:1.45; }
+.api-model-state { justify-content:center; min-height:100px; color:var(--text-faint); }
+.api-model-state.empty,.api-model-replacement-warning,.api-model-codex-warning { background:var(--surface-2); }
+.api-model-codex-warning { display:flex; align-items:flex-start; gap:9px; min-width:0; padding:10px; border:1px solid color-mix(in oklch,var(--amber) 36%,var(--line)); border-radius:var(--r-sm); color:var(--text-soft); font-size:var(--fs-sm); line-height:1.45; text-align:start; }
+.api-model-codex-warning input { flex:0 0 auto; width:17px; height:17px; margin-top:1px; accent-color:var(--accent); }
+.api-model-replacement-warning svg,.api-model-confirm svg { flex:0 0 auto; color:var(--amber-deep); }
+.api-model-confirm { display:grid; gap:3px; border-color:color-mix(in oklch,var(--amber) 36%,var(--line)); background:var(--amber-tint); }
+.api-model-confirm strong,.api-model-result strong { color:var(--text); }
+.api-model-result.committed { border-color:color-mix(in oklch,var(--success) 35%,var(--line)); background:var(--success-tint); }
+.api-model-result.partial,.api-model-result.failed_before_mutation { border-color:color-mix(in oklch,var(--amber) 35%,var(--line)); background:var(--amber-tint); }
+.api-model-result ul { display:grid; gap:4px; margin:7px 0 0; padding-inline-start:18px; }
+.api-model-result li { display:flex; flex-wrap:wrap; gap:5px 8px; }
+.api-model-result-error { flex-basis:100%; color:var(--danger-deep); }
+.api-model-result code { color:var(--text); font-family:var(--mono); overflow-wrap:anywhere; }
+.api-model-selection-count { color:var(--text-faint); font-size:var(--fs-caption); font-variant-numeric:tabular-nums; }
+.api-model-load-error { display:grid; gap:var(--space-xs); }
+.api-model-load-error .btn { justify-self:start; min-height:36px; }
+.api-model-sheet-heading + .api-model-state .cam-icon-loader,.api-model-sheet-heading ~ .api-model-state .cam-icon-loader { animation:spin 1s linear infinite; }

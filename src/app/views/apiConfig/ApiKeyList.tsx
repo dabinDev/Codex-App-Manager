@@ -4,6 +4,7 @@ import { errorCode, managerApi } from "../../../services/managerApi";
 import type {
   ApiConfigKey,
   ApiConfigKeyList as ApiConfigKeyListModel,
+  ApiConfigDestination,
   ApiConfigSession,
   ApiConfigWriteReport,
 } from "../../../shared/types";
@@ -11,6 +12,7 @@ import { Icon } from "../../icons";
 import { useI18n, type TKey } from "../../i18n";
 import { Sheet } from "../../Sheet";
 import { apiConfigErrorText, apiConfigWarningText } from "./errors";
+import { ModelImportSheet } from "./ModelImportSheet";
 
 const PAGE_SIZE = 20;
 
@@ -48,6 +50,7 @@ export function ApiKeyList({
   onLogout: (session: ApiConfigSession) => void;
 }) {
   const { t, lang } = useI18n();
+  const [destination, setDestination] = useState<ApiConfigDestination>("codex");
   const [page, setPage] = useState(1);
   const [refreshing, setRefreshing] = useState(false);
   const [importingId, setImportingId] = useState<number | null>(null);
@@ -59,6 +62,7 @@ export function ApiKeyList({
   const [actionError, setActionError] = useState<string | null>(initialErrorCode);
   const [ccsNotice, setCcsNotice] = useState<number | null>(null);
   const [writeReport, setWriteReport] = useState<ApiConfigWriteReport | null>(null);
+  const [modelImportKey, setModelImportKey] = useState<ApiConfigKey | null>(null);
   const confirmTitleId = useId();
   const confirmBodyId = useId();
 
@@ -202,6 +206,19 @@ export function ApiKeyList({
 
   return (
     <section className="api-config-connected api-config-with-footer">
+      <div className="api-config-tabs" role="tablist" aria-label={t("config.destination")}>
+        {(["codex", "traecode"] as const).map((value) => (
+          <button
+            key={value}
+            type="button"
+            role="tab"
+            aria-selected={destination === value}
+            onClick={() => setDestination(value)}
+          >
+            {value === "codex" ? t("config.destinationCodex") : t("config.destinationTraeCode")}
+          </button>
+        ))}
+      </div>
       <header className="api-config-connection">
         <div className="api-config-connection-copy">
           <span className={`api-config-connection-state${interrupted ? " interrupted" : ""}`}>
@@ -241,7 +258,7 @@ export function ApiKeyList({
           <span>{t("config.stale")}</span>
         </div>
       ) : null}
-      {ccsNotice != null ? (
+      {destination === "codex" && ccsNotice != null ? (
         <div className="banner ok" role="status">
           <Icon name="link" />
           <span>{t("config.ccsSent")}</span>
@@ -306,24 +323,37 @@ export function ApiKeyList({
                   <div><dt>{t("config.expiry")}</dt><dd>{expiry}</dd></div>
                 </dl>
                 <div className="api-key-actions">
-                  <button
-                    className="btn ghost"
-                    type="button"
-                    disabled={keys.stale || !key.actionable || importing}
-                    onClick={() => void importCcs(key.id)}
-                  >
-                    <Icon name={importing ? "loader" : "link"} />
-                    {t(importing ? "config.importingCcs" : "config.importCcs")}
-                  </button>
+                  {destination === "codex" ? (
+                    <button
+                      className="btn ghost"
+                      type="button"
+                      disabled={keys.stale || !key.actionable || importing}
+                      onClick={() => void importCcs(key.id)}
+                    >
+                      <Icon name={importing ? "loader" : "link"} />
+                      {t(importing ? "config.importingCcs" : "config.importCcs")}
+                    </button>
+                  ) : null}
                   <button
                     className="btn"
                     type="button"
-                    disabled={keys.stale || !key.actionable || writing}
-                    onClick={() => setConfirmKey(key)}
+                    disabled={keys.stale || !key.actionable || modelImportKey != null}
+                    onClick={() => setModelImportKey(key)}
                   >
-                    <Icon name={writing ? "loader" : "download"} />
-                    {t(writing ? "config.writingLocal" : "config.writeLocal")}
+                    <Icon name="download" />
+                    {t(destination === "codex" ? "config.chooseCodexModels" : "config.chooseTraeCodeModels")}
                   </button>
+                  {destination === "codex" ? (
+                    <button
+                      className="btn"
+                      type="button"
+                      disabled={keys.stale || !key.actionable || writing}
+                      onClick={() => setConfirmKey(key)}
+                    >
+                      <Icon name={writing ? "loader" : "download"} />
+                      {t(writing ? "config.writingLocal" : "config.writeLocal")}
+                    </button>
+                  ) : null}
                 </div>
               </li>
             );
@@ -378,6 +408,30 @@ export function ApiKeyList({
           </button>
         </div>
       </Sheet>
+
+      {modelImportKey ? (
+        <ModelImportSheet
+          destination={destination}
+          apiKey={modelImportKey}
+          onClose={() => setModelImportKey(null)}
+          onCodexReport={(keyId, report) => {
+            setWriteReport(report);
+            setModelImportKey(null);
+            if (report.outcome === "committed") {
+              onKeysChange({
+                ...keys,
+                items: keys.items.map((item) => ({
+                  ...item,
+                  enabled: item.id === keyId,
+                })),
+              });
+              void managerApi.apiConfigKeys().then(onKeysChange).catch(() => {
+                // Keep the verified local projection and success report visible.
+              });
+            }
+          }}
+        />
+      ) : null}
     </section>
   );
 }

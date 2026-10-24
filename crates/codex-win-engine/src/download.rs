@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use sha2::{Digest, Sha256};
 
 use crate::limits::MAX_PACKAGE_BYTES;
-use crate::network::{is_schannel_revocation_offline, NetworkConfig, SchannelRevocationCheck};
+use crate::network::{is_schannel_revocation_check_failure, NetworkConfig, SchannelRevocationCheck};
 use crate::process::{
     curl_exe, hidden_command, run_with_progress, RunError, RunLimits, TimeoutKind,
 };
@@ -32,10 +32,12 @@ enum CurlAttemptError {
 }
 
 impl CurlAttemptError {
-    fn into_message(self, url: &str) -> String {
+    fn into_message(self, url: &str, network: &NetworkConfig) -> String {
         match self {
             Self::Cancelled => "download cancelled".to_string(),
-            Self::Curl { exit_code, stderr } => curl_failure_message(url, exit_code, &stderr),
+            Self::Curl { exit_code, stderr } => {
+                curl_failure_message(url, exit_code, &stderr, network)
+            }
             Self::Other(message) => message,
         }
     }
@@ -98,24 +100,30 @@ fn url_host(url: &str) -> &str {
         .unwrap_or("")
 }
 
-fn proxy_env_summary() -> String {
+fn proxy_env_summary(network: &NetworkConfig) -> String {
     let vars = ["HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "NO_PROXY"];
     let configured = vars
         .iter()
         .filter(|name| std::env::var_os(name).is_some())
         .copied()
         .collect::<Vec<_>>();
-    if configured.is_empty() {
-        "no curl proxy environment variables are set; Windows system proxy/PAC may not be used automatically".to_string()
+    let env = if configured.is_empty() {
+        "no curl proxy environment variables set".to_string()
     } else {
         format!(
             "curl proxy environment variables set: {}",
             configured.join(", ")
         )
-    }
+    };
+    format!("{env}; proxy mode: {}", network.proxy_summary())
 }
 
-fn curl_failure_message(url: &str, exit_code: Option<i32>, stderr: &str) -> String {
+fn curl_failure_message(
+    url: &str,
+    exit_code: Option<i32>,
+    stderr: &str,
+    network: &NetworkConfig,
+) -> String {
     let base = format!(
         "curl failed for host={} exit={}: stderr='{}'",
         url_host(url),
@@ -127,7 +135,7 @@ fn curl_failure_message(url: &str, exit_code: Option<i32>, stderr: &str) -> Stri
     // Append the proxy diagnostic only for connectivity failures — pasting it
     // onto write / disk / HTTP errors (e.g. exit 23) only misleads.
     if is_connectivity_exit(exit_code) {
-        format!("{base}; {}", proxy_env_summary())
+        format!("{base}; {}", proxy_env_summary(network))
     } else {
         base
     }
@@ -303,7 +311,7 @@ fn retry_with_schannel_no_revoke(
 ) -> Result<(), CurlAttemptError> {
     let should_retry = match &err {
         CurlAttemptError::Curl { exit_code, stderr } => {
-            is_schannel_revocation_offline(*exit_code, stderr)
+            is_schannel_revocation_check_failure(*exit_code, stderr)
         }
         _ => false,
     };
@@ -357,11 +365,11 @@ fn run_curl(
                     .or_else(|err| {
                         retry_with_schannel_no_revoke(err, &run, ProgressMode::SilentWithErrors)
                     })
-                    .map_err(|err| err.into_message(url));
+                    .map_err(|err| err.into_message(url, network));
             }
         }
         return retry_with_schannel_no_revoke(first_err, &run, ProgressMode::NoProgressMeter)
-            .map_err(|err| err.into_message(url));
+            .map_err(|err| err.into_message(url, network));
     }
     Ok(())
 }
@@ -519,6 +527,20 @@ pub fn sha256_file(path: &Path) -> Result<String, EngineError> {
 mod tests {
     use super::*;
 
+    static DOWNLOAD_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn curl_available() -> bool {
+        let available = hidden_command(curl_exe())
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success());
+        assert!(
+            available || !cfg!(windows),
+            "Windows download tests require curl"
+        );
+        available
+    }
+
     fn file_url(path: &Path) -> String {
         let mut path = path.to_string_lossy().replace('\\', "/");
         if !path.starts_with('/') {
@@ -529,6 +551,7 @@ mod tests {
 
     #[test]
     fn download_guard_rejects_concurrent_downloads() {
+        let _lock = DOWNLOAD_TEST_LOCK.lock().unwrap();
         let guard = DownloadGuard::acquire().unwrap();
         assert!(cancel_active_download());
         assert!(DownloadGuard::acquire().is_err());
@@ -601,38 +624,79 @@ mod tests {
     }
 
     #[test]
-    fn download_with_progress_reports_final_size() {
-        if hidden_command(curl_exe())
-            .arg("--version")
-            .output()
-            .is_err()
-        {
+    fn download_rejects_file_urls() {
+        let _lock = DOWNLOAD_TEST_LOCK.lock().unwrap();
+        if !curl_available() {
             return;
         }
 
-        let root =
-            std::env::temp_dir().join(format!("codex-win-engine-progress-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = std::env::temp_dir().join(format!(
+            "codex-win-engine-file-url-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("source.bin");
+        let dest = root.join("dest.bin");
+        std::fs::write(&source, b"local file must not be downloaded").unwrap();
+
+        // Production downloads and redirects are HTTPS-only. A file:// fixture
+        // cannot exercise successful transfer progress through this path.
+        let error = download_to_with_progress(&file_url(&source), &dest, &|_| {})
+            .unwrap_err();
+        let message = error.to_string().to_ascii_lowercase();
+        assert!(
+            message.contains("protocol") && message.contains("file"),
+            "{error}"
+        );
+        assert!(
+            !dest.exists(),
+            "a rejected URL must not create the destination"
+        );
+        assert!(
+            !partial_path(&dest).exists(),
+            "a rejected URL must not write a partial file"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn curl_attempt_reports_final_size() {
+        let _lock = DOWNLOAD_TEST_LOCK.lock().unwrap();
+        if !curl_available() {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!(
+            "codex-win-engine-progress-{}",
+            uuid::Uuid::new_v4()
+        ));
         std::fs::create_dir_all(&root).unwrap();
         let source = root.join("source.bin");
         let dest = root.join("dest.bin");
         let bytes = vec![0x4d; 1024 * 1024];
         std::fs::write(&source, &bytes).unwrap();
-
+        let url = file_url(&source);
         let seen = std::sync::Mutex::new(Vec::new());
-        let result = download_to_with_progress(&file_url(&source), &dest, &|downloaded| {
-            seen.lock().unwrap().push(downloaded);
-        });
-        if let Err(EngineError::Io(message)) = &result {
-            if message.contains("Protocol \"file\"") && message.contains("disabled") {
-                let _ = std::fs::remove_dir_all(&root);
-                return;
-            }
-        }
-        result.unwrap();
 
+        // Exercise the transfer runner without changing the public download
+        // policy. This test permits only local files and ignores curl config.
+        let args = vec![
+            "--disable".into(),
+            "-f".into(),
+            "-sS".into(),
+            "--proto".into(),
+            "=file".into(),
+            "--noproxy".into(),
+            "*".into(),
+            "-o".into(),
+            dest.to_string_lossy().into_owned(),
+            url,
+        ];
+        run_curl_once("local fixture", &dest.to_string_lossy(), args, &|downloaded| {
+            seen.lock().unwrap().push(downloaded);
+        })
+        .unwrap();
         assert_eq!(std::fs::read(&dest).unwrap(), bytes);
-        assert!(seen.lock().unwrap().contains(&(1024 * 1024)));
-        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(seen.lock().unwrap().last(), Some(&(bytes.len() as u64)));
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

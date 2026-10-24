@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { relaunch } from "@tauri-apps/plugin-process";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 import type {
   AncillaryRetryReport,
@@ -7,6 +7,7 @@ import type {
   ApiConfigKeyList,
   ApiConfigSession,
   ApiConfigWriteReport,
+  CodexModelImportReport,
   AlignmentReport,
   AlignmentScan,
   AppSettings,
@@ -19,14 +20,22 @@ import type {
   ConfigHealth,
   ConfigWhich,
   Diagnostics,
+  HistoricalInstallSelection,
+  HistoricalReleaseArchitecture,
+  HistoricalReleaseCatalog,
+  LocalReleasePackage,
   MacInstallStatus,
   MacPerformReport,
   MacUninstallReport,
   MacUpdateReport,
+  ManagerUpdateSnapshot,
   OperationKind,
   OperationSnapshot,
   OperationCompletion,
   OperationToken,
+  OpenCodexStatus,
+  TraeCodeImportReport,
+  TraeCodeProbe,
   WinInstallStatus,
   WinPerformReport,
   WinStageReport,
@@ -47,6 +56,7 @@ const MAX_PERIODIC_CHECK_INTERVAL_SECONDS = 7 * 24 * 60 * 60;
 
 export type ManagerUpdateCheck =
   | { kind: "development" }
+  | { kind: "unavailable" }
   | { kind: "none" }
   | ManagerUpdateAvailable;
 
@@ -64,6 +74,16 @@ interface ManagerUpdateMetadata {
   currentVersion: string;
   body?: string;
 }
+
+const MANAGER_UPDATE_STATE_EVENT = "manager://update-state";
+export const IDLE_MANAGER_UPDATE_SNAPSHOT: ManagerUpdateSnapshot = {
+  phase: "idle",
+  version: null,
+  downloaded: 0,
+  total: null,
+  code: null,
+  updatedAtMs: 0,
+};
 
 export interface FrontendErrorPayload {
   kind: string;
@@ -667,6 +687,13 @@ const API_CONFIG_WRITE_OUTCOMES = new Set([
   "restored",
   "recovery_required",
 ]);
+const TRAECODE_IMPORT_OUTCOMES = new Set([
+  "committed",
+  "partial",
+  "failed_before_mutation",
+]);
+const MAX_API_CONFIG_MODELS = 256;
+const MAX_API_CONFIG_MODEL_ID_LENGTH = 512;
 const ALIGNMENT_OUTCOMES = new Set([
   "committed",
   "no_changes",
@@ -750,6 +777,95 @@ function guardApiConfigWrite(report: ApiConfigWriteReport): ApiConfigWriteReport
   return report;
 }
 
+function isModelId(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.length > 0 &&
+    value.length <= MAX_API_CONFIG_MODEL_ID_LENGTH &&
+    value.trim() === value
+  );
+}
+
+function modelIdsAreValid(value: unknown, allowEmpty: boolean): value is string[] {
+  return (
+    Array.isArray(value) &&
+    value.length <= MAX_API_CONFIG_MODELS &&
+    (allowEmpty || value.length > 0) &&
+    value.every(isModelId) &&
+    new Set(value).size === value.length
+  );
+}
+
+function modelImportRequestError(
+  keyId: number,
+  models?: string[],
+  defaultModel?: string,
+): CommandError | null {
+  if (!Number.isSafeInteger(keyId) || keyId < 0) {
+    return { code: "provider_key_invalid", message: "invalid API key" };
+  }
+  if (models !== undefined && !modelIdsAreValid(models, false)) {
+    return { code: "provider_models_invalid", message: "invalid model selection" };
+  }
+  if (defaultModel !== undefined && (!isModelId(defaultModel) || !models?.includes(defaultModel))) {
+    return { code: "provider_default_not_selected", message: "default model is not selected" };
+  }
+  return null;
+}
+
+function guardApiConfigModels(models: string[]): string[] {
+  if (!modelIdsAreValid(models, true)) throw contractError("API model list");
+  return models;
+}
+
+function guardCodexModelImport(report: CodexModelImportReport): CodexModelImportReport {
+  guardApiConfigWrite(report);
+  const value = report as unknown;
+  if (
+    !isRecord(value) ||
+    typeof value.catalogPath !== "string" ||
+    !value.catalogPath ||
+    !modelIdsAreValid(value.selectedModels, false) ||
+    !isModelId(value.defaultModel) ||
+    !value.selectedModels.includes(value.defaultModel)
+  ) {
+    throw contractError("Codex model import report");
+  }
+  return report;
+}
+
+function guardTraeCodeProbe(probe: TraeCodeProbe): TraeCodeProbe {
+  const value = probe as unknown;
+  if (
+    !isRecord(value) ||
+    typeof value.installed !== "boolean" ||
+    typeof value.running !== "boolean" ||
+    typeof value.cdpReady !== "boolean" ||
+    typeof value.restartRequired !== "boolean"
+  ) throw contractError("TraeCode probe");
+  return probe;
+}
+
+function guardTraeCodeImport(report: TraeCodeImportReport): TraeCodeImportReport {
+  const value = report as unknown;
+  if (
+    !isRecord(value) ||
+    typeof value.outcome !== "string" ||
+    !TRAECODE_IMPORT_OUTCOMES.has(value.outcome) ||
+    !nonNegativeInteger(value.removedCount) ||
+    !Array.isArray(value.addedModels) ||
+    !modelIdsAreValid(value.addedModels, true) ||
+    !Array.isArray(value.failedModels) ||
+    !value.failedModels.every(
+      (failure) =>
+        isRecord(failure) && isModelId(failure.modelId) && typeof failure.errorCode === "string",
+    ) ||
+    typeof value.restarted !== "boolean" ||
+    !nullableString(value.errorCode)
+  ) throw contractError("TraeCode import report");
+  return report;
+}
+
 function nonNegativeInteger(value: unknown): boolean {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
@@ -812,6 +928,12 @@ function desktopRequired(): Promise<never> {
 }
 
 export const managerApi = {
+  beginTrackedOperation(kind: OperationKind): Promise<OperationToken> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve(`browser-dev-token-${kind}`);
+    }
+    return invoke<OperationToken>("begin_operation", { kind });
+  },
   apiConfigSession(): Promise<ApiConfigSession> {
     if (!hasTauriRuntime()) {
       return Promise.resolve({
@@ -834,6 +956,44 @@ export const managerApi = {
     if (!hasTauriRuntime()) return desktopRequired();
     return invoke<ApiConfigKeyList>("api_config_keys").then(guardApiConfigKeys);
   },
+  apiConfigModels(keyId: number): Promise<string[]> {
+    if (!hasTauriRuntime()) return desktopRequired();
+    const invalid = modelImportRequestError(keyId);
+    if (invalid) return Promise.reject(invalid);
+    return invoke<string[]>("api_config_models", { keyId }).then(guardApiConfigModels);
+  },
+  apiConfigImportCodex(
+    keyId: number,
+    models: string[],
+    defaultModel: string,
+  ): Promise<CodexModelImportReport> {
+    if (!hasTauriRuntime()) return desktopRequired();
+    const invalid = modelImportRequestError(keyId, models, defaultModel);
+    if (invalid) return Promise.reject(invalid);
+    return invoke<CodexModelImportReport>("api_config_import_codex", {
+      keyId,
+      models,
+      defaultModel,
+    }).then(guardCodexModelImport);
+  },
+  apiConfigProbeTraeCode(): Promise<TraeCodeProbe> {
+    if (!hasTauriRuntime()) return desktopRequired();
+    return invoke<TraeCodeProbe>("api_config_probe_traecode").then(guardTraeCodeProbe);
+  },
+  apiConfigImportTraeCode(
+    keyId: number,
+    models: string[],
+    restartIfNeeded: boolean,
+  ): Promise<TraeCodeImportReport> {
+    if (!hasTauriRuntime()) return desktopRequired();
+    const invalid = modelImportRequestError(keyId, models);
+    if (invalid) return Promise.reject(invalid);
+    return invoke<TraeCodeImportReport>("api_config_import_traecode", {
+      keyId,
+      models,
+      restartIfNeeded,
+    }).then(guardTraeCodeImport);
+  },
   apiConfigLogout(): Promise<ApiConfigSession> {
     if (!hasTauriRuntime()) return desktopRequired();
     return invoke<ApiConfigSession>("api_config_logout").then(guardApiConfigSession);
@@ -851,6 +1011,10 @@ export const managerApi = {
   apiConfigRestartCodex(): Promise<void> {
     if (!hasTauriRuntime()) return desktopRequired();
     return invoke<void>("api_config_restart_codex");
+  },
+  apiConfigStopOpenCodex(): Promise<OpenCodexStatus> {
+    if (!hasTauriRuntime()) return desktopRequired();
+    return invoke<OpenCodexStatus>("api_config_stop_opencodex");
   },
   toolboxAlignmentScan(): Promise<AlignmentScan> {
     if (!hasTauriRuntime()) {
@@ -913,12 +1077,106 @@ export const managerApi = {
     }
     return invoke<OperationSnapshot | null>("get_operation_snapshot");
   },
+  getPausedOperationSnapshot(): Promise<OperationSnapshot | null> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve(null);
+    }
+    return invoke<OperationSnapshot | null>("get_paused_operation_snapshot");
+  },
   /** Token-keyed terminal evidence retained after a renderer loses its invoke. */
   getOperationCompletion(token: OperationToken): Promise<OperationCompletion | null> {
     if (!hasTauriRuntime()) {
       return Promise.resolve(null);
     }
     return invoke<OperationCompletion | null>("get_operation_completion", { token });
+  },
+  historicalReleaseCatalog(
+    platform: "macos" | "windows",
+    architecture: HistoricalReleaseArchitecture,
+  ): Promise<HistoricalReleaseCatalog> {
+    if (!hasTauriRuntime()) {
+      const version = "26.727.51351";
+      const packageVersion = "26.727.6591.0";
+      return Promise.resolve({
+        repository: "Wangnov/codex-app-mirror",
+        platform,
+        architecture,
+        releases: [{
+          tag: `codex-app-${version}`,
+          version,
+          publishedAt: "2026-08-01T00:17:13Z",
+          assets: platform === "macos"
+            ? [
+                { name: `Codex-mac-${architecture}.dmg`, size: 560_000_000, architecture, format: "dmg" as const, packageVersion: null },
+                { name: `Codex-darwin-${architecture}-${version}.zip`, size: 530_000_000, architecture, format: "zip" as const, packageVersion: null },
+              ]
+            : [{ name: `OpenAI.Codex_${packageVersion}_${architecture}__2p2nqsd0c76g0.Msix`, size: 755_000_000, architecture, format: "msix" as const, packageVersion }],
+        }],
+      });
+    }
+    return invoke<HistoricalReleaseCatalog>("historical_release_catalog", { architecture });
+  },
+  historicalPickLocalPackage(
+    platform: "macos" | "windows",
+    architecture: HistoricalReleaseArchitecture,
+  ): Promise<LocalReleasePackage | null> {
+    if (!hasTauriRuntime()) {
+      const version = "26.727.51351";
+      const packageVersion = platform === "windows" ? "26.727.6591.0" : null;
+      const assetName = platform === "macos"
+        ? `Codex-mac-${architecture}.dmg`
+        : `OpenAI.Codex_${packageVersion}_${architecture}__2p2nqsd0c76g0.Msix`;
+      return Promise.resolve({
+        path: `/Users/example/Downloads/${assetName}`,
+        fileName: assetName,
+        size: platform === "macos" ? 560_000_000 : 755_000_000,
+        releaseTag: `local-signed-${version}`,
+        version,
+        assetName,
+        architecture,
+        format: platform === "macos" ? "dmg" : "msix",
+        packageVersion,
+      });
+    }
+    return invoke<LocalReleasePackage | null>("historical_pick_local_package", { architecture });
+  },
+  async macInstallHistoricalRelease(
+    selection: HistoricalInstallSelection,
+    blockUpdates: boolean,
+    expected: { path: string | null; build: number | null },
+    operationToken?: OperationToken,
+  ): Promise<MacInstallStatus> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve({
+        installed: { path: expected.path ?? "/Applications/Codex.app", build: 5813, shortVersion: selection.version, arch: selection.architecture === "x64" ? "x86_64" : "arm64" },
+        status: "managed",
+      });
+    }
+    const token = operationToken ?? (expected.path ? await managerApi.armDestructive("update") : await managerApi.beginTrackedOperation("install"));
+    return invoke<MacInstallStatus>("mac_install_historical_release", {
+      confirm: true, token, releaseTag: selection.releaseTag, assetName: selection.assetName, localPath: selection.localPath,
+      architecture: selection.architecture, blockUpdates, expectedCurrentPath: expected.path, expectedCurrentBuild: expected.build,
+    }).then(guardMacStatus);
+  },
+  async winInstallHistoricalRelease(
+    selection: HistoricalInstallSelection,
+    blockUpdates: boolean,
+    expected: { currentPath: string | null; currentVersion: string | null; currentSource: string | null },
+    operationToken?: OperationToken,
+    installRoot?: string,
+  ): Promise<WinPerformReport> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve({
+        ...WIN_FALLBACK_PERFORM,
+        installed: WIN_FALLBACK_PERFORM.installed ? { ...WIN_FALLBACK_PERFORM.installed, version: selection.version } : null,
+        stage: { ...WIN_FALLBACK_PERFORM.stage, latestVersion: selection.version, packageMoniker: selection.assetName.replace(/\.msix$/i, "") },
+      });
+    }
+    const token = operationToken ?? (expected.currentPath ? await managerApi.armDestructive("update") : await managerApi.beginTrackedOperation("install"));
+    return invoke<WinPerformReport>("win_install_historical_release", {
+      confirm: true, token, releaseTag: selection.releaseTag, assetName: selection.assetName, localPath: selection.localPath,
+      architecture: selection.architecture, blockUpdates, installRoot, expected,
+    });
   },
   macPlanUpdate(simulatedBuild?: number): Promise<MacUpdateReport> {
     if (!hasTauriRuntime()) {
@@ -937,6 +1195,8 @@ export const managerApi = {
     fromBuild: number;
     toBuild: number;
     path: string;
+    fromVersion: string;
+    toVersion: string;
   }): Promise<MacPerformReport> {
     if (!hasTauriRuntime()) {
       return Promise.resolve({
@@ -954,13 +1214,7 @@ export const managerApi = {
       });
     }
     const token = await managerApi.armDestructive("update");
-    return invoke<MacPerformReport>("mac_perform_update", {
-      confirm: true,
-      token,
-      expectedFromBuild: expected.fromBuild,
-      expectedToBuild: expected.toBuild,
-      expectedPath: expected.path,
-    });
+    return invoke<MacPerformReport>("mac_perform_update", { confirm: true, token, expected });
   },
   // Self-update the manager itself via the Tauri updater (minisign-signed,
   // full bundle). Endpoints + signing are server-side (see roadmap §4).
@@ -968,11 +1222,34 @@ export const managerApi = {
     if (!hasTauriRuntime()) {
       return { kind: "development" };
     }
-    const update = await invoke<ManagerUpdateMetadata | null>("manager_check_update");
+    const update = await invoke<ManagerUpdateMetadata | null>("manager_check_update").catch(() => undefined);
+    if (update === undefined) return { kind: "unavailable" };
     if (!update) {
       return { kind: "none" };
     }
     return managerUpdateAvailable(update);
+  },
+  getManagerUpdateRuntime(): Promise<ManagerUpdateSnapshot> {
+    if (!hasTauriRuntime()) return Promise.resolve(IDLE_MANAGER_UPDATE_SNAPSHOT);
+    return invoke<ManagerUpdateSnapshot>("manager_get_update_runtime");
+  },
+  ackManagerUpdateRuntime(): Promise<ManagerUpdateSnapshot> {
+    if (!hasTauriRuntime()) return Promise.resolve(IDLE_MANAGER_UPDATE_SNAPSHOT);
+    return invoke<ManagerUpdateSnapshot>("manager_ack_update_runtime");
+  },
+  async relaunchManager(): Promise<void> {
+    if (!hasTauriRuntime()) return;
+    await invoke<void>("manager_relaunch");
+  },
+  async onManagerUpdateRuntime(
+    onSnapshot: (snapshot: ManagerUpdateSnapshot) => void,
+  ): Promise<UnlistenFn> {
+    if (!hasTauriRuntime()) return () => {};
+    try {
+      return await listen<ManagerUpdateSnapshot>(MANAGER_UPDATE_STATE_EVENT, (event) => onSnapshot(event.payload));
+    } catch {
+      return () => {};
+    }
   },
   macStatus(): Promise<MacInstallStatus> {
     if (!hasTauriRuntime()) {
@@ -1013,7 +1290,7 @@ export const managerApi = {
   },
 
   // Fresh-install the latest Codex (full package) into /Applications.
-  macInstall(): Promise<MacInstallStatus> {
+  macInstall(expected: { targetBuild: number; targetVersion: string }): Promise<MacInstallStatus> {
     if (!hasTauriRuntime()) {
       return Promise.resolve({
         installed: {
@@ -1025,7 +1302,10 @@ export const managerApi = {
         status: "managed",
       });
     }
-    return invoke<MacInstallStatus>("mac_install");
+    return invoke<MacInstallStatus>("mac_install", {
+      expectedTargetBuild: expected.targetBuild,
+      expectedTargetVersion: expected.targetVersion,
+    });
   },
   macPauseDownload(operationId: string): Promise<boolean> {
     if (!hasTauriRuntime()) {
@@ -1072,6 +1352,13 @@ export const managerApi = {
     }
     return invoke<Diagnostics>("get_diagnostics");
   },
+  getHostArchitecture(): Promise<string> {
+    if (!hasTauriRuntime()) {
+      const platform = navigator.platform.toLowerCase();
+      return Promise.resolve(platform.includes("arm") ? "aarch64" : "x86_64");
+    }
+    return invoke<string>("get_host_architecture");
+  },
   openLogsDir(): Promise<void> {
     if (!hasTauriRuntime()) {
       return Promise.resolve();
@@ -1083,6 +1370,15 @@ export const managerApi = {
       return Promise.resolve();
     }
     return invoke<void>("open_codex_home");
+  },
+  writeClipboardText(text: string): Promise<void> {
+    if (!hasTauriRuntime()) {
+      if (typeof navigator !== "undefined" && navigator.clipboard) {
+        return navigator.clipboard.writeText(text);
+      }
+      return Promise.resolve();
+    }
+    return invoke<void>("write_clipboard_text", { text });
   },
   reportFrontendError(payload: FrontendErrorPayload): Promise<void> {
     if (!hasTauriRuntime()) {
@@ -1131,6 +1427,10 @@ export const managerApi = {
     } catch {
       return localSettings();
     }
+  },
+  async getSettingsStrict(): Promise<AppSettings> {
+    if (!hasTauriRuntime()) return localSettings();
+    return normalizeSettings(await invoke<AppSettings>("get_settings"));
   },
   async setSettings(next: AppSettings): Promise<AppSettings> {
     const safe = normalizeSettings(next);
@@ -1452,6 +1752,7 @@ export const managerApi = {
     },
     installRoot?: string,
     operationToken?: OperationToken,
+    resumeKind: "install" | "perform" = "perform",
   ): Promise<WinPerformReport> {
     if (!hasTauriRuntime()) {
       return confirm
@@ -1467,6 +1768,7 @@ export const managerApi = {
       token,
       installRoot: installRoot ?? null,
       expected: expected ?? null,
+      resumeKind,
     });
   },
   async winUninstall(confirm: boolean, purgeUserData: boolean): Promise<WinUninstallReport> {
@@ -1542,7 +1844,7 @@ function managerUpdateAvailable(update: ManagerUpdateMetadata): ManagerUpdateAva
         expectedVersion: update.version,
         expectedCurrentVersion: update.currentVersion,
       });
-      await relaunch();
+      await managerApi.relaunchManager();
     },
     discard: async () => {},
   };

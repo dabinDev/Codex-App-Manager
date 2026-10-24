@@ -358,11 +358,8 @@ fn configure_windows_browser_accelerators(
     window: &tauri::WebviewWindow<tauri::Wry>,
     enabled: bool,
 ) -> tauri::Result<()> {
-    use webview2_com::Microsoft::Web::WebView2::Win32::{
-        ICoreWebView2Settings, ICoreWebView2Settings3,
-    };
+    use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Settings3;
     use windows_core::Interface;
-    use windows_core_wry::Interface as WryInterface;
 
     if enabled {
         return Ok(());
@@ -373,23 +370,11 @@ fn configure_windows_browser_accelerators(
     let app_handle = app.handle().clone();
     let callback_result = window.with_webview(move |platform_webview| {
         let result = unsafe {
-            (|| -> Result<(), String> {
-                let webview = platform_webview
-                    .controller()
-                    .CoreWebView2()
-                    .map_err(|error| error.to_string())?;
-                let legacy_settings = webview.Settings().map_err(|error| error.to_string())?;
-
-                // Tauri/Wry returns a windows-core 0.61 wrapper. Move its one
-                // COM reference into the 0.62 wrapper for the same interface.
-                let raw_settings = WryInterface::into_raw(legacy_settings);
-                let settings = ICoreWebView2Settings::from_raw(raw_settings);
-                let settings3 = settings
-                    .cast::<ICoreWebView2Settings3>()
-                    .map_err(|error| error.to_string())?;
-                settings3
-                    .SetAreBrowserAcceleratorKeysEnabled(false)
-                    .map_err(|error| error.to_string())
+            (|| -> windows_core::Result<()> {
+                let webview = platform_webview.controller().CoreWebView2()?;
+                let settings = webview.Settings()?;
+                let settings3 = settings.cast::<ICoreWebView2Settings3>()?;
+                settings3.SetAreBrowserAcceleratorKeysEnabled(false)
             })()
         };
         match result {
@@ -855,7 +840,12 @@ fn run_tauri_app() {
             commands::api_config_session,
             commands::api_config_login,
             commands::api_config_keys,
+            commands::api_config_models,
+            commands::api_config_import_codex,
+            commands::api_config_probe_traecode,
+            commands::api_config_import_traecode,
             commands::api_config_logout,
+            commands::api_config_stop_opencodex,
             commands::api_config_import_ccs,
             commands::api_config_write_local,
             commands::api_config_restart_codex,

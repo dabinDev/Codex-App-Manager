@@ -53,6 +53,7 @@ use crate::errors::{AppError, CommandError};
 use crate::state::ManagerState;
 
 static PROVIDER_COMMAND_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static TRAECODE_COMMAND_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 static ALIGNMENT_COMMAND_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 static ALIGNMENT_RESTART_PERMIT: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
 
@@ -151,6 +152,7 @@ fn orange_command_error(error: OrangeError) -> CommandError {
     CommandError {
         code: error.code().to_string(),
         message: error.to_string(),
+        retry_after_unix: None,
     }
 }
 
@@ -158,6 +160,29 @@ fn provider_command_error(error: crate::app::codex_provider::ProviderWriteError)
     CommandError {
         code: error.code().to_string(),
         message: error.to_string(),
+        retry_after_unix: None,
+    }
+}
+
+fn opencodex_command_error(error: crate::app::opencodex::OpenCodexError) -> CommandError {
+    CommandError {
+        code: error.code().to_string(),
+        message: error.to_string(),
+        retry_after_unix: None,
+    }
+}
+
+fn codex_model_config_command_error(
+    error: crate::app::codex_model_config::CodexModelConfigError,
+) -> CommandError {
+    provider_command_error(error.into())
+}
+
+fn traecode_command_error(error: crate::app::traecode_cdp::TraeCodeError) -> CommandError {
+    CommandError {
+        code: error.code().to_string(),
+        message: error.to_string(),
+        retry_after_unix: None,
     }
 }
 
@@ -167,6 +192,7 @@ fn alignment_command_error(
     CommandError {
         code: error.code().to_string(),
         message: error.to_string(),
+        retry_after_unix: None,
     }
 }
 
@@ -174,6 +200,7 @@ fn elevation_command_error(error: crate::app::alignment_elevation::ElevationErro
     CommandError {
         code: error.code().to_string(),
         message: error.to_string(),
+        retry_after_unix: None,
     }
 }
 
@@ -194,6 +221,7 @@ fn codex_locale_command_error(error: AppError) -> CommandError {
         return CommandError {
             code: code.to_string(),
             message,
+            retry_after_unix: None,
         };
     }
     error.into()
@@ -1239,10 +1267,158 @@ pub async fn api_config_keys(
 }
 
 #[tauri::command]
+pub async fn api_config_models(
+    state: State<'_, ManagerState>,
+    key_id: u64,
+) -> Result<Vec<String>, CommandError> {
+    let api_key = state
+        .orange
+        .full_key(key_id)
+        .await
+        .map_err(orange_command_error)?;
+    Ok(state
+        .opencodex
+        .discover_models(&api_key)
+        .await
+        .map_err(opencodex_command_error)?
+        .models)
+}
+
+#[tauri::command]
+pub async fn api_config_import_codex(
+    state: State<'_, ManagerState>,
+    key_id: u64,
+    models: Vec<String>,
+    default_model: String,
+) -> Result<crate::app::codex_provider::ProviderWriteReport, CommandError> {
+    let selected = crate::app::codex_model_config::normalize_model_selection(&models)
+        .map_err(codex_model_config_command_error)?;
+    crate::app::codex_model_config::ensure_codex_models(&selected)
+        .map_err(codex_model_config_command_error)?;
+    let default_model = default_model.trim().to_owned();
+    crate::app::codex_model_config::validate_codex_default(&selected, &default_model)
+        .map_err(codex_model_config_command_error)?;
+    let api_key = state
+        .orange
+        .full_key(key_id)
+        .await
+        .map_err(orange_command_error)?;
+    let current = state
+        .opencodex
+        .discover_models(&api_key)
+        .await
+        .map_err(opencodex_command_error)?
+        .models;
+    crate::app::codex_model_config::ensure_models_are_current(&selected, &current)
+        .map_err(codex_model_config_command_error)?;
+    let _operation = begin_guard(&state, OperationKind::ProviderWrite)?;
+    let report = tauri::async_runtime::spawn_blocking(move || {
+        let _guard = PROVIDER_COMMAND_LOCK.try_lock().map_err(|_| CommandError {
+            code: "provider_busy".into(),
+            message: "another Codex provider write is already running".into(),
+            retry_after_unix: None,
+        })?;
+        let permit =
+            crate::app::codex_provider::begin_provider_write().map_err(provider_command_error)?;
+        let was_running = crate::app::codex_theme::stop_for_external_config_write()
+            .map_err(CommandError::from)?;
+        crate::app::codex_provider::write_model_provider_files_with_base_url(
+            permit,
+            &api_key,
+            &selected,
+            &default_model,
+            was_running,
+            &format!(
+                "{}/v1",
+                crate::app::orange_api::ORANGE_BASE_URL.trim_end_matches('/')
+            ),
+        )
+        .map_err(provider_command_error)
+    })
+    .await
+    .map_err(|error| AppError::Internal(format!("Codex model import task failed: {error}")))??;
+
+    if report.outcome == crate::app::codex_provider::ProviderWriteOutcome::Committed {
+        state.orange.mark_enabled(key_id).await;
+    }
+    Ok(report)
+}
+
+#[tauri::command]
+pub async fn api_config_probe_traecode(
+) -> Result<crate::app::traecode_cdp::TraeCodeProbe, CommandError> {
+    crate::app::traecode_cdp::probe_traecode()
+        .await
+        .map_err(traecode_command_error)
+}
+
+#[tauri::command]
+pub async fn api_config_import_traecode(
+    state: State<'_, ManagerState>,
+    key_id: u64,
+    models: Vec<String>,
+    restart_if_needed: bool,
+) -> Result<crate::app::traecode_import::TraeCodeImportReport, CommandError> {
+    let selected = crate::app::codex_model_config::normalize_model_selection(&models)
+        .map_err(codex_model_config_command_error)?;
+    let current = state
+        .orange
+        .models_for_key(key_id)
+        .await
+        .map_err(orange_command_error)?;
+    crate::app::codex_model_config::ensure_models_are_current(&selected, &current)
+        .map_err(codex_model_config_command_error)?;
+    let api_key = state
+        .orange
+        .full_key(key_id)
+        .await
+        .map_err(orange_command_error)?;
+
+    let _guard = TRAECODE_COMMAND_LOCK
+        .try_lock()
+        .map_err(|_| traecode_command_error(crate::app::traecode_cdp::TraeCodeError::Busy))?;
+    let endpoint = crate::app::traecode_cdp::ensure_traecode_cdp(restart_if_needed)
+        .await
+        .map_err(traecode_command_error)?;
+    let restarted = endpoint.restarted;
+    let cdp = crate::app::traecode_cdp::CdpTransport::connect(&endpoint)
+        .await
+        .map_err(traecode_command_error)?;
+    let transport = crate::app::traecode_import::TraeCodeCdpModelTransport::new(
+        cdp,
+        api_key,
+        crate::app::traecode_import::traecode_chat_completions_url(
+            crate::app::brand::SERVICE_BASE_URL,
+        ),
+    );
+    crate::app::traecode_import::import_traecode_models(
+        &transport,
+        crate::app::traecode_import::TraeCodeImportRequest {
+            models: selected,
+            restarted,
+        },
+    )
+    .await
+    .map_err(traecode_command_error)
+}
+
+#[tauri::command]
 pub async fn api_config_logout(
     state: State<'_, ManagerState>,
 ) -> Result<OrangeSessionView, CommandError> {
+    let _ = state.opencodex.stop().await;
     state.orange.logout().await.map_err(orange_command_error)
+}
+
+#[tauri::command]
+pub async fn api_config_stop_opencodex(
+    state: State<'_, ManagerState>,
+) -> Result<crate::app::opencodex::OpenCodexStatus, CommandError> {
+    state
+        .opencodex
+        .stop()
+        .await
+        .map_err(opencodex_command_error)
 }
 
 #[tauri::command]
@@ -1279,6 +1455,7 @@ pub async fn api_config_write_local(
         let _guard = PROVIDER_COMMAND_LOCK.try_lock().map_err(|_| CommandError {
             code: "provider_busy".into(),
             message: "another Codex provider write is already running".into(),
+            retry_after_unix: None,
         })?;
         let permit =
             crate::app::codex_provider::begin_provider_write().map_err(provider_command_error)?;
@@ -1374,10 +1551,12 @@ pub async fn toolbox_alignment_execute(
                     code: "alignment_busy".to_string(),
                     message: "another conversation alignment operation is already running"
                         .to_string(),
+                    retry_after_unix: None,
                 })?;
             let _provider_command = PROVIDER_COMMAND_LOCK.try_lock().map_err(|_| CommandError {
                 code: "provider_busy".to_string(),
                 message: "another Codex provider write is already running".to_string(),
+                retry_after_unix: None,
             })?;
             let _provider_permit = crate::app::codex_provider::begin_provider_write()
                 .map_err(provider_command_error)?;
@@ -1461,10 +1640,12 @@ pub async fn toolbox_alignment_restore(
             .map_err(|_| CommandError {
                 code: "alignment_busy".to_string(),
                 message: "another conversation alignment operation is already running".to_string(),
+                retry_after_unix: None,
             })?;
         let _provider_command = PROVIDER_COMMAND_LOCK.try_lock().map_err(|_| CommandError {
             code: "provider_busy".to_string(),
             message: "another Codex provider write is already running".to_string(),
+            retry_after_unix: None,
         })?;
         let _provider_permit =
             crate::app::codex_provider::begin_provider_write().map_err(provider_command_error)?;
@@ -1508,6 +1689,7 @@ pub async fn toolbox_alignment_restart(state: State<'_, ManagerState>) -> Result
         return Err(CommandError {
             code: "alignment_restart_not_allowed".to_string(),
             message: "Codex restart is not allowed for the current alignment result".to_string(),
+            retry_after_unix: None,
         });
     }
     let settings = PersistedAppSettings::load();
@@ -1549,12 +1731,14 @@ pub async fn toolbox_force_restart_codex(
             return Err(CommandError {
                 code: "alignment_restart_confirmation_required".to_string(),
                 message: "Codex force restart requires explicit confirmation".to_string(),
+                retry_after_unix: None,
             });
         }
         RestartCommandPolicy::Busy => {
             return Err(CommandError {
                 code: "alignment_busy".to_string(),
                 message: "another protected operation is already running".to_string(),
+                retry_after_unix: None,
             });
         }
         RestartCommandPolicy::ConfirmedManual => {}
@@ -1596,12 +1780,14 @@ pub async fn toolbox_apply_codex_locale(
             return Err(CommandError {
                 code: "alignment_restart_confirmation_required".to_string(),
                 message: "Codex locale apply requires explicit confirmation".to_string(),
+                retry_after_unix: None,
             });
         }
         RestartCommandPolicy::Busy => {
             return Err(CommandError {
                 code: "alignment_busy".to_string(),
                 message: "another protected operation is already running".to_string(),
+                retry_after_unix: None,
             });
         }
         RestartCommandPolicy::ConfirmedManual => {}

@@ -305,6 +305,30 @@ impl OrangeApiClient {
         )
         .await
     }
+
+    pub async fn key_models(
+        &self,
+        access_token: &str,
+        key_id: u64,
+    ) -> Result<Vec<String>, OrangeError> {
+        let mut models: Vec<String> = self
+            .decode(
+                self.client
+                    .get(self.url(&format!("/studio/keys/{key_id}/models")))
+                    .bearer_auth(access_token)
+                    .send()
+                    .await,
+            )
+            .await?;
+        models = models
+            .into_iter()
+            .map(|id| id.trim().to_owned())
+            .filter(|id| !id.is_empty())
+            .collect();
+        models.sort();
+        models.dedup();
+        Ok(models)
+    }
 }
 
 fn classify_transport(error: reqwest::Error) -> OrangeError {

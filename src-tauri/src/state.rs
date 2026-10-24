@@ -35,6 +35,9 @@ pub struct ManagerState {
     pub codex_theme: crate::app::codex_theme::ThemeService,
     /// OrangeAPI authentication and full-key cache. Secrets remain in Rust.
     pub orange: crate::app::orange_session::OrangeSessionService,
+    /// Bundled OpenCodex model proxy. The child is private to the manager and
+    /// receives API keys through its environment only.
+    pub opencodex: crate::app::opencodex::OpenCodexSupervisor,
 }
 
 #[cfg(any(target_os = "windows", test))]
@@ -97,6 +100,7 @@ impl ManagerState {
             frontend: FrontendGate::default(),
             codex_theme: crate::app::codex_theme::ThemeService::new(codex_locale_compatibility),
             orange: crate::app::orange_session::OrangeSessionService::default(),
+            opencodex: crate::app::opencodex::OpenCodexSupervisor::from_default_runtime(),
         }
     }
 

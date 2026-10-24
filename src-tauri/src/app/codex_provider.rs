@@ -11,6 +11,10 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::app::brand::SERVICE_NAME;
+use crate::app::codex_model_config::{
+    build_model_catalog, merge_codex_auth, merge_codex_config, normalize_model_selection,
+    validate_codex_default, CodexModelConfigError, CATALOG_NAME,
+};
 use crate::app::orange_api::ORANGE_BASE_URL;
 
 const MODEL: &str = "gpt-5.5";
@@ -30,28 +34,6 @@ const USAGE_SCRIPT: &str = r#"({
       };
     }
   })"#;
-
-fn provider_config() -> String {
-    let base_url = ORANGE_BASE_URL.trim_end_matches('/');
-    format!(
-        r#"model_provider = "OpenAI"
-model = "gpt-5.5"
-review_model = "gpt-5.5"
-model_reasoning_effort = "xhigh"
-disable_response_storage = true
-network_access = "enabled"
-windows_wsl_setup_acknowledged = true
-
-[model_providers.OpenAI]
-name = "OpenAI"
-base_url = "{base_url}/v1"
-wire_api = "responses"
-requires_openai_auth = true
-
-[features]
-goals = true"#
-    )
-}
 
 #[derive(Debug, Clone)]
 pub struct ProviderPaths {
@@ -86,6 +68,9 @@ pub struct ProviderWriteReport {
     pub backup_dir: Option<String>,
     pub config_path: String,
     pub auth_path: String,
+    pub catalog_path: String,
+    pub selected_models: Vec<String>,
+    pub default_model: String,
     pub codex_was_running: bool,
     pub write_verified: bool,
     pub rollback_verified: bool,
@@ -108,6 +93,8 @@ pub enum ProviderWriteError {
     CcSwitchUnavailable,
     #[error("this operation is not supported on the current platform")]
     UnsupportedPlatform,
+    #[error(transparent)]
+    ModelConfig(#[from] CodexModelConfigError),
 }
 
 impl ProviderWriteError {
@@ -120,6 +107,7 @@ impl ProviderWriteError {
             Self::Io => "provider_io",
             Self::CcSwitchUnavailable => "ccswitch_unavailable",
             Self::UnsupportedPlatform => "unsupported_platform",
+            Self::ModelConfig(error) => error.code(),
         }
     }
 }
@@ -143,6 +131,7 @@ struct BackupEntry {
 struct Preimage {
     config: Option<Vec<u8>>,
     auth: Option<Vec<u8>>,
+    catalog: Option<Vec<u8>>,
 }
 
 struct ProviderLock(File);
@@ -234,11 +223,12 @@ pub fn write_provider_files(
     api_key: &str,
     codex_was_running: bool,
 ) -> Result<ProviderWriteReport, ProviderWriteError> {
-    write_provider_files_with_permit(
-        &permit,
+    write_model_provider_files(
+        permit,
         api_key,
+        &[MODEL.to_owned()],
+        MODEL,
         codex_was_running,
-        ProviderWriteFault::None,
     )
 }
 
@@ -247,48 +237,181 @@ pub fn write_provider_files_at(
     api_key: &str,
     codex_was_running: bool,
 ) -> Result<ProviderWriteReport, ProviderWriteError> {
-    write_provider_files_at_with_fault(paths, api_key, codex_was_running, ProviderWriteFault::None)
+    write_model_provider_files_at(
+        paths,
+        api_key,
+        &[MODEL.to_owned()],
+        MODEL,
+        codex_was_running,
+    )
 }
 
+#[cfg(test)]
 fn write_provider_files_at_with_fault(
     paths: &ProviderPaths,
     api_key: &str,
     codex_was_running: bool,
     fault: ProviderWriteFault,
 ) -> Result<ProviderWriteReport, ProviderWriteError> {
-    let permit = begin_provider_write_at(paths)?;
-    write_provider_files_with_permit(&permit, api_key, codex_was_running, fault)
+    write_model_provider_files_at_with_fault(
+        paths,
+        api_key,
+        &[MODEL.to_owned()],
+        MODEL,
+        codex_was_running,
+        fault,
+    )
 }
 
-fn write_provider_files_with_permit(
+pub fn write_model_provider_files(
+    permit: ProviderWritePermit,
+    api_key: &str,
+    models: &[String],
+    default_model: &str,
+    codex_was_running: bool,
+) -> Result<ProviderWriteReport, ProviderWriteError> {
+    write_model_provider_files_with_base_url(
+        permit,
+        api_key,
+        models,
+        default_model,
+        codex_was_running,
+        &format!("{}/v1", ORANGE_BASE_URL.trim_end_matches('/')),
+    )
+}
+
+pub fn write_model_provider_files_with_base_url(
+    permit: ProviderWritePermit,
+    api_key: &str,
+    models: &[String],
+    default_model: &str,
+    codex_was_running: bool,
+    base_url: &str,
+) -> Result<ProviderWriteReport, ProviderWriteError> {
+    write_model_provider_files_with_permit(
+        &permit,
+        api_key,
+        models,
+        default_model,
+        codex_was_running,
+        base_url,
+        ProviderWriteFault::None,
+    )
+}
+
+pub fn write_model_provider_files_at(
+    paths: &ProviderPaths,
+    api_key: &str,
+    models: &[String],
+    default_model: &str,
+    codex_was_running: bool,
+) -> Result<ProviderWriteReport, ProviderWriteError> {
+    write_model_provider_files_at_with_fault(
+        paths,
+        api_key,
+        models,
+        default_model,
+        codex_was_running,
+        ProviderWriteFault::None,
+    )
+}
+
+fn write_model_provider_files_at_with_fault(
+    paths: &ProviderPaths,
+    api_key: &str,
+    models: &[String],
+    default_model: &str,
+    codex_was_running: bool,
+    fault: ProviderWriteFault,
+) -> Result<ProviderWriteReport, ProviderWriteError> {
+    let permit = begin_provider_write_at(paths)?;
+    write_model_provider_files_with_permit(
+        &permit,
+        api_key,
+        models,
+        default_model,
+        codex_was_running,
+        &format!("{}/v1", ORANGE_BASE_URL.trim_end_matches('/')),
+        fault,
+    )
+}
+
+fn write_model_provider_files_with_permit(
     permit: &ProviderWritePermit,
     api_key: &str,
+    models: &[String],
+    default_model: &str,
     codex_was_running: bool,
+    base_url: &str,
     _fault: ProviderWriteFault,
 ) -> Result<ProviderWriteReport, ProviderWriteError> {
     let config_path = permit.paths.codex_home.join("config.toml");
     let auth_path = permit.paths.codex_home.join("auth.json");
-    let preimage = (|| -> Result<Preimage, ProviderWriteError> {
+    let catalog_path = permit.paths.codex_home.join(CATALOG_NAME);
+    let selected_models = match normalize_model_selection(models) {
+        Ok(models) => models,
+        Err(error) => {
+            return Ok(failed_before_mutation_report(
+                &config_path,
+                &auth_path,
+                &catalog_path,
+                Vec::new(),
+                default_model.trim().to_owned(),
+                codex_was_running,
+                None,
+                &error.into(),
+            ));
+        }
+    };
+    let default_model = default_model.trim().to_owned();
+    if let Err(error) = validate_codex_default(&selected_models, &default_model) {
+        return Ok(failed_before_mutation_report(
+            &config_path,
+            &auth_path,
+            &catalog_path,
+            selected_models,
+            default_model,
+            codex_was_running,
+            None,
+            &error.into(),
+        ));
+    }
+
+    let prepared = (|| -> Result<(Preimage, Vec<u8>, Vec<u8>, Vec<u8>), ProviderWriteError> {
         if api_key.trim().is_empty() {
             return Err(ProviderWriteError::EmptyKey);
         }
         reject_symlink(&config_path)?;
         reject_symlink(&auth_path)?;
+        reject_symlink(&catalog_path)?;
         #[cfg(test)]
         if _fault == ProviderWriteFault::BeforePreimageRead {
             return Err(ProviderWriteError::Io);
         }
-        Ok(Preimage {
+        let preimage = Preimage {
             config: read_optional(&config_path)?,
             auth: read_optional(&auth_path)?,
-        })
+            catalog: read_optional(&catalog_path)?,
+        };
+        let config = merge_codex_config(
+            preimage.config.as_deref(),
+            base_url,
+            &catalog_path,
+            &default_model,
+        )?;
+        let auth = merge_codex_auth(preimage.auth.as_deref(), api_key)?;
+        let catalog = build_model_catalog(&selected_models)?;
+        Ok((preimage, config, auth, catalog))
     })();
-    let preimage = match preimage {
-        Ok(preimage) => preimage,
+    let (preimage, config_bytes, auth_bytes, catalog_bytes) = match prepared {
+        Ok(prepared) => prepared,
         Err(error) => {
             return Ok(failed_before_mutation_report(
                 &config_path,
                 &auth_path,
+                &catalog_path,
+                selected_models,
+                default_model,
                 codex_was_running,
                 None,
                 &error,
@@ -304,6 +427,9 @@ fn write_provider_files_with_permit(
     let mut report = report_base(
         &config_path,
         &auth_path,
+        &catalog_path,
+        selected_models,
+        default_model,
         codex_was_running,
         Some(backup_string),
     );
@@ -314,16 +440,10 @@ fn write_provider_files_with_permit(
         return Ok(report);
     }
 
-    let config_bytes = provider_config().into_bytes();
-    let auth_bytes = match auth_template(api_key) {
-        Ok(bytes) => bytes,
-        Err(_) => {
-            report.error_code = Some(ProviderWriteError::Io.code().into());
-            return Ok(report);
-        }
-    };
     let mutation_result = (|| -> Result<(), ProviderWriteError> {
         replace_durable(&config_path, &config_bytes, false).map_err(|_| ProviderWriteError::Io)?;
+        replace_durable(&catalog_path, &catalog_bytes, false)
+            .map_err(|_| ProviderWriteError::Io)?;
         #[cfg(test)]
         if _fault == ProviderWriteFault::BeforeAuthReplace {
             return Err(ProviderWriteError::Io);
@@ -336,7 +456,15 @@ fn write_provider_files_with_permit(
         ) {
             fs::write(&auth_path, b"{}").map_err(|_| ProviderWriteError::Io)?;
         }
-        verify_written(&config_path, &auth_path, &config_bytes, api_key)
+        verify_written(
+            &config_path,
+            &auth_path,
+            &catalog_path,
+            &config_bytes,
+            &auth_bytes,
+            &catalog_bytes,
+            api_key,
+        )
     })();
 
     match mutation_result {
@@ -353,8 +481,8 @@ fn write_provider_files_with_permit(
             let rollback = if force_rollback_failure {
                 false
             } else {
-                restore_preimage(&config_path, &auth_path, &preimage).is_ok()
-                    && verify_preimage(&config_path, &auth_path, &preimage)
+                restore_preimage(&config_path, &auth_path, &catalog_path, &preimage).is_ok()
+                    && verify_preimage(&config_path, &auth_path, &catalog_path, &preimage)
             };
             report.outcome = if rollback {
                 ProviderWriteOutcome::Restored
@@ -381,15 +509,6 @@ pub fn read_local_api_key_at(codex_home: &Path) -> Option<String> {
         .as_str()
         .filter(|value| !value.is_empty())
         .map(str::to_owned)
-}
-
-fn auth_template(api_key: &str) -> Result<Vec<u8>, serde_json::Error> {
-    let mut object = serde_json::Map::new();
-    object.insert(
-        "OPENAI_API_KEY".into(),
-        serde_json::Value::String(api_key.into()),
-    );
-    serde_json::to_vec_pretty(&serde_json::Value::Object(object))
 }
 
 fn acquire_lock(backup_root: &Path) -> Result<ProviderLock, ProviderWriteError> {
@@ -436,6 +555,9 @@ fn create_backup(backup_root: &Path, backup_dir: &Path, preimage: &Preimage) -> 
     if let Some(bytes) = &preimage.auth {
         write_private_durable(&backup_dir.join("auth.json"), bytes)?;
     }
+    if let Some(bytes) = &preimage.catalog {
+        write_durable(&backup_dir.join(CATALOG_NAME), bytes)?;
+    }
     let manifest = BackupManifest {
         version: 1,
         created_at_unix_ms: unix_millis(),
@@ -449,6 +571,11 @@ fn create_backup(backup_root: &Path, backup_dir: &Path, preimage: &Preimage) -> 
                 name: "auth.json",
                 existed: preimage.auth.is_some(),
                 sha256: preimage.auth.as_deref().map(sha256_hex),
+            },
+            BackupEntry {
+                name: CATALOG_NAME,
+                existed: preimage.catalog.is_some(),
+                sha256: preimage.catalog.as_deref().map(sha256_hex),
             },
         ],
     };
@@ -518,16 +645,25 @@ fn replace_durable(path: &Path, bytes: &[u8], private: bool) -> io::Result<()> {
 fn verify_written(
     config_path: &Path,
     auth_path: &Path,
+    catalog_path: &Path,
     expected_config: &[u8],
+    expected_auth: &[u8],
+    expected_catalog: &[u8],
     api_key: &str,
 ) -> Result<(), ProviderWriteError> {
     if fs::read(config_path).map_err(|_| ProviderWriteError::Io)? != expected_config {
         return Err(ProviderWriteError::Io);
     }
+    let auth_bytes = fs::read(auth_path).map_err(|_| ProviderWriteError::Io)?;
+    if auth_bytes != expected_auth {
+        return Err(ProviderWriteError::Io);
+    }
     let auth: serde_json::Value =
-        serde_json::from_slice(&fs::read(auth_path).map_err(|_| ProviderWriteError::Io)?)
-            .map_err(|_| ProviderWriteError::Io)?;
+        serde_json::from_slice(&auth_bytes).map_err(|_| ProviderWriteError::Io)?;
     if auth.get("OPENAI_API_KEY").and_then(|value| value.as_str()) != Some(api_key) {
+        return Err(ProviderWriteError::Io);
+    }
+    if fs::read(catalog_path).map_err(|_| ProviderWriteError::Io)? != expected_catalog {
         return Err(ProviderWriteError::Io);
     }
     Ok(())
@@ -536,10 +672,12 @@ fn verify_written(
 fn restore_preimage(
     config_path: &Path,
     auth_path: &Path,
+    catalog_path: &Path,
     preimage: &Preimage,
 ) -> Result<(), ProviderWriteError> {
     restore_one(config_path, preimage.config.as_deref(), false)?;
     restore_one(auth_path, preimage.auth.as_deref(), true)?;
+    restore_one(catalog_path, preimage.catalog.as_deref(), false)?;
     Ok(())
 }
 
@@ -557,9 +695,15 @@ fn restore_one(path: &Path, bytes: Option<&[u8]>, private: bool) -> Result<(), P
     }
 }
 
-fn verify_preimage(config_path: &Path, auth_path: &Path, preimage: &Preimage) -> bool {
+fn verify_preimage(
+    config_path: &Path,
+    auth_path: &Path,
+    catalog_path: &Path,
+    preimage: &Preimage,
+) -> bool {
     read_optional(config_path).ok() == Some(preimage.config.clone())
         && read_optional(auth_path).ok() == Some(preimage.auth.clone())
+        && read_optional(catalog_path).ok() == Some(preimage.catalog.clone())
 }
 
 #[cfg(target_os = "windows")]
@@ -597,6 +741,9 @@ fn replace_file(source: &Path, destination: &Path) -> io::Result<()> {
 fn report_base(
     config_path: &Path,
     auth_path: &Path,
+    catalog_path: &Path,
+    selected_models: Vec<String>,
+    default_model: String,
     codex_was_running: bool,
     backup_dir: Option<String>,
 ) -> ProviderWriteReport {
@@ -605,6 +752,9 @@ fn report_base(
         backup_dir,
         config_path: config_path.to_string_lossy().into_owned(),
         auth_path: auth_path.to_string_lossy().into_owned(),
+        catalog_path: catalog_path.to_string_lossy().into_owned(),
+        selected_models,
+        default_model,
         codex_was_running,
         write_verified: false,
         rollback_verified: false,
@@ -615,11 +765,22 @@ fn report_base(
 fn failed_before_mutation_report(
     config_path: &Path,
     auth_path: &Path,
+    catalog_path: &Path,
+    selected_models: Vec<String>,
+    default_model: String,
     codex_was_running: bool,
     backup_dir: Option<String>,
     error: &ProviderWriteError,
 ) -> ProviderWriteReport {
-    let mut report = report_base(config_path, auth_path, codex_was_running, backup_dir);
+    let mut report = report_base(
+        config_path,
+        auth_path,
+        catalog_path,
+        selected_models,
+        default_model,
+        codex_was_running,
+        backup_dir,
+    );
     report.error_code = Some(error.code().into());
     report
 }
@@ -720,6 +881,8 @@ mod tests {
 
     use super::*;
 
+    const OLD_CONFIG: &str = "# old config\nmodel = \"old\"\n";
+
     fn test_root(name: &str) -> PathBuf {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("target")
@@ -736,7 +899,7 @@ mod tests {
             backup_root: root.join("backups"),
         };
         fs::create_dir_all(&paths.codex_home).unwrap();
-        fs::write(paths.codex_home.join("config.toml"), "old-config").unwrap();
+        fs::write(paths.codex_home.join("config.toml"), OLD_CONFIG).unwrap();
         fs::write(
             paths.codex_home.join("auth.json"),
             r#"{"OPENAI_API_KEY":"old"}"#,
@@ -774,22 +937,190 @@ mod tests {
     }
 
     #[test]
-    fn replaces_both_files_after_durable_backup_and_verification() {
+    fn model_import_commits_three_verified_files_and_preserves_user_config() {
+        let root = test_root("provider-model-commit");
+        let paths = ProviderPaths {
+            codex_home: root.join(".codex"),
+            backup_root: root.join("backups"),
+        };
+        fs::create_dir_all(&paths.codex_home).unwrap();
+        fs::write(
+            paths.codex_home.join("config.toml"),
+            b"# user\n[features]\ngoals = false\n",
+        )
+        .unwrap();
+        fs::write(
+            paths.codex_home.join("auth.json"),
+            br#"{"tokens":{"keep":true}}"#,
+        )
+        .unwrap();
+
+        let report = write_model_provider_files_at(
+            &paths,
+            "secret-key",
+            &["deepseek-v3".into(), "gpt-5.5".into()],
+            "deepseek-v3",
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(report.outcome, ProviderWriteOutcome::Committed);
+        assert!(report.write_verified);
+        assert_eq!(report.selected_models, vec!["deepseek-v3", "gpt-5.5"]);
+        assert_eq!(report.default_model, "deepseek-v3");
+        assert_eq!(
+            PathBuf::from(&report.catalog_path),
+            paths
+                .codex_home
+                .canonicalize()
+                .unwrap()
+                .join("app-manager-model-catalog.json")
+        );
+        let config = fs::read_to_string(paths.codex_home.join("config.toml")).unwrap();
+        assert!(config.contains("# user\n"));
+        assert!(config.contains("[features]\ngoals = false\n"));
+        assert!(config.contains("model = \"deepseek-v3\""));
+        let catalog: serde_json::Value = serde_json::from_slice(
+            &fs::read(paths.codex_home.join("app-manager-model-catalog.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(catalog["models"][0]["slug"], "deepseek-v3");
+        let auth: serde_json::Value =
+            serde_json::from_slice(&fs::read(paths.codex_home.join("auth.json")).unwrap()).unwrap();
+        assert_eq!(auth["OPENAI_API_KEY"], "secret-key");
+        assert_eq!(auth["tokens"]["keep"], true);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn model_import_can_bind_codex_to_the_local_opencodex_proxy() {
+        let (root, paths) = fixture("provider-opencodex-base-url");
+        let report = write_model_provider_files_with_base_url(
+            begin_provider_write_at(&paths).unwrap(),
+            "secret-key",
+            &["gpt-5.5".into()],
+            "gpt-5.5",
+            false,
+            "http://127.0.0.1:10100/v1",
+        )
+        .unwrap();
+        assert_eq!(report.outcome, ProviderWriteOutcome::Committed);
+        let config = fs::read_to_string(paths.codex_home.join("config.toml")).unwrap();
+        assert!(config.contains("openai_base_url = \"http://127.0.0.1:10100/v1\""));
+        assert!(!config.contains("secret-key"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn model_import_rolls_back_all_three_preimages_and_records_them() {
+        let root = test_root("provider-model-rollback");
+        let paths = ProviderPaths {
+            codex_home: root.join(".codex"),
+            backup_root: root.join("backups"),
+        };
+        fs::create_dir_all(&paths.codex_home).unwrap();
+        let config_before = b"# before\nmodel = \"old\"\n";
+        let auth_before = br#"{"OPENAI_API_KEY":"old","keep":true}"#;
+        let catalog_before = br#"{"models":[{"slug":"old"}]}"#;
+        fs::write(paths.codex_home.join("config.toml"), config_before).unwrap();
+        fs::write(paths.codex_home.join("auth.json"), auth_before).unwrap();
+        fs::write(
+            paths.codex_home.join("app-manager-model-catalog.json"),
+            catalog_before,
+        )
+        .unwrap();
+
+        let report = write_model_provider_files_at_with_fault(
+            &paths,
+            "secret-key",
+            &["gpt-5.5".into()],
+            "gpt-5.5",
+            true,
+            ProviderWriteFault::BeforeAuthReplace,
+        )
+        .unwrap();
+
+        assert_eq!(report.outcome, ProviderWriteOutcome::Restored);
+        assert!(report.rollback_verified);
+        assert_eq!(
+            fs::read(paths.codex_home.join("config.toml")).unwrap(),
+            config_before
+        );
+        assert_eq!(
+            fs::read(paths.codex_home.join("auth.json")).unwrap(),
+            auth_before
+        );
+        assert_eq!(
+            fs::read(paths.codex_home.join("app-manager-model-catalog.json")).unwrap(),
+            catalog_before
+        );
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &fs::read(PathBuf::from(report.backup_dir.unwrap()).join("manifest.json")).unwrap(),
+        )
+        .unwrap();
+        let names = manifest["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["name"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec!["config.toml", "auth.json", "app-manager-model-catalog.json"]
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn invalid_model_import_preimage_fails_before_backup() {
+        let root = test_root("provider-model-invalid-preimage");
+        let paths = ProviderPaths {
+            codex_home: root.join(".codex"),
+            backup_root: root.join("backups"),
+        };
+        fs::create_dir_all(&paths.codex_home).unwrap();
+        fs::write(paths.codex_home.join("config.toml"), b"[invalid").unwrap();
+
+        let report = write_model_provider_files_at(
+            &paths,
+            "secret-key",
+            &["gpt-5.5".into()],
+            "gpt-5.5",
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(report.outcome, ProviderWriteOutcome::FailedBeforeMutation);
+        assert_eq!(
+            report.error_code.as_deref(),
+            Some("provider_config_invalid")
+        );
+        assert!(report.backup_dir.is_none());
+        assert_eq!(
+            fs::read(paths.codex_home.join("config.toml")).unwrap(),
+            b"[invalid"
+        );
+        assert!(!paths
+            .codex_home
+            .join("app-manager-model-catalog.json")
+            .exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_write_uses_the_verified_model_transaction() {
         let (root, paths) = fixture("provider-commit");
         let report = write_provider_files_at(&paths, "sk-new", false).unwrap();
         assert_eq!(report.outcome, ProviderWriteOutcome::Committed);
         assert!(report.write_verified);
-        assert_eq!(
-            fs::read_to_string(paths.codex_home.join("config.toml")).unwrap(),
-            provider_config()
-        );
-        assert!(fs::read_to_string(paths.codex_home.join("config.toml"))
-            .unwrap()
-            .contains(&format!("base_url = \"{ORANGE_BASE_URL}/v1\"")));
+        let config = fs::read_to_string(paths.codex_home.join("config.toml")).unwrap();
+        assert!(config.contains("# old config\n"));
+        assert!(config.contains(&format!("openai_base_url = \"{ORANGE_BASE_URL}/v1\"")));
+        assert!(paths.codex_home.join(CATALOG_NAME).is_file());
         let backup = PathBuf::from(report.backup_dir.unwrap());
         assert_eq!(
             fs::read_to_string(backup.join("config.toml")).unwrap(),
-            "old-config"
+            OLD_CONFIG
         );
         assert_eq!(
             read_local_api_key_at(&paths.codex_home).as_deref(),
@@ -915,7 +1246,7 @@ mod tests {
         assert!(report.backup_dir.is_none());
         assert_eq!(
             fs::read_to_string(paths.codex_home.join("config.toml")).unwrap(),
-            "old-config"
+            OLD_CONFIG
         );
         assert_eq!(
             read_local_api_key_at(&paths.codex_home).as_deref(),
@@ -938,7 +1269,7 @@ mod tests {
         assert!(report.rollback_verified);
         assert_eq!(
             fs::read_to_string(paths.codex_home.join("config.toml")).unwrap(),
-            "old-config"
+            OLD_CONFIG
         );
         assert_eq!(
             read_local_api_key_at(&paths.codex_home).as_deref(),
@@ -962,7 +1293,7 @@ mod tests {
         assert!(report.rollback_verified);
         assert_eq!(
             fs::read_to_string(paths.codex_home.join("config.toml")).unwrap(),
-            "old-config"
+            OLD_CONFIG
         );
         assert_eq!(
             read_local_api_key_at(&paths.codex_home).as_deref(),

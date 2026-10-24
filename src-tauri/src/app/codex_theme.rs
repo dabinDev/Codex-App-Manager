@@ -1816,10 +1816,7 @@ fn launch_codex_with_cdp(
         codex_win_engine::LaunchOptions {
             disable_codex_self_updates: disable_self_updates,
             remote_debugging_port: Some(port),
-            locale: locale
-                .map(str::trim)
-                .filter(|l| !l.is_empty())
-                .map(str::to_string),
+            additional_arguments: "",
         },
     )
     .map_err(|e| AppError::Engine(format!("以调试模式打开 Codex 失败: {e}")))

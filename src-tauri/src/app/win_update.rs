@@ -1470,6 +1470,14 @@ fn install_portable_after_stage(
                 Ok(())
             }
             PortableBoundary::BeforeMoveNew { .. } => Ok(()),
+            PortableBoundary::BeforeRollback { .. } => {
+                if let Some(active) = tx.as_mut() {
+                    active
+                        .mark_rollback_started()
+                        .map_err(|e| codex_win_engine::EngineError::Io(e.to_string()))?;
+                }
+                Ok(())
+            }
             PortableBoundary::AfterMoveNew { .. } => {
                 if let Some(active) = tx.as_mut() {
                     active
@@ -1496,7 +1504,7 @@ fn install_portable_after_stage(
         engine_err(err)
     })?;
     if let Some(active) = tx.take() {
-        active.succeed()?;
+        let _ = active.succeed();
     }
     if let Some(hook) = phase {
         hook(OperationPhase::Finishing);
@@ -1692,12 +1700,18 @@ pub fn launch_codex(settings: &AppSettings) -> Result<(), AppError> {
     }
     let path = &installed.path;
     log::info!("Windows launch Codex path={path}");
+    let additional_arguments = settings
+        .locale
+        .as_deref()
+        .filter(|locale| !locale.trim().is_empty())
+        .map(|locale| format!("--lang={locale}"))
+        .unwrap_or_default();
     codex_win_engine::launch_codex_with_options(
         &installed,
         codex_win_engine::LaunchOptions {
             disable_codex_self_updates: settings.disable_codex_self_updates,
             remote_debugging_port: None,
-            locale: settings.locale.clone(),
+            additional_arguments: &additional_arguments,
         },
     )
     .map_err(|e| AppError::Engine(e.to_string()))

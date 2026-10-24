@@ -10,12 +10,12 @@ use crate::capability::WinCapabilityReport;
 use crate::capability::{CapabilityCheck, CapabilityState};
 use crate::limits::MAX_TEXT_BYTES;
 use crate::msix::parse_appx_manifest_xml;
-use crate::network::{is_schannel_revocation_offline, NetworkConfig, SchannelRevocationCheck};
+use crate::network::{is_schannel_revocation_check_failure, NetworkConfig, SchannelRevocationCheck};
 use crate::process::{
-    curl_exe, hidden_command, run_capturing, spawn_and_require_liveness, LivenessResult,
-    RunError, RunLimits, TimeoutKind, MSIX_ACTIVATION_WINDOW_SECS, MSIX_LIVENESS_WINDOW_SECS,
-    PORTABLE_LIVENESS_WINDOW,
+    curl_exe, hidden_command, run_capturing, LivenessResult, RunLimits, PORTABLE_LIVENESS_WINDOW,
 };
+#[cfg(windows)]
+use crate::process::{RunError, TimeoutKind, MSIX_ACTIVATION_WINDOW_SECS, MSIX_LIVENESS_WINDOW_SECS};
 use crate::EngineError;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,19 +35,47 @@ pub struct InstalledWindowsCodex {
     pub installed_at: Option<u64>,
 }
 
-// Not `Copy`: `locale` is an owned `String`. Every call site constructs a
-// `LaunchOptions` and passes it straight into `launch_codex_with_options` by
-// value with no reuse, so move semantics are sufficient.
-#[derive(Debug, Clone, Default)]
-pub struct LaunchOptions {
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LaunchOptions<'a> {
     pub disable_codex_self_updates: bool,
     /// Start Electron's loopback DevTools endpoint for renderer theme injection.
     /// `None` preserves the ordinary launch path.
     pub remote_debugging_port: Option<u16>,
-    /// Set Chromium and the native-menu locale. The renderer's React catalog is
-    /// controlled separately through Codex's official `localeOverride` setting.
-    /// `None` follows the system locale on the ordinary launch path.
-    pub locale: Option<String>,
+    pub additional_arguments: &'a str,
+}
+
+pub fn validate_launch_arguments(arguments: &str) -> Result<(), EngineError> {
+    // No shell is involved. Keep quoting and backslashes verbatim for Windows.
+    if arguments.encode_utf16().count() > 16_384 || arguments.chars().any(|ch| ch.is_control()) {
+        return Err(EngineError::Io(
+            "Codex 启动参数不能包含换行或控制字符，且不能超过 16384 个字符".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn apply_launch_arguments(
+    command: &mut std::process::Command,
+    arguments: &str,
+) -> Result<(), EngineError> {
+    validate_launch_arguments(arguments)?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        if !arguments.is_empty() {
+            command.raw_arg(arguments);
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = command;
+        if !arguments.is_empty() {
+            return Err(EngineError::Io(
+                "Windows launch arguments are unavailable on this platform".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 const CODEX_SELF_UPDATE_ENV_KEY: &str = "CODEX_SPARKLE_ENABLED";
@@ -58,11 +86,6 @@ fn remote_debugging_arguments(port: u16) -> [String; 2] {
         "--remote-debugging-address=127.0.0.1".to_string(),
         format!("--remote-debugging-port={port}"),
     ]
-}
-
-/// Chromium's language-override switch for Chromium surfaces and native menus.
-fn lang_argument(locale: &str) -> String {
-    format!("--lang={locale}")
 }
 
 #[derive(Debug, Deserialize)]
@@ -77,7 +100,10 @@ struct RegisteredMsixApp {
 fn registered_msix_aumid(json: &str, expected_family: &str) -> Result<String, EngineError> {
     let entry: RegisteredMsixApp = serde_json::from_str(json)
         .map_err(|e| EngineError::Io(format!("parse registered MSIX app entry: {e}")))?;
-    if !entry.package_family_name.eq_ignore_ascii_case(expected_family) {
+    if !entry
+        .package_family_name
+        .eq_ignore_ascii_case(expected_family)
+    {
         return Err(EngineError::Io(format!(
             "registered MSIX package family changed: expected {expected_family}, got {}",
             entry.package_family_name
@@ -134,8 +160,8 @@ pub struct MsixRemoveReport {
 /// yet fail to launch, which is exactly the failure users hit. We verify the
 /// package is registered, its Status is Ok, the app entry (AUMID) resolves,
 /// every declared framework dependency is present, **and** a real shell
-/// activation leaves a process under the install location. When any of these
-/// fail the caller removes the package and falls back to the portable build.
+/// activation opens a stable main window without a startup error dialog. When
+/// these fail the caller verifies a portable fallback before removing the MSIX.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MsixHealthReport {
@@ -153,14 +179,15 @@ pub struct MsixHealthReport {
     /// Declared framework dependencies that are NOT installed on this machine —
     /// the usual reason an MSIX installs but won't launch on a stripped Windows.
     pub missing_dependencies: Vec<String>,
-    /// Shell activation succeeded and a process under the package install
-    /// location stayed alive for the liveness window.
+    /// Shell activation succeeded and the main window under the package install
+    /// location stayed ready without a startup dialog for the settling window.
     #[serde(default)]
     pub activation_ok: bool,
     /// Machine-stable failure class for UI / fallback routing. Empty when healthy.
     /// Values: `not-registered` | `status-bad` | `aumid-unresolved` |
     /// `missing-dependencies` | `activation-failed` | `immediate-exit` |
-    /// `timeout` | `probe-failed` | `policy` | `cleanup-failed`.
+    /// `timeout` | `probe-failed` | `policy` | `cleanup-failed` |
+    /// `startup-dialog` | `main-window-timeout`.
     #[serde(default)]
     pub failure_kind: String,
     /// Human-facing reason when unhealthy; empty when healthy.
@@ -179,6 +206,8 @@ pub mod msix_failure {
     pub const PROBE_FAILED: &str = "probe-failed";
     pub const POLICY: &str = "policy";
     pub const CLEANUP_FAILED: &str = "cleanup-failed";
+    pub const STARTUP_DIALOG: &str = "startup-dialog";
+    pub const MAIN_WINDOW_TIMEOUT: &str = "main-window-timeout";
 }
 
 /// Result of the framework-dependency PRE-check run BEFORE attempting an MSIX
@@ -224,6 +253,9 @@ fn fetch_text_output(
     let max_text = MAX_TEXT_BYTES.to_string();
     let mut command = hidden_command(curl_exe());
     network.apply_to_command_with_schannel_revocation(&mut command, revocation_check);
+    if crate::github_rate_limit::is_github_api(url) {
+        command.arg("--include");
+    }
     command.args([
         "-fsSL",
         "--proto",
@@ -240,24 +272,53 @@ fn fetch_text_output(
     ]);
     // curl's own --max-time is the primary budget; the outer deadline is a
     // backstop that also kills a hung curl that ignored max-time.
-    run_capturing(command, RunLimits::total(std::time::Duration::from_secs(75)), None)
-        .map_err(|e| EngineError::Io(format!("curl: {}", e.message())))
+    run_capturing(
+        command,
+        RunLimits::total(std::time::Duration::from_secs(75)),
+        None,
+    )
+    .map_err(|e| EngineError::Io(format!("curl: {}", e.message())))
 }
 
 pub fn fetch_text_with_network(url: &str, network: &NetworkConfig) -> Result<String, EngineError> {
+    fetch_text_with_output(url, network, fetch_text_output)
+}
+
+fn fetch_text_with_output(
+    url: &str,
+    network: &NetworkConfig,
+    mut fetch_output: impl FnMut(&str, &NetworkConfig, SchannelRevocationCheck) -> Result<std::process::Output, EngineError>,
+) -> Result<String, EngineError> {
+    let github_api = crate::github_rate_limit::is_github_api(url);
+    let route = github_api.then(|| network.curl_proxy_args());
+    if let Some(deadline) = route.as_ref().and_then(|args| crate::github_rate_limit::blocked_until(args)) {
+        return Err(EngineError::Io(crate::github_rate_limit::message(deadline)));
+    }
     let source = url_host(url);
     log::debug!("fetch Windows text source={source}");
-    let mut output = fetch_text_output(url, network, SchannelRevocationCheck::Strict)?;
+    let mut output = fetch_output(url, network, SchannelRevocationCheck::Strict)?;
     let should_retry_without_revocation = {
         let stderr = String::from_utf8_lossy(&output.stderr);
         !output.status.success()
-            && is_schannel_revocation_offline(output.status.code(), stderr.as_ref())
+            && is_schannel_revocation_check_failure(output.status.code(), stderr.as_ref())
     };
     if should_retry_without_revocation {
         log::warn!(
             "Windows curl Schannel revocation check failed; retrying with --ssl-no-revoke source={source}"
         );
-        output = fetch_text_output(url, network, SchannelRevocationCheck::Disabled)?;
+        output = fetch_output(url, network, SchannelRevocationCheck::Disabled)?;
+    }
+
+    if github_api {
+        if let Some(response) = crate::github_rate_limit::response(&output.stdout) {
+            if let Some(deadline) = response.retry_at(crate::github_rate_limit::unix_now()) {
+                crate::github_rate_limit::remember(route.unwrap_or_default(), deadline);
+                return Err(EngineError::Io(crate::github_rate_limit::message(deadline)));
+            }
+            output.stdout = response.body.to_vec();
+        } else if output.status.success() {
+            return Err(EngineError::Io("invalid GitHub API response headers".to_string()));
+        }
     }
 
     if !output.status.success() {
@@ -265,6 +326,7 @@ pub fn fetch_text_with_network(url: &str, network: &NetworkConfig) -> Result<Str
             url,
             output.status.code(),
             &String::from_utf8_lossy(&output.stderr),
+            network,
         ));
         log::warn!("fetch Windows text failed source={source} error={err}");
         return Err(err);
@@ -282,7 +344,12 @@ pub fn fetch_text_with_network(url: &str, network: &NetworkConfig) -> Result<Str
     Ok(text)
 }
 
-fn curl_failure_message(url: &str, exit_code: Option<i32>, stderr: &str) -> String {
+fn curl_failure_message(
+    url: &str,
+    exit_code: Option<i32>,
+    stderr: &str,
+    network: &NetworkConfig,
+) -> String {
     let base = format!(
         "curl failed for host={} exit={}: stderr='{}'",
         url_host(url),
@@ -294,7 +361,7 @@ fn curl_failure_message(url: &str, exit_code: Option<i32>, stderr: &str) -> Stri
     // Append the proxy diagnostic only for connectivity failures — pasting it
     // onto write / disk / HTTP errors (e.g. exit 23) only misleads.
     if is_connectivity_exit(exit_code) {
-        format!("{base}; {}", proxy_env_summary())
+        format!("{base}; {}", proxy_env_summary(network))
     } else {
         base
     }
@@ -333,25 +400,66 @@ fn url_host(url: &str) -> &str {
         .unwrap_or("")
 }
 
-fn proxy_env_summary() -> String {
+fn proxy_env_summary(network: &NetworkConfig) -> String {
     let vars = ["HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "NO_PROXY"];
     let configured = vars
         .iter()
         .filter(|name| std::env::var_os(name).is_some())
         .copied()
         .collect::<Vec<_>>();
-    if configured.is_empty() {
-        "no curl proxy environment variables are set; Windows system proxy/PAC may not be used automatically".to_string()
+    let env = if configured.is_empty() {
+        "no curl proxy environment variables set".to_string()
     } else {
         format!(
             "curl proxy environment variables set: {}",
             configured.join(", ")
         )
-    }
+    };
+    format!("{env}; proxy mode: {}", network.proxy_summary())
 }
 
 pub fn detect_installed_codex(portable_root: &Path) -> Option<InstalledWindowsCodex> {
     detect_msix_install().or_else(|| detect_portable_install(portable_root))
+}
+
+#[cfg(any(windows, test))]
+fn parse_registered_msix_package_full_name(output: &str) -> Result<Option<String>, EngineError> {
+    let trimmed = output.trim();
+    if trimmed.is_empty() || trimmed == "null" {
+        return Ok(None);
+    }
+    let value: String = serde_json::from_str(trimmed)
+        .map_err(|e| EngineError::Io(format!("parse registered MSIX package full name: {e}")))?;
+    let value = value.trim();
+    Ok((!value.is_empty()).then(|| value.to_string()))
+}
+
+/// Exact PackageFullName of the currently registered Codex MSIX. Historical
+/// policy recovery compares this signed-package identity with the durable target
+/// recorded immediately before Add-AppxPackage, rather than guessing from the
+/// human-facing app version inside app.asar.
+#[cfg(windows)]
+pub fn registered_msix_package_full_name() -> Result<Option<String>, EngineError> {
+    let script = format!(
+        r#"
+$p = Get-AppxPackage -Name {name} -ErrorAction SilentlyContinue |
+  Sort-Object -Property Version -Descending |
+  Select-Object -First 1
+if ($null -eq $p) {{
+  'null'
+}} else {{
+  [string]$p.PackageFullName | ConvertTo-Json -Compress
+}}
+"#,
+        name = ps_quote(crate::OPENAI_PACKAGE_IDENTITY),
+    );
+    let output = run_powershell_json(&script)?;
+    parse_registered_msix_package_full_name(&output)
+}
+
+#[cfg(not(windows))]
+pub fn registered_msix_package_full_name() -> Result<Option<String>, EngineError> {
+    Ok(None)
 }
 
 #[cfg(windows)]
@@ -422,7 +530,13 @@ fn run_powershell_json_with_limits(
     limits: RunLimits,
 ) -> Result<String, PowerShellRunError> {
     let mut command = hidden_command(powershell_exe());
-    command.args(["-NoProfile", "-NonInteractive", "-Command", script]);
+    // Windows PowerShell otherwise writes the inherited/OEM console encoding.
+    // CLM may forbid changing Console.OutputEncoding; keep that environment
+    // supported and decode its code page below instead of corrupting Chinese.
+    let script = format!(
+        "try {{ [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false) }} catch {{ }}\n{script}"
+    );
+    command.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
     let output = run_capturing(command, limits, None).map_err(|e| match e {
         RunError::Timeout { kind, .. } => PowerShellRunError::Timeout(kind),
         other => PowerShellRunError::Other(format!("powershell: {}", other.message())),
@@ -430,10 +544,59 @@ fn run_powershell_json_with_limits(
     if !output.status.success() {
         return Err(PowerShellRunError::Other(format!(
             "powershell failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
+            decode_powershell_output(&output.stderr)?.trim()
         )));
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    Ok(decode_powershell_output(&output.stdout)?.trim().to_string())
+}
+
+#[cfg(windows)]
+fn decode_powershell_output(bytes: &[u8]) -> Result<String, PowerShellRunError> {
+    use windows_sys::Win32::{Globalization::GetOEMCP, System::Console::GetConsoleOutputCP};
+    let console_cp = unsafe { GetConsoleOutputCP() };
+    let code_page = if console_cp == 0 {
+        unsafe { GetOEMCP() }
+    } else {
+        console_cp
+    };
+    decode_powershell_bytes(bytes, code_page).map_err(PowerShellRunError::Other)
+}
+
+#[cfg(windows)]
+fn decode_powershell_bytes(bytes: &[u8], code_page: u32) -> Result<String, String> {
+    use windows_sys::Win32::Globalization::{MultiByteToWideChar, MB_ERR_INVALID_CHARS};
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        return Ok(text.trim_start_matches('\u{feff}').to_string());
+    }
+    let len = i32::try_from(bytes.len()).map_err(|_| "PowerShell output too large")?;
+    let required = unsafe {
+        MultiByteToWideChar(
+            code_page,
+            MB_ERR_INVALID_CHARS,
+            bytes.as_ptr(),
+            len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if required == 0 {
+        return Err("PowerShell output has an unsupported encoding".to_string());
+    }
+    let mut wide = vec![0; required as usize];
+    let written = unsafe {
+        MultiByteToWideChar(
+            code_page,
+            MB_ERR_INVALID_CHARS,
+            bytes.as_ptr(),
+            len,
+            wide.as_mut_ptr(),
+            required,
+        )
+    };
+    if written != required {
+        return Err("Could not decode PowerShell output".to_string());
+    }
+    String::from_utf16(&wide).map_err(|_| "Invalid UTF-16 in PowerShell output".to_string())
 }
 
 // Plain hashtables keep the same JSON contract as PSCustomObject without using
@@ -486,8 +649,7 @@ fn parse_offline_appx_conflict_probe(
 fn validated_delivery_optimization_file_id(value: Option<String>) -> String {
     let value = value.unwrap_or_default();
     if value.is_empty()
-        || ((40..=128).contains(&value.len())
-            && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        || ((40..=128).contains(&value.len()) && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
     {
         return value;
     }
@@ -610,7 +772,7 @@ if ($null -eq $activeDeployment) {{
 #[cfg(windows)]
 fn base64_encode(bytes: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut encoded = String::with_capacity(((bytes.len() + 2) / 3) * 4);
+    let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
         let first = chunk[0];
         let second = chunk.get(1).copied().unwrap_or(0);
@@ -632,7 +794,7 @@ fn base64_encode(bytes: &[u8]) -> String {
 }
 
 #[cfg(windows)]
-fn encode_powershell_command(script: &str) -> String {
+pub(crate) fn encode_powershell_command(script: &str) -> String {
     let bytes = script
         .encode_utf16()
         .flat_map(|unit| unit.to_le_bytes())
@@ -644,6 +806,7 @@ fn encode_powershell_command(script: &str) -> String {
 /// executable script is written to a user-writable directory; temporary paths
 /// are one-way state markers shared with the elevated watchdogs.
 #[cfg(windows)]
+#[allow(clippy::too_many_arguments)] // Explicit fields are interpolated into a fixed recovery script.
 fn offline_appx_recovery_script(
     package_moniker: &str,
     activity_id: &str,
@@ -1039,8 +1202,7 @@ pub fn install_msix_sideload_with_observer(
     // Windows Update Stage transaction, narrowly release it and immediately
     // submit our local MSIX. The guard restores any paused services on every
     // return path, including Add-AppxPackage timeout/failure.
-    let _restore_guard =
-        prepare_offline_appx_install(package_moniker, recovery_outcome_ambiguous)?;
+    let _restore_guard = prepare_offline_appx_install(package_moniker, recovery_outcome_ambiguous)?;
     let script = install_msix_script(path);
     // Everything above is pre-package-mutation. An optional elevated recovery
     // may have paused services, but its own watchdog restores them. The app
@@ -1410,19 +1572,101 @@ pub fn verify_msix_health() -> MsixHealthReport {
     verify_msix_health_with_options(false)
 }
 
+#[cfg(any(windows, test))]
+#[derive(Debug)]
+struct MsixStartupFailure {
+    kind: &'static str,
+    detail: String,
+}
+
+#[cfg(any(windows, test))]
+fn finish_msix_startup_probe(
+    startup: Result<(), MsixStartupFailure>,
+    keep_running: bool,
+    cleanup: impl FnOnce() -> Result<(), String>,
+) -> Result<(), MsixStartupFailure> {
+    if keep_running && startup.is_ok() {
+        return startup;
+    }
+    match (startup, cleanup()) {
+        (Ok(()), Err(detail)) => Err(MsixStartupFailure {
+            kind: msix_failure::CLEANUP_FAILED,
+            detail,
+        }),
+        (Err(mut failure), Err(cleanup)) => {
+            failure
+                .detail
+                .push_str(&format!("; cleanup also failed: {cleanup}"));
+            Err(failure)
+        }
+        (result, Ok(())) => result,
+    }
+}
+
 #[cfg(windows)]
-pub fn verify_msix_health_with_options(keep_running: bool) -> MsixHealthReport {
-    log::info!("MSIX health check start");
-    // Activation is the expensive step — budget deps probe + cold-start window +
-    // continuous liveness + cleanup + slack.
-    let limits = RunLimits::total(std::time::Duration::from_secs(
-        60 + MSIX_ACTIVATION_WINDOW_SECS + MSIX_LIVENESS_WINDOW_SECS + 30,
-    ));
-    let script = format!(
+fn wait_for_msix_startup(root: &Path) -> Result<(), MsixStartupFailure> {
+    use std::time::{Duration, Instant};
+    let started = Instant::now();
+    let mut progress = crate::startup_window::StartupProgress::default();
+    let mut saw_process = false;
+    loop {
+        let (running, window) =
+            crate::windows_process::startup_window_for_root(root).map_err(|err| {
+                MsixStartupFailure {
+                    kind: msix_failure::PROBE_FAILED,
+                    detail: err.to_string(),
+                }
+            })?;
+        saw_process |= running;
+        if progress
+            .observe(
+                started.elapsed(),
+                &window,
+                Duration::from_secs(MSIX_LIVENESS_WINDOW_SECS),
+            )
+            .map_err(|detail| MsixStartupFailure {
+                kind: msix_failure::STARTUP_DIALOG,
+                detail,
+            })?
+        {
+            return Ok(());
+        }
+        if started.elapsed() >= Duration::from_secs(MSIX_ACTIVATION_WINDOW_SECS) {
+            let (kind, detail) = if running {
+                (
+                    msix_failure::MAIN_WINDOW_TIMEOUT,
+                    "Codex did not open a stable main window within 30 seconds",
+                )
+            } else if saw_process {
+                (
+                    msix_failure::IMMEDIATE_EXIT,
+                    "package process started then exited before its main window was ready",
+                )
+            } else {
+                (
+                    msix_failure::ACTIVATION_FAILED,
+                    "no process under install location after activation",
+                )
+            };
+            return Err(MsixStartupFailure {
+                kind,
+                detail: detail.into(),
+            });
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+#[cfg(windows)]
+fn msix_health_script() -> String {
+    msix_health_script_with_activation(true)
+}
+
+#[cfg(windows)]
+fn msix_health_script_with_activation(activate: bool) -> String {
+    format!(
         r#"
 $ErrorActionPreference = 'SilentlyContinue'
-$activationWindowSecs = {activation_window}
-$livenessWindowSecs = {liveness_window}
 $pkg = Get-AppxPackage -Name {name} |
   Sort-Object -Property Version -Descending |
   Select-Object -First 1
@@ -1448,9 +1692,6 @@ $failureKind = ''
 $activationDetail = ''
 $appId = ''
 $installLoc = ''
-$targetIds = @()
-$activationAttempted = $false
-$keepRunning = {keep_running}
 function Convert-ToVersion($value) {{
   try {{
     $text = [string]$value
@@ -1468,63 +1709,6 @@ function Same-Architecture($package, [string]$required) {{
   if ([string]::IsNullOrWhiteSpace($required) -or $required -eq 'neutral') {{ return $true }}
   $arch = [string]$package.Architecture
   return [string]::IsNullOrWhiteSpace($arch) -or $arch -eq 'Neutral' -or $arch -eq $required
-}}
-# AppX / protected processes often leave Get-Process.Path empty. Fall through
-# MainModule and CIM so a live Codex is not treated as activation-failed.
-function Get-ProcessExePath($p) {{
-  try {{
-    $path = [string]$p.Path
-    if (-not [string]::IsNullOrWhiteSpace($path)) {{ return $path }}
-  }} catch {{}}
-  try {{
-    $path = [string]$p.MainModule.FileName
-    if (-not [string]::IsNullOrWhiteSpace($path)) {{ return $path }}
-  }} catch {{}}
-  try {{
-    $cim = Get-CimInstance -ClassName Win32_Process -Filter ("ProcessId=" + $p.Id) -ErrorAction SilentlyContinue
-    if ($null -ne $cim -and -not [string]::IsNullOrWhiteSpace([string]$cim.ExecutablePath)) {{
-      return [string]$cim.ExecutablePath
-    }}
-  }} catch {{}}
-  return $null
-}}
-function Test-UnderInstall($p, [string]$root) {{
-  if ([string]::IsNullOrWhiteSpace($root)) {{ return $false }}
-  $path = Get-ProcessExePath $p
-  if ([string]::IsNullOrWhiteSpace($path)) {{ return $false }}
-  $full = [string]$path
-  try {{
-    $resolved = [string](Convert-Path -LiteralPath $path -ErrorAction Stop)
-    if (-not [string]::IsNullOrWhiteSpace($resolved)) {{ $full = $resolved }}
-  }} catch {{}}
-  return ($full.Equals($root, [System.StringComparison]::OrdinalIgnoreCase) -or
-          $full.StartsWith($root + '\', [System.StringComparison]::OrdinalIgnoreCase))
-}}
-function Get-PackageProcesses([string]$root) {{
-  $found = @()
-  foreach ($p in @(Get-Process -Name Codex,ChatGPT -ErrorAction SilentlyContinue)) {{
-    if (Test-UnderInstall $p $root) {{ $found += $p }}
-  }}
-  return $found
-}}
-function Stop-PackageProcesses([string]$root, $ids) {{
-  $pendingIds = @($ids)
-  $deadline = (Get-Date).AddSeconds(5)
-  do {{
-    foreach ($id in $pendingIds) {{
-      try {{ Stop-Process -Id $id -Force -ErrorAction SilentlyContinue }} catch {{}}
-    }}
-    foreach ($p in @(Get-PackageProcesses $root)) {{
-      try {{ Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }} catch {{}}
-    }}
-    Start-Sleep -Milliseconds 200
-    $remaining = @(Get-PackageProcesses $root)
-    if ($remaining.Count -eq 0) {{ return $true }}
-    # Electron may replace a process while shutting down. Follow the replacement
-    # PIDs and retry until the bounded cleanup deadline.
-    $pendingIds = @($remaining | ForEach-Object {{ $_.Id }} | Select-Object -Unique)
-  }} while ((Get-Date) -lt $deadline)
-  return (@(Get-PackageProcesses $root).Count -eq 0)
 }}
 try {{
   $manifest = Get-AppxPackageManifest $pkg -ErrorAction Stop
@@ -1566,71 +1750,14 @@ try {{
   }}
 }} catch {{}}
 
-# Real activation: shell-start the AUMID and require a process under InstallLocation
-# for a continuous liveness window aligned with portable. Registration alone is
-# not enough on stripped Windows.
+# Shell activation only submits the launch. Rust observes the actual package
+# windows and performs bounded cleanup after this script returns.
 if ($statusOk -and $aumidResolved -and $missing.Count -eq 0) {{
-  if ([string]::IsNullOrEmpty($appId)) {{ $appId = 'App' }}
   $aumid = [string]$pkg.PackageFamilyName + '!' + $appId
   $installLoc = [string]$pkg.InstallLocation
-  try {{ $installLoc = ([string](Convert-Path -LiteralPath $installLoc -ErrorAction Stop)).TrimEnd('\') }} catch {{}}
-  $activationAttempted = $true
   try {{
-    Start-Process ("shell:AppsFolder\" + $aumid) -ErrorAction Stop | Out-Null
-    $deadline = (Get-Date).AddSeconds($activationWindowSecs)
-    $sawProcess = $false
-    $stillAlive = $false
-    while ((Get-Date) -lt $deadline) {{
-      Start-Sleep -Milliseconds 300
-      $found = @(Get-PackageProcesses $installLoc)
-      if ($found.Count -eq 0) {{ continue }}
-      $sawProcess = $true
-      $targetIds = @($found | ForEach-Object {{ $_.Id }} | Select-Object -Unique)
-      # Continuous survival for $livenessWindowSecs (same bar as portable).
-      $liveDeadline = (Get-Date).AddSeconds($livenessWindowSecs)
-      $continuous = $true
-      while ((Get-Date) -lt $liveDeadline) {{
-        Start-Sleep -Milliseconds 250
-        $alive = @()
-        foreach ($id in $targetIds) {{
-          $p = Get-Process -Id $id -ErrorAction SilentlyContinue
-          if ($null -ne $p) {{ $alive += $p }}
-        }}
-        # Also accept replacements under install root (Electron restarts).
-        if ($alive.Count -eq 0) {{
-          $alive = @(Get-PackageProcesses $installLoc)
-          $targetIds = @($alive | ForEach-Object {{ $_.Id }} | Select-Object -Unique)
-        }}
-        if ($alive.Count -eq 0) {{
-          $continuous = $false
-          break
-        }}
-      }}
-      if ($continuous) {{
-        $stillAlive = $true
-        break
-      }}
-    }}
-    if ($stillAlive) {{
-      $activationOk = $true
-      if (-not $keepRunning) {{
-        if (Stop-PackageProcesses $installLoc $targetIds) {{
-          $targetIds = @()
-        }} else {{
-          # A health check is not successful if it changes a previously-closed
-          # app into a running one. Fail closed so the caller can report/fallback.
-          $activationOk = $false
-          $failureKind = 'cleanup-failed'
-          $activationDetail = 'package process remained running after health-check cleanup'
-        }}
-      }}
-    }} elseif ($sawProcess) {{
-      $failureKind = 'immediate-exit'
-      $activationDetail = 'package process started then exited during the liveness window'
-    }} else {{
-      $failureKind = 'activation-failed'
-      $activationDetail = 'no process under install location after shell activation'
-    }}
+    if ({activate}) {{ Start-Process ("shell:AppsFolder\" + $aumid) -ErrorAction Stop | Out-Null }}
+    $activationOk = $true
   }} catch {{
     $msg = [string]$_.Exception.Message
     $activationDetail = $msg
@@ -1639,11 +1766,6 @@ if ($statusOk -and $aumidResolved -and $missing.Count -eq 0) {{
     }} else {{
       $failureKind = 'activation-failed'
     }}
-  }}
-  # Unhealthy activation must not leave Codex holding package files open for
-  # the subsequent portable fallback / Remove-AppxPackage.
-  if (-not $activationOk -and $activationAttempted) {{
-    $null = Stop-PackageProcesses $installLoc $targetIds
   }}
 }}
 
@@ -1656,21 +1778,39 @@ if ($statusOk -and $aumidResolved -and $missing.Count -eq 0) {{
   activationOk = $activationOk
   failureKind = $failureKind
   activationDetail = $activationDetail
+  installLocation = $installLoc
 }} | ConvertTo-Json -Compress
 "#,
         name = ps_quote(crate::OPENAI_PACKAGE_IDENTITY),
-        activation_window = MSIX_ACTIVATION_WINDOW_SECS,
-        liveness_window = MSIX_LIVENESS_WINDOW_SECS,
-        keep_running = if keep_running { "$true" } else { "$false" }
-    );
+        activate = if activate { "$true" } else { "$false" },
+    )
+}
+
+#[cfg(windows)]
+pub fn verify_msix_health_with_options(keep_running: bool) -> MsixHealthReport {
+    verify_msix_health_with_launch_arguments(keep_running, "")
+}
+
+#[cfg(windows)]
+pub fn verify_msix_health_with_launch_arguments(
+    keep_running: bool,
+    arguments: &str,
+) -> MsixHealthReport {
+    log::info!("MSIX health check start");
+    // Package queries and shell activation are bounded separately from native
+    // window observation. A live error dialog must never count as readiness.
+    let limits = RunLimits::probe();
+    let script = if arguments.is_empty() {
+        msix_health_script()
+    } else {
+        msix_health_script_with_activation(false)
+    };
 
     let run_result = run_powershell_json_with_limits(&script, limits);
     let parsed = match &run_result {
         Ok(json) => serde_json::from_str::<serde_json::Value>(json).ok(),
         Err(PowerShellRunError::Timeout(kind)) => {
-            log::info!(
-                "MSIX health check result healthy=false status=timeout kind={kind:?}"
-            );
+            log::info!("MSIX health check result healthy=false status=timeout kind={kind:?}");
             // Start-Process detaches; kill any process the timed-out probe left running.
             best_effort_close_msix_after_probe();
             return MsixHealthReport {
@@ -1689,7 +1829,7 @@ if ($statusOk -and $aumidResolved -and $missing.Count -eq 0) {{
         Err(_) => None,
     };
 
-    let Some(value) = parsed else {
+    let Some(mut value) = parsed else {
         // The health probe itself could not run. On managed/stripped Windows this
         // is exactly the situation where an MSIX can register but fail to launch,
         // so treat the verdict as degraded and let the caller fall back to the
@@ -1710,6 +1850,60 @@ if ($statusOk -and $aumidResolved -and $missing.Count -eq 0) {{
         };
     };
 
+    if !arguments.is_empty() && value.get("activationOk").and_then(|v| v.as_bool()) == Some(true) {
+        let activation = validate_launch_arguments(arguments).and_then(|_| {
+            let installed = detect_msix_install()
+                .ok_or_else(|| EngineError::Io("registered Codex package not found".into()))?;
+            launch_msix_app_with_arguments(&installed, arguments)
+        });
+        if let Err(error) = activation {
+            value["activationOk"] = false.into();
+            value["failureKind"] = msix_failure::ACTIVATION_FAILED.into();
+            value["activationDetail"] = error.to_string().into();
+        }
+    }
+    if value.get("activationOk").and_then(|v| v.as_bool()) == Some(true) {
+        let root = value
+            .get("installLocation")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if root.trim().is_empty() {
+            value["activationOk"] = false.into();
+            value["failureKind"] = msix_failure::PROBE_FAILED.into();
+            value["activationDetail"] = "registered package has no install location".into();
+            best_effort_close_msix_after_probe();
+        } else {
+            let root = PathBuf::from(root);
+            let startup = wait_for_msix_startup(&root);
+            let result = finish_msix_startup_probe(startup, keep_running, || {
+                crate::windows_process::close_startup_gui_for_root(&root).map_err(|e| e.to_string())
+            });
+            if let Err(failure) = result {
+                log::warn!(
+                    "MSIX startup failed kind={} detail={}",
+                    failure.kind,
+                    failure.detail
+                );
+                value["activationOk"] = false.into();
+                value["failureKind"] = failure.kind.into();
+                value["activationDetail"] = failure.detail.into();
+            }
+        }
+    } else if let Some(root) = value
+        .get("installLocation")
+        .and_then(|v| v.as_str())
+        .filter(|root| !root.trim().is_empty())
+    {
+        // Start-Process can fail after partially activating an application.
+        if let Err(err) = crate::windows_process::close_startup_gui_for_root(Path::new(root)) {
+            log::warn!("MSIX failed activation cleanup: {err}");
+        }
+    }
+    msix_health_from_probe(&value)
+}
+
+#[cfg(any(windows, test))]
+fn msix_health_from_probe(value: &serde_json::Value) -> MsixHealthReport {
     let package_registered = value
         .get("packageRegistered")
         .and_then(|v| v.as_bool())
@@ -1815,6 +2009,14 @@ if ($statusOk -and $aumidResolved -and $missing.Count -eq 0) {{
 }
 
 #[cfg(not(windows))]
+pub fn verify_msix_health_with_launch_arguments(
+    keep_running: bool,
+    _arguments: &str,
+) -> MsixHealthReport {
+    verify_msix_health_with_options(keep_running)
+}
+
+#[cfg(not(windows))]
 pub fn verify_msix_health_with_options(_keep_running: bool) -> MsixHealthReport {
     // Non-Windows builds never sideload, so there is nothing to verify; report
     // healthy so this can never be the thing that blocks a (non-existent) path,
@@ -1868,7 +2070,24 @@ fn detect_msix_install() -> Option<InstalledWindowsCodex> {
     None
 }
 
+/// Registered MSIX payloads are read-only package storage, even when they have
+/// the same executable/manifest layout as an extracted portable installation.
+pub fn is_msix_package_path(path: &Path) -> bool {
+    fn contains_windows_apps(path: &Path) -> bool {
+        path.to_string_lossy()
+            .split(['\\', '/'])
+            .any(|component| component.eq_ignore_ascii_case("WindowsApps"))
+    }
+    contains_windows_apps(path)
+        || path
+            .canonicalize()
+            .is_ok_and(|resolved| contains_windows_apps(&resolved))
+}
+
 pub fn detect_portable_install(portable_root: &Path) -> Option<InstalledWindowsCodex> {
+    if is_msix_package_path(portable_root) {
+        return None;
+    }
     // Entry-exe aware (manifest-declared, ChatGPT.exe/Codex.exe fallback) so
     // both pre- and post-rebrand portable payloads are recognized.
     let exe = crate::portable::installed_app_exe(portable_root)?;
@@ -1904,7 +2123,8 @@ pub fn detect_portable_install(portable_root: &Path) -> Option<InstalledWindowsC
             }
         },
         Err(_) => {
-            let asar_name = crate::app_version::read_asar_package_name_from_install_root(portable_root);
+            let asar_name =
+                crate::app_version::read_asar_package_name_from_install_root(portable_root);
             if asar_name.as_deref() != Some(crate::app_version::CODEX_ASAR_PACKAGE_NAME) {
                 log::debug!(
                     "portable root at {} has no manifest and its app payload name is {:?} (expected {}); not a Codex install",
@@ -1945,44 +2165,53 @@ pub fn launch_codex(installed: &InstalledWindowsCodex) -> Result<(), EngineError
 
 pub fn launch_codex_with_options(
     installed: &InstalledWindowsCodex,
-    options: LaunchOptions,
+    options: LaunchOptions<'_>,
 ) -> Result<(), EngineError> {
+    validate_launch_arguments(options.additional_arguments)?;
     if installed.source == "portable" {
         let root = Path::new(&installed.path);
-        let exe = crate::portable::installed_app_exe(root)
-            .ok_or_else(|| {
-                EngineError::Io(format!(
-                    "no app entry executable (ChatGPT.exe / Codex.exe) in {}",
-                    root.display()
-                ))
-            })?;
+        if is_msix_package_path(root) {
+            return Err(EngineError::Io(
+                "MSIX package storage cannot be launched as a portable installation; re-check the installed Codex".to_string(),
+            ));
+        }
+        let exe = crate::portable::installed_app_exe(root).ok_or_else(|| {
+            EngineError::Io(format!(
+                "no app entry executable (ChatGPT.exe / Codex.exe) in {}",
+                root.display()
+            ))
+        })?;
         // CREATE_NO_WINDOW only suppresses a console flash; the GUI still shows.
         // Require a short liveness window so an immediate crash is reported as a
         // launch failure instead of a silent no-op.
-        let mut command = hidden_command(exe);
+        crate::portable::repair_portable_launch_entry(root)?;
+        let mut command = crate::portable::portable_launch_command(&exe)?;
         if options.disable_codex_self_updates {
             command.env(CODEX_SELF_UPDATE_ENV_KEY, CODEX_SELF_UPDATE_ENV_DISABLED);
         }
         if let Some(port) = options.remote_debugging_port {
             command.args(remote_debugging_arguments(port));
         }
-        if let Some(locale) = &options.locale {
-            command.arg(lang_argument(locale));
-        }
-        match spawn_and_require_liveness(command, PORTABLE_LIVENESS_WINDOW) {
+        apply_launch_arguments(&mut command, options.additional_arguments)?;
+        let was_running = crate::windows_process::codex_processes_running_for_root(root)
+            .unwrap_or(false);
+        match crate::process::spawn_and_check_startup(
+            command,
+            PORTABLE_LIVENESS_WINDOW,
+            crate::app_version::requires_portable_cli(root),
+        ) {
             Ok(LivenessResult::Survived { child }) => {
                 std::mem::forget(child);
                 Ok(())
             }
+            Ok(LivenessResult::ExitedEarly { code })
+                if portable_activation_succeeded(root, was_running, code) => Ok(()),
             Ok(LivenessResult::ExitedEarly { code }) => Err(EngineError::Io(format!(
                 "Codex exited immediately after launch (exit={})",
                 code.map(|c| c.to_string())
                     .unwrap_or_else(|| "signal".to_string())
             ))),
-            Err(err) => Err(EngineError::Io(format!(
-                "launch Codex: {}",
-                err.message()
-            ))),
+            Err(err) => Err(EngineError::Io(format!("launch Codex: {}", err.message()))),
         }
     } else {
         if options.disable_codex_self_updates {
@@ -1990,21 +2219,32 @@ pub fn launch_codex_with_options(
                 "launching MSIX Codex with updater disabled via persisted user environment"
             );
         }
-        // Both the debug port and the locale switch are delivered as MSIX
-        // activation arguments (a single space-separated string). Only fall back
-        // to the plain activation when neither is requested.
-        let mut arguments: Vec<String> = Vec::new();
-        if let Some(port) = options.remote_debugging_port {
-            arguments.extend(remote_debugging_arguments(port));
-        }
-        if let Some(locale) = &options.locale {
-            arguments.push(lang_argument(locale));
-        }
-        if arguments.is_empty() {
-            launch_msix_app()
-        } else {
-            launch_msix_app_with_arguments(installed, &arguments.join(" "))
-        }
+        let arguments = match options.remote_debugging_port {
+            Some(port) => format!(
+                "{} {}",
+                remote_debugging_arguments(port).join(" "),
+                options.additional_arguments
+            ),
+            None => options.additional_arguments.to_string(),
+        };
+        launch_msix_app_with_arguments(installed, &arguments)
+    }
+}
+
+fn portable_activation_succeeded(root: &Path, was_running: bool, code: Option<i32>) -> bool {
+    if !was_running || code != Some(0) {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        // A worker alone or a startup error dialog does not prove activation.
+        crate::windows_process::startup_window_for_root(root)
+            .is_ok_and(|(_, window)| window.ready && window.failure.is_none())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = root;
+        false
     }
 }
 
@@ -2042,6 +2282,7 @@ if ($app -is [array]) {{ $app = $app[0] }}
 @{{
   packageFamilyName = [string]$pkg.PackageFamilyName
   appId = [string]$app.Id
+  installLocation = [string]$pkg.InstallLocation
 }} | ConvertTo-Json -Compress
 "#,
         name = ps_quote(crate::OPENAI_PACKAGE_IDENTITY),
@@ -2050,6 +2291,20 @@ if ($app -is [array]) {{ $app = $app[0] }}
     let registered = run_powershell_json_with_limits(&script, RunLimits::probe())
         .map_err(|e| e.into_install())?;
     let aumid = HSTRING::from(registered_msix_aumid(&registered, family)?);
+    // Follow registration if an external updater changed the version/path
+    // since detection. Never accept a window from the stale install root.
+    let value: serde_json::Value = serde_json::from_str(&registered)
+        .map_err(|e| EngineError::Io(format!("parse registered MSIX install location: {e}")))?;
+    let root = value
+        .get("installLocation")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if root.trim().is_empty() {
+        return Err(EngineError::Io(
+            "registered MSIX package has no install location".into(),
+        ));
+    }
+    let root = PathBuf::from(root);
     let arguments = HSTRING::from(arguments);
 
     // Blocking launch calls run on a pool thread whose COM apartment is
@@ -2063,22 +2318,27 @@ if ($app -is [array]) {{ $app = $app[0] }}
     }
     let uninitialize = initialized.is_ok();
     let outcome = (|| unsafe {
-        let manager: IApplicationActivationManager = CoCreateInstance(
-            &ApplicationActivationManager,
-            None,
-            CLSCTX_LOCAL_SERVER,
-        )
-        .map_err(|e| EngineError::Io(format!("create application activation manager: {e}")))?;
+        let manager: IApplicationActivationManager =
+            CoCreateInstance(&ApplicationActivationManager, None, CLSCTX_LOCAL_SERVER).map_err(
+                |e| EngineError::Io(format!("create application activation manager: {e}")),
+            )?;
         let pid = manager
             .ActivateApplication(&aumid, &arguments, AO_NONE)
             .map_err(|e| EngineError::Io(format!("activate MSIX Codex with arguments: {e}")))?;
-        log::debug!("activated MSIX Codex with arguments pid={pid}");
+        log::debug!("activated MSIX Codex pid={pid}");
         Ok(())
     })();
     if uninitialize {
         unsafe { CoUninitialize() };
     }
-    outcome
+    outcome?;
+    wait_for_msix_startup(&root).map_err(|failure| {
+        log::warn!("MSIX launch failed kind={} detail={}", failure.kind, failure.detail);
+        EngineError::Io(format!(
+            "MSIX Codex failed to start ({}): {}. Reinstall this version in Codex App Manager to verify startup and automatically try the portable fallback. If that also fails, copy diagnostics for further investigation.",
+            failure.kind, failure.detail
+        ))
+    })
 }
 
 #[cfg(not(windows))]
@@ -2088,36 +2348,6 @@ fn launch_msix_app_with_arguments(
 ) -> Result<(), EngineError> {
     Err(EngineError::Io(
         "MSIX launch with arguments is only available on Windows".to_string(),
-    ))
-}
-
-#[cfg(windows)]
-fn launch_msix_app() -> Result<(), EngineError> {
-    // Resolve the real AUMID (PackageFamilyName!AppId) from the manifest so the
-    // shell can activate the package; fall back to the conventional "App" id.
-    let script = format!(
-        r#"
-$ErrorActionPreference = 'Stop'
-$pkg = Get-AppxPackage -Name {name} | Sort-Object -Property Version -Descending | Select-Object -First 1
-if ($null -eq $pkg) {{ throw 'Codex is not installed' }}
-$app = (Get-AppxPackageManifest $pkg).Package.Applications.Application
-if ($app -is [array]) {{ $app = $app[0] }}
-$id = $app.Id
-if (-not $id) {{ $id = 'App' }}
-Start-Process ("shell:AppsFolder\" + $pkg.PackageFamilyName + "!" + $id)
-"#,
-        name = ps_quote(crate::OPENAI_PACKAGE_IDENTITY)
-    );
-    // Activation is fire-and-forget from the shell; bound the AUMID resolve + Start-Process.
-    run_powershell_json_with_limits(&script, RunLimits::probe())
-        .map(|_| ())
-        .map_err(|e| e.into_install())
-}
-
-#[cfg(not(windows))]
-fn launch_msix_app() -> Result<(), EngineError> {
-    Err(EngineError::Io(
-        "MSIX launch is only available on Windows".to_string(),
     ))
 }
 
@@ -2366,9 +2596,11 @@ fn capabilities_from_probe_json(value: &serde_json::Value) -> WinCapabilityRepor
 
 #[cfg(test)]
 mod tests {
-    use super::{lang_argument, registered_msix_aumid, remote_debugging_arguments, LaunchOptions};
     #[cfg(windows)]
     use super::*;
+    use super::{
+        parse_registered_msix_package_full_name, registered_msix_aumid, remote_debugging_arguments,
+    };
 
     #[test]
     fn builds_loopback_remote_debugging_arguments() {
@@ -2379,20 +2611,6 @@ mod tests {
                 "--remote-debugging-port=9345".to_string(),
             ]
         );
-    }
-
-    #[test]
-    fn builds_the_chromium_language_switch() {
-        assert_eq!(lang_argument("zh-CN"), "--lang=zh-CN");
-        assert_eq!(lang_argument("en-US"), "--lang=en-US");
-    }
-
-    #[test]
-    fn default_launch_options_request_no_locale_or_debug_port() {
-        let options = LaunchOptions::default();
-        assert!(options.locale.is_none());
-        assert!(options.remote_debugging_port.is_none());
-        assert!(!options.disable_codex_self_updates);
     }
 
     #[test]
@@ -2408,6 +2626,23 @@ mod tests {
             "OpenAI.Codex_abc"
         )
         .is_err());
+    }
+
+    #[test]
+    fn parses_exact_registered_msix_package_full_name() {
+        assert_eq!(
+            parse_registered_msix_package_full_name(
+                r#""OpenAI.Codex_26.803.10989.0_x64__2p2nqsd0c76g0""#
+            )
+            .unwrap()
+            .as_deref(),
+            Some("OpenAI.Codex_26.803.10989.0_x64__2p2nqsd0c76g0")
+        );
+        assert_eq!(
+            parse_registered_msix_package_full_name("null").unwrap(),
+            None
+        );
+        assert!(parse_registered_msix_package_full_name("not-json").is_err());
     }
 
     #[cfg(windows)]
@@ -2492,6 +2727,27 @@ function Get-AppxPackage {
 
     #[cfg(windows)]
     #[test]
+    fn powershell_transport_preserves_chinese_json_and_errors() {
+        let json = run_powershell_json(
+            "@{ message = '需要管理员权限；路径：C:\\用户\\测试' } | ConvertTo-Json -Compress",
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["message"], "需要管理员权限；路径：C:\\用户\\测试");
+        let error = run_powershell_json("throw '需要管理员权限'")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("需要管理员权限"), "{error}");
+        let gbk = b"{\"message\":\"\xd6\xd0\xce\xc4\"}";
+        assert_eq!(
+            super::decode_powershell_bytes(gbk, 936).unwrap(),
+            "{\"message\":\"中文\"}"
+        );
+        assert!(super::decode_powershell_bytes(b"\xff", 65001).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn constrained_language_capability_probe_keeps_restricted_checks_unknown() {
         let script = format!(
             "$ExecutionContext.SessionState.LanguageMode = 'ConstrainedLanguage'; if ($ExecutionContext.SessionState.LanguageMode -ne 'ConstrainedLanguage') {{ throw 'CLM was not enabled' }}; {}",
@@ -2558,6 +2814,32 @@ function Get-AppxPackage {
         assert_eq!(installed.source, "msix");
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn constrained_language_health_probe_returns_root_for_native_observation() {
+        let mocks = r#"
+$ExecutionContext.SessionState.LanguageMode = 'ConstrainedLanguage'
+function Get-AppxPackage {
+  @{ Status = 'Ok'; Version = '26.917.6896.0'; Architecture = 'X64';
+     PackageFamilyName = 'OpenAI.Codex_2p2nqsd0c76g0'; InstallLocation = 'C:\fixture\Codex' }
+}
+function Get-AppxPackageManifest {
+  @{ Package = @{ Applications = @{ Application = @{ Id = 'App' } }; Dependencies = @{} } }
+}
+function Start-Process {
+  param([string]$FilePath)
+  if ($FilePath -ne 'shell:AppsFolder\OpenAI.Codex_2p2nqsd0c76g0!App') { throw 'wrong activation target' }
+}
+"#;
+        let script = format!("{mocks}\n{}", super::msix_health_script());
+        let json = run_powershell_json(&script).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["packageRegistered"], true);
+        assert_eq!(value["activationOk"], true);
+        assert_eq!(value["installLocation"], r"C:\fixture\Codex");
+        assert_eq!(value["failureKind"], "");
+    }
+
     #[test]
     fn msix_health_failure_kinds_are_stable_strings() {
         // Keep these stable: frontend / notes may switch on them.
@@ -2567,6 +2849,125 @@ function Get-AppxPackage {
         assert_eq!(super::msix_failure::TIMEOUT, "timeout");
         assert_eq!(super::msix_failure::POLICY, "policy");
         assert_eq!(super::msix_failure::CLEANUP_FAILED, "cleanup-failed");
+        assert_eq!(super::msix_failure::STARTUP_DIALOG, "startup-dialog");
+        assert_eq!(
+            super::msix_failure::MAIN_WINDOW_TIMEOUT,
+            "main-window-timeout"
+        );
+    }
+
+    #[test]
+    fn healthy_registration_with_a_runtime_dialog_routes_to_fallback() {
+        let value = serde_json::json!({
+            "packageRegistered": true, "statusOk": true, "status": "Ok",
+            "aumidResolved": true, "missingDependencies": "",
+            "activationOk": false, "failureKind": "startup-dialog",
+            "activationDetail": "Unable to locate the Codex CLI binary or required runtime components."
+        });
+        let report = super::msix_health_from_probe(&value);
+        assert!(!report.healthy);
+        assert!(report.verified);
+        assert!(report.status_ok);
+        assert_eq!(report.failure_kind, "startup-dialog");
+        assert!(report.reason.contains("required runtime components"));
+        let mut ready = value;
+        ready["activationOk"] = true.into();
+        ready["failureKind"] = "".into();
+        ready["activationDetail"] = "".into();
+        assert!(super::msix_health_from_probe(&ready).healthy);
+    }
+
+    #[test]
+    fn startup_probe_preserves_keep_running_and_never_hides_cleanup_failure() {
+        use super::{finish_msix_startup_probe, msix_failure, MsixStartupFailure};
+        assert!(finish_msix_startup_probe(Ok(()), true, || panic!("must keep running")).is_ok());
+        let mut cleaned = false;
+        assert!(finish_msix_startup_probe(Ok(()), false, || {
+            cleaned = true;
+            Ok(())
+        })
+        .is_ok());
+        assert!(cleaned);
+        let failed_cleanup =
+            finish_msix_startup_probe(Ok(()), false, || Err("access denied".into())).unwrap_err();
+        assert_eq!(failed_cleanup.kind, msix_failure::CLEANUP_FAILED);
+        let dialog = || {
+            Err(MsixStartupFailure {
+                kind: msix_failure::STARTUP_DIALOG,
+                detail: "runtime missing".into(),
+            })
+        };
+        cleaned = false;
+        let failure = finish_msix_startup_probe(dialog(), true, || {
+            cleaned = true;
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(cleaned);
+        assert_eq!(failure.kind, msix_failure::STARTUP_DIALOG);
+        let failure =
+            finish_msix_startup_probe(dialog(), false, || Err("access denied".into())).unwrap_err();
+        assert_eq!(failure.kind, msix_failure::STARTUP_DIALOG);
+        assert!(failure.detail.contains("runtime missing"));
+        assert!(failure.detail.contains("access denied"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_startup_windows_are_scoped_and_reject_errors() {
+        use std::process::Stdio;
+        let root =
+            std::env::temp_dir().join(format!("codex-startup-window-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let exe = root.join("fixture.exe");
+        std::fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
+        for mode in ["ready", "title", "body", "late-error"] {
+            let mut child = crate::process::hidden_command(&exe)
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "startup_window::tests::native_window_fixture",
+                ])
+                .env("CODEX_STARTUP_WINDOW_FIXTURE", mode)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let result = super::wait_for_msix_startup(&root);
+            // Always reap the isolated fixture before checking assertions.
+            let _ = child.kill();
+            let _ = child.wait();
+            if mode == "ready" {
+                assert!(result.is_ok(), "{result:?}");
+            } else {
+                let failure = result.unwrap_err();
+                assert_eq!(
+                    failure.kind,
+                    super::msix_failure::STARTUP_DIALOG,
+                    "{mode}: {failure:?}"
+                );
+            }
+        }
+        // Another installation's window must never satisfy this root's probe.
+        let mut child = crate::process::hidden_command(&exe)
+            .args([
+                "--ignored",
+                "--exact",
+                "startup_window::tests::native_window_fixture",
+            ])
+            .env("CODEX_STARTUP_WINDOW_FIXTURE", "ready")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let ready = super::wait_for_msix_startup(&root);
+        let other = crate::windows_process::startup_window_for_root(&root.join("other-install"));
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(ready.is_ok());
+        let (running, window) = other.unwrap();
+        assert!(!running && !window.ready && window.failure.is_none());
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
@@ -2575,7 +2976,7 @@ function Get-AppxPackage {
             crate::process::MSIX_LIVENESS_WINDOW_SECS,
             crate::process::PORTABLE_LIVENESS_WINDOW.as_secs()
         );
-        assert!(crate::process::MSIX_ACTIVATION_WINDOW_SECS >= 20);
+        const { assert!(crate::process::MSIX_ACTIVATION_WINDOW_SECS >= 20) };
     }
 
     #[cfg(windows)]
@@ -2633,9 +3034,7 @@ function Get-AppxPackage {
                     .find("Stop-Service -Name $name")
                     .expect("service stop must follow watchdog")
         );
-        assert!(recovery.contains(
-            "@('InstallService', 'wuauserv', 'DoSvc', 'AppXSvc', 'ClipSVC')"
-        ));
+        assert!(recovery.contains("@('InstallService', 'wuauserv', 'DoSvc', 'AppXSvc', 'ClipSVC')"));
         assert!(
             std::time::Duration::from_secs(OFFLINE_APPX_RESTORE_WATCHDOG_SECS)
                 > crate::process::APPX_RECOVERY_TIMEOUT + crate::process::INSTALL_TIMEOUT
@@ -2859,6 +3258,96 @@ mod portable_identity_tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn normal_second_activation_keeps_existing_gui_but_first_launch_still_checks_liveness() {
+        use std::time::{Duration, Instant};
+        let root = write_root("second-activation", "ChatGPT.exe", Some("OpenAI.Codex"));
+        let exe = root.join("ChatGPT.exe");
+        std::fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
+        let fixture = "startup_window::tests::native_window_fixture";
+        let mut child = std::process::Command::new(&exe)
+            .args(["--ignored", "--exact", fixture])
+            .env("CODEX_STARTUP_WINDOW_FIXTURE", "ready")
+            .spawn().unwrap();
+        let ready = {
+            let deadline = Instant::now() + Duration::from_secs(8);
+            loop {
+                if crate::windows_process::startup_window_for_root(&root)
+                    .is_ok_and(|(_, window)| window.ready && window.failure.is_none()) {
+                    break true;
+                }
+                if Instant::now() >= deadline { break false; }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        };
+        let installed = detect_portable_install(&root).unwrap();
+        let arguments = format!("--ignored --exact {fixture}");
+        let options = super::LaunchOptions {
+            additional_arguments: &arguments,
+            ..Default::default()
+        };
+        let result = if ready { super::launch_codex_with_options(&installed, options) }
+            else { Err(crate::EngineError::Io("fixture window did not become ready".into())) };
+        let _ = child.kill();
+        let _ = child.wait();
+        let first_launch = super::launch_codex_with_options(&installed, options);
+        cleanup(&root);
+        result.unwrap();
+        assert!(first_launch.unwrap_err().to_string().contains("exited immediately"));
+    }
+
+    #[test]
+    fn launch_arguments_accept_proxy_quotes_and_reject_control_characters() {
+        assert!(super::validate_launch_arguments(
+            r#"--proxy-server=http://127.0.0.1:7890 --proxy-pac-url="http://localhost/my pac""#
+        )
+        .is_ok());
+        for arguments in ["--flag\nother", "--flag\0other", "--flag\r"] {
+            assert!(super::validate_launch_arguments(arguments).is_err());
+        }
+        assert!(super::validate_launch_arguments(&"x".repeat(16385)).is_err());
+    }
+
+    #[test]
+    fn registered_package_payload_is_not_a_portable_install() {
+        let parent =
+            std::env::temp_dir().join(format!("codex-package-store-{}", std::process::id()));
+        let root = parent.join("WindowsApps").join("OpenAI.Codex");
+        std::fs::create_dir_all(root.join("app")).unwrap();
+        std::fs::write(root.join("app/ChatGPT.exe"), b"fake exe").unwrap();
+        std::fs::write(root.join("AppxManifest.xml"), r#"<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"><Identity Name="OpenAI.Codex" Publisher="CN=OpenAI OpCo, LLC" Version="26.930.7945.0" ProcessorArchitecture="x64" /><Applications><Application Id="App" Executable="app/ChatGPT.exe" /></Applications></Package>"#).unwrap();
+        assert!(detect_portable_install(&root).is_none());
+        let result = crate::portable::install_portable_from_msix_with_observer(
+            &parent.join("missing.msix"),
+            &root,
+            false,
+            false,
+            &mut |_| Ok(()),
+        );
+        assert!(result.unwrap_err().to_string().contains("WindowsApps"));
+        assert!(!root
+            .parent()
+            .unwrap()
+            .join(".codex-app-manager-staging")
+            .exists());
+        cleanup(&parent);
+    }
+
+    #[test]
+    fn package_path_detection_handles_windows_spelling() {
+        for path in [
+            r"C:\Program Files\WindowsApps\OpenAI.Codex",
+            r"\\?\C:\Program Files\windowsapps\OpenAI.Codex\app",
+            "C:/Program Files/WindowsApps/OpenAI.Codex",
+        ] {
+            assert!(super::is_msix_package_path(Path::new(path)));
+        }
+        assert!(!super::is_msix_package_path(Path::new(
+            r"C:\Users\user\Programs\Codex"
+        )));
+    }
+
     #[test]
     fn accepts_rebranded_portable_with_codex_identity() {
         let root = write_root("rebrand", "ChatGPT.exe", Some("OpenAI.Codex"));
@@ -2916,5 +3405,72 @@ mod portable_identity_tests {
         );
         assert!(detect_portable_install(&root).is_none());
         cleanup(&root);
+    }
+}
+
+
+#[cfg(test)]
+mod github_rate_limit_tests {
+    use super::*;
+    use std::{cell::Cell, process::{ExitStatus, Output}};
+    #[cfg(unix)]
+    use std::os::unix::process::ExitStatusExt;
+    #[cfg(windows)]
+    use std::os::windows::process::ExitStatusExt;
+
+    fn output(success: bool, headers: &[u8]) -> Output {
+        #[cfg(unix)]
+        let status = ExitStatus::from_raw(if success { 0 } else { 22 << 8 });
+        #[cfg(windows)]
+        let status = ExitStatus::from_raw(if success { 0 } else { 22 });
+        Output { status, stdout: headers.to_vec(), stderr: b"curl HTTP failure".to_vec() }
+    }
+
+    fn route() -> NetworkConfig {
+        NetworkConfig::custom(format!("http://{}.invalid:18441", uuid::Uuid::new_v4()))
+    }
+
+    #[test]
+    fn a_confirmed_limit_prevents_another_transport_request_until_reset() {
+        let network = route();
+        let calls = Cell::new(0);
+        let reset = crate::github_rate_limit::unix_now() + 300;
+        let headers = format!("HTTP/2 403\r\nx-ratelimit-remaining: 0\r\nx-ratelimit-reset: {reset}\r\n\r\n");
+        let first = fetch_text_with_output("https://api.github.com/repos/test/repo/releases", &network, |_,_,_| {
+            calls.set(calls.get()+1);
+            Ok(output(false, headers.as_bytes()))
+        }).unwrap_err();
+        assert!(first.to_string().contains(&format!("retry_after_unix={reset}")));
+        let second = fetch_text_with_output("https://api.github.com/repos/test/repo/releases?page=2", &network, |_,_,_| {
+            panic!("cooldown must stop the transport request")
+        }).unwrap_err();
+        assert!(second.to_string().contains("GitHub API rate limit exceeded"));
+        assert_eq!(calls.get(), 1);
+        let mirror = fetch_text_with_output("https://codexapp.agentsmirror.com/latest/manifest", &network, |_,_,_| {
+            Ok(output(true, b"{}"))
+        }).unwrap();
+        assert_eq!(mirror, "{}");
+    }
+
+    #[test]
+    fn successful_api_json_has_no_header_prefix() {
+        let text = fetch_text_with_output("https://api.github.com/repos/test/repo/releases", &route(), |_,_,_| {
+            Ok(output(true, b"HTTP/2 200\r\nx-ratelimit-remaining: 12\r\n\r\n[]"))
+        }).unwrap();
+        assert_eq!(text, "[]");
+    }
+
+    #[test]
+    fn ordinary_forbidden_does_not_start_a_rate_limit_cooldown() {
+        let network = route();
+        let calls = Cell::new(0);
+        for _ in 0..2 {
+            let error = fetch_text_with_output("https://api.github.com/repos/test/repo/releases", &network, |_,_,_| {
+                calls.set(calls.get()+1);
+                Ok(output(false, b"HTTP/2 403\r\nx-ratelimit-remaining: 20\r\n\r\n"))
+            }).unwrap_err();
+            assert!(!error.to_string().contains("rate limit exceeded"));
+        }
+        assert_eq!(calls.get(), 2);
     }
 }

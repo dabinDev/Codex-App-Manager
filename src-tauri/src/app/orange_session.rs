@@ -347,11 +347,6 @@ impl OrangeSessionService {
 
         match self.fetch_all_keys_locked(&mut state).await {
             Ok(mut keys) => {
-                keys.retain(|key| {
-                    key.group
-                        .as_ref()
-                        .is_some_and(|group| group.platform.eq_ignore_ascii_case("openai"))
-                });
                 sort_keys_newest_first(&mut keys);
                 let now = unix_now();
                 let items = keys
@@ -379,6 +374,61 @@ impl OrangeSessionService {
                 Ok(state.projected.clone())
             }
             Err(error) => Err(error),
+        }
+    }
+
+    pub async fn models_for_key(&self, id: u64) -> Result<Vec<String>, OrangeError> {
+        let mut state = self.state.lock().await;
+        if state.access_token.is_none() {
+            return Err(OrangeError::SignedOut);
+        }
+        if state.projected.stale
+            || !state
+                .keys
+                .iter()
+                .any(|key| key.id == id && key.actionable_at(unix_now()))
+        {
+            return Err(OrangeError::KeyUnavailable);
+        }
+        if self.token_needs_refresh(&state) {
+            if let Err(error) = self.refresh_locked(&mut state).await {
+                if refresh_error_ends_session(&error) {
+                    self.expire_session_locked(&mut state).await;
+                    return Err(OrangeError::SignedOut);
+                }
+                return Err(error);
+            }
+        }
+
+        let client = state.client.clone().ok_or(OrangeError::Network)?;
+        let access_token = state
+            .access_token
+            .as_deref()
+            .ok_or(OrangeError::SignedOut)?;
+        let result = client.key_models(access_token, id).await;
+        let result = match result {
+            Err(OrangeError::Unauthorized) => {
+                if let Err(error) = self.refresh_locked(&mut state).await {
+                    if refresh_error_ends_session(&error) {
+                        self.expire_session_locked(&mut state).await;
+                        return Err(OrangeError::SignedOut);
+                    }
+                    return Err(error);
+                }
+                let access_token = state
+                    .access_token
+                    .as_deref()
+                    .ok_or(OrangeError::SignedOut)?;
+                client.key_models(access_token, id).await
+            }
+            other => other,
+        };
+        match result {
+            Err(OrangeError::Unauthorized) => {
+                self.expire_session_locked(&mut state).await;
+                Err(OrangeError::SignedOut)
+            }
+            other => other,
         }
     }
 
