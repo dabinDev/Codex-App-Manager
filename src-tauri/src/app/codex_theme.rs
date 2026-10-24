@@ -11,7 +11,11 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use codex_theme_engine::codex_theme::{parse_codex_theme, CodexTheme, ValidateOptions};
-use codex_theme_engine::daemon::{run_daemon, DaemonStatus, Directive};
+use codex_theme_engine::daemon::{run_daemon, DaemonStatus, Directive, LocaleDirective};
+use codex_theme_engine::locale::{
+    build_zh_cn_payload, validate_runtime_report, LocaleRuntimeReport,
+    CURRENT_LOCALE_REPORT_EXPRESSION,
+};
 use codex_theme_engine::native::{has_backup, NativeSettingsSnapshot, NativeThemePaths};
 use codex_theme_engine::native_hot;
 use codex_theme_engine::theme::{list_themes, load_theme, LoadedTheme, ThemeSummary};
@@ -19,6 +23,7 @@ use codex_theme_engine::transaction::{self, BeginInput, NativeTransaction, Phase
 use serde::{Deserialize, Serialize};
 use tokio::sync::{watch, Mutex};
 
+use crate::app::brand::SKINS_BASE_URL;
 use crate::app::paths;
 use crate::app::settings_store::AppSettings;
 use crate::errors::AppError;
@@ -116,7 +121,8 @@ fn write_snapshot_with_tx(
             &codex_theme_engine::native::snapshot_plan(snapshot),
         )
         .map_err(|e| AppError::Engine(e.to_string()))?;
-        tx.stage(&planned).map_err(|e| AppError::Engine(e.to_string()))?;
+        tx.stage(&planned)
+            .map_err(|e| AppError::Engine(e.to_string()))?;
         codex_theme_engine::native::write_config_atomic(&paths, &planned)
             .map_err(|e| AppError::Engine(e.to_string()))?;
         let on_disk = std::fs::read_to_string(&paths.config)
@@ -162,9 +168,15 @@ pub fn recover_native_theme_on_startup() {
     }
 }
 
-#[derive(Default)]
 pub struct ThemeService {
     inner: Mutex<ServiceInner>,
+    initial_directive: Directive,
+}
+
+impl Default for ThemeService {
+    fn default() -> Self {
+        Self::new(false)
+    }
 }
 
 #[derive(Default)]
@@ -197,6 +209,23 @@ pub struct ThemeStatusReport {
     pub recovery_required: bool,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LocaleMode {
+    OfficialCatalog,
+    CompatibilityRuntime,
+    SystemDefault,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexLocaleApplyResult {
+    pub mode: LocaleMode,
+    pub locale: Option<String>,
+    pub translated_nodes: usize,
+    pub catalog_entries: usize,
+}
+
 fn theme_supported() -> bool {
     cfg!(any(target_os = "macos", target_os = "windows"))
 }
@@ -207,13 +236,14 @@ fn theme_supported() -> bool {
 /// between detection and launch.
 #[cfg(target_os = "windows")]
 fn codex_version_hint() -> Option<String> {
-    installed_windows_codex().ok().map(|installed| installed.version)
+    installed_windows_codex()
+        .ok()
+        .map(|installed| installed.version)
 }
 
 #[cfg(target_os = "macos")]
 fn codex_version_hint() -> Option<String> {
-    crate::app::mac_update::detect_managed_installed()
-        .map(|installed| installed.short_version)
+    crate::app::mac_update::detect_managed_installed().map(|installed| installed.short_version)
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -273,9 +303,9 @@ fn move_dir(src: &Path, dst: &Path) -> Result<(), AppError> {
         }
         Ok(())
     }
-    copy_tree(src, dst).map_err(|e| AppError::Internal(format!("迁移 {} 失败: {e}", src.display())))?;
-    std::fs::remove_dir_all(src)
-        .map_err(|e| AppError::Internal(format!("清理旧目录失败: {e}")))?;
+    copy_tree(src, dst)
+        .map_err(|e| AppError::Internal(format!("迁移 {} 失败: {e}", src.display())))?;
+    std::fs::remove_dir_all(src).map_err(|e| AppError::Internal(format!("清理旧目录失败: {e}")))?;
     Ok(())
 }
 
@@ -360,8 +390,7 @@ pub fn delete_store_skin(settings: &AppSettings, skin_id: &str) -> Result<(), Ap
             "{skin_id} 不是有效皮肤目录，拒绝删除"
         )));
     }
-    std::fs::remove_dir_all(&dir)
-        .map_err(|e| AppError::Internal(format!("删除皮肤失败: {e}")))?;
+    std::fs::remove_dir_all(&dir).map_err(|e| AppError::Internal(format!("删除皮肤失败: {e}")))?;
     log::info!("deleted store skin id={skin_id}");
     Ok(())
 }
@@ -507,16 +536,24 @@ pub fn merged_theme_list(settings: &AppSettings) -> Vec<ThemeListEntry> {
         .map(str::trim)
         .filter(|d| !d.is_empty())
     {
-        entries.extend(list_themes(Path::new(dir)).into_iter().map(|summary| ThemeListEntry {
-            summary,
-            origin: ThemeOrigin::Dev,
-        }));
+        entries.extend(
+            list_themes(Path::new(dir))
+                .into_iter()
+                .map(|summary| ThemeListEntry {
+                    summary,
+                    origin: ThemeOrigin::Dev,
+                }),
+        );
     }
     if let Ok(store) = store_dir(settings) {
-        entries.extend(list_themes(&store).into_iter().map(|summary| ThemeListEntry {
-            summary,
-            origin: ThemeOrigin::Store,
-        }));
+        entries.extend(
+            list_themes(&store)
+                .into_iter()
+                .map(|summary| ThemeListEntry {
+                    summary,
+                    origin: ThemeOrigin::Store,
+                }),
+        );
     }
     entries
 }
@@ -545,7 +582,6 @@ pub fn resolve_theme_for_keep(settings: &AppSettings, theme_ref: &str) -> Result
 // curl (the repo's networking idiom; Windows 10+ ships curl.exe) with https
 // pinned, size caps, and a sha256 gate before anything reaches the importer.
 
-const SKINS_BASE: &str = "https://skins.agentsmirror.com";
 const CATALOG_MAX_BYTES: &str = "1048576"; // 1 MB index.json cap
 const PACK_MAX_BYTES: &str = "52428800"; // 50 MB archive cap (importer re-checks)
 
@@ -600,7 +636,7 @@ fn safe_catalog_path(rel: &str) -> Result<String, AppError> {
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"/-_.".contains(&b));
     if ok {
-        Ok(format!("{SKINS_BASE}/{rel}"))
+        Ok(format!("{SKINS_BASE_URL}/{rel}"))
     } else {
         Err(AppError::Engine(format!("目录条目路径非法: {rel}")))
     }
@@ -718,7 +754,11 @@ fn curl_fetch(url: &str, max_bytes: &str, timeout_secs: &str) -> Result<Vec<u8>,
 }
 
 pub fn fetch_catalog() -> Result<Vec<CatalogSkin>, AppError> {
-    let bytes = curl_fetch(&format!("{SKINS_BASE}/index.json"), CATALOG_MAX_BYTES, "15")?;
+    let bytes = curl_fetch(
+        &format!("{SKINS_BASE_URL}/index.json"),
+        CATALOG_MAX_BYTES,
+        "15",
+    )?;
     let index: CatalogIndex = serde_json::from_slice(&bytes)
         .map_err(|e| AppError::Engine(format!("皮肤目录解析失败: {e}")))?;
     let mut skins: Vec<CatalogSkin> = index
@@ -746,16 +786,16 @@ fn preview_cache_path(url: &str, version: &str) -> Option<PathBuf> {
             }
         })
         .collect();
-    let vsafe = if vsafe.is_empty() { "v".to_string() } else { vsafe };
-    Some(
-        paths::cache_dir()?
-            .join("catalog-previews")
-            .join(format!(
-                "{:016x}-{}.webp",
-                crate::app::staging::fnv1a64(url.as_bytes()),
-                vsafe
-            )),
-    )
+    let vsafe = if vsafe.is_empty() {
+        "v".to_string()
+    } else {
+        vsafe
+    };
+    Some(paths::cache_dir()?.join("catalog-previews").join(format!(
+        "{:016x}-{}.webp",
+        crate::app::staging::fnv1a64(url.as_bytes()),
+        vsafe
+    )))
 }
 
 /// Cheap structural check that bytes look like a WebP (RIFF container + WEBP
@@ -823,7 +863,9 @@ pub fn catalog_preview_data_url(preview_rel: &str, version: &str) -> Result<Stri
 
 /// Download + sha256-gate + install one catalog skin. Returns the installed
 /// summary (the importer re-validates everything structurally).
-pub fn install_from_catalog(skin_id: &str) -> Result<codex_theme_engine::theme::ThemeSummary, AppError> {
+pub fn install_from_catalog(
+    skin_id: &str,
+) -> Result<codex_theme_engine::theme::ThemeSummary, AppError> {
     use sha2::Digest as _;
     let skin = fetch_catalog()?
         .into_iter()
@@ -884,6 +926,16 @@ pub fn preview_data_url(settings: &AppSettings, theme_ref: &str) -> Option<Strin
 }
 
 impl ThemeService {
+    pub fn new(locale_compatibility: bool) -> Self {
+        Self {
+            inner: Mutex::new(ServiceInner::default()),
+            initial_directive: Directive {
+                theme_dir: None,
+                locale: locale_compatibility.then_some(LocaleDirective::ZhCn),
+            },
+        }
+    }
+
     /// Ensure the reconciliation daemon is running and return its directive
     /// handle. One daemon per manager process, lazily started.
     async fn directive_handle(&self) -> watch::Sender<Directive> {
@@ -893,12 +945,54 @@ impl ThemeService {
                 return tx.clone();
             }
         }
-        let (directive_tx, directive_rx) = watch::channel::<Directive>(None);
+        let (directive_tx, directive_rx) = watch::channel(self.initial_directive.clone());
         let (status_tx, status_rx) = watch::channel(DaemonStatus::default());
         tauri::async_runtime::spawn(run_daemon(THEME_CDP_PORT, directive_rx, status_tx));
         inner.directive_tx = Some(directive_tx.clone());
         inner.status_rx = Some(status_rx);
         directive_tx
+    }
+
+    async fn set_theme_directive(&self, theme_dir: Option<PathBuf>) -> Result<(), AppError> {
+        let handle = self.directive_handle().await;
+        handle.send_modify(move |current| current.theme_dir = theme_dir);
+        if handle.is_closed() {
+            Err(AppError::Internal("主题守护未运行".to_string()))
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn set_locale_directive(&self, locale: Option<LocaleDirective>) -> Result<(), AppError> {
+        let handle = self.directive_handle().await;
+        handle.send_modify(move |current| current.locale = locale);
+        if handle.is_closed() {
+            Err(AppError::Internal("语言守护未运行".to_string()))
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn start_persisted_locale_daemon(&self, enabled: bool) -> Result<bool, AppError> {
+        if !enabled {
+            return Ok(false);
+        }
+        self.set_locale_directive(Some(LocaleDirective::ZhCn))
+            .await?;
+        Ok(true)
+    }
+
+    async fn run_with_locale_fallback<T>(
+        &self,
+        operation: impl std::future::Future<Output = Result<T, AppError>>,
+    ) -> Result<T, AppError> {
+        self.set_locale_directive(Some(LocaleDirective::ZhCn))
+            .await?;
+        let result = operation.await;
+        if result.is_err() {
+            let _ = self.set_locale_directive(None).await;
+        }
+        result
     }
 
     async fn daemon_status(&self) -> Option<DaemonStatus> {
@@ -952,10 +1046,7 @@ impl ThemeService {
             self.hot_apply_native(&theme.config.id, &native, true)
                 .await?;
         }
-        let handle = self.directive_handle().await;
-        handle
-            .send(Some(dir))
-            .map_err(|_| AppError::Internal("主题守护未运行".to_string()))
+        self.set_theme_directive(Some(dir)).await
     }
 
     /// Hot-write a theme's native settings over CDP (running Codex, official
@@ -1087,7 +1178,11 @@ impl ThemeService {
     pub async fn turn_off_live(&self) -> Result<(), AppError> {
         let inner = self.inner.lock().await;
         if let Some(tx) = &inner.directive_tx {
-            let _ = tx.send(None);
+            let next = {
+                let current = tx.borrow();
+                current.with_theme(None)
+            };
+            let _ = tx.send(next);
         }
         Ok(())
     }
@@ -1101,11 +1196,11 @@ impl ThemeService {
             return;
         };
         let current = tx.borrow().clone();
-        if let Some(dir) = current {
+        if let Some(dir) = &current.theme_dir {
             if let Ok(rel) = dir.strip_prefix(old_root) {
                 let rebased = new_root.join(rel);
                 if rebased.join("theme.json").is_file() {
-                    let _ = tx.send(Some(rebased));
+                    let _ = tx.send(current.with_theme(Some(rebased)));
                 }
             }
         }
@@ -1150,11 +1245,9 @@ impl ThemeService {
         if codex_theme_engine::cdp::cdp_http_ready(THEME_CDP_PORT).await {
             match self.hot_apply_native(&theme_id, &native, false).await {
                 Ok(()) => {
-                    let handle = self.directive_handle().await;
-                    handle
-                        .send(Some(dir.clone()))
-                        .map_err(|_| AppError::Internal("主题守护未运行".to_string()))?;
-                    self.wait_daemon_theme(&theme_id, Duration::from_secs(30)).await?;
+                    self.set_theme_directive(Some(dir.clone())).await?;
+                    self.wait_daemon_theme(&theme_id, Duration::from_secs(30))
+                        .await?;
                     remove_stash(); // applied == kept: the try-on stash is consumed
                     return Ok(());
                 }
@@ -1193,26 +1286,7 @@ impl ThemeService {
             }
         };
 
-        // Plain relaunch into CDP mode — the native layer is synced hot after
-        // the debug port is up, so nothing here races Codex's config persist.
-        let disable_self_updates = settings.disable_codex_self_updates;
-        tauri::async_runtime::spawn_blocking(move || -> Result<(), AppError> {
-            let installed = installed_codex_path()?;
-            quit_codex(&installed)?;
-            launch_codex_with_cdp(&installed, THEME_CDP_PORT, disable_self_updates)
-        })
-        .await
-        .map_err(|e| AppError::Internal(format!("主题应用任务失败: {e}")))??;
-
-        let deadline = tokio::time::Instant::now() + CDP_WAIT;
-        while !codex_theme_engine::cdp::cdp_http_ready(THEME_CDP_PORT).await {
-            if tokio::time::Instant::now() >= deadline {
-                return Err(AppError::Engine(
-                    "Codex 已启动但调试端口未就绪".to_string(),
-                ));
-            }
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        }
+        self.restart_debuggable(settings).await?;
 
         if let Some(native) = &native {
             let stash_first = matches!(sync, NativeSync::Hot);
@@ -1228,15 +1302,167 @@ impl ThemeService {
             }
         }
 
-        let handle = self.directive_handle().await;
-        handle
-            .send(Some(dir))
-            .map_err(|_| AppError::Internal("主题守护未运行".to_string()))?;
+        self.set_theme_directive(Some(dir)).await?;
         if matches!(sync, NativeSync::HotThenFile) {
-            self.wait_daemon_theme(&theme_id, Duration::from_secs(30)).await?;
+            self.wait_daemon_theme(&theme_id, Duration::from_secs(30))
+                .await?;
             remove_stash();
         }
         Ok(())
+    }
+
+    async fn restart_debuggable(&self, settings: &AppSettings) -> Result<(), AppError> {
+        if !theme_supported() {
+            return Err(AppError::UnsupportedPlatform);
+        }
+        // The native layer is synced only after the debug port is up, so
+        // nothing here races Codex's settings persistence on exit.
+        let disable_self_updates = settings.disable_codex_self_updates;
+        let locale = settings.codex_locale.clone();
+        tauri::async_runtime::spawn_blocking(move || -> Result<(), AppError> {
+            let installed = installed_codex_path()?;
+            quit_codex(&installed)?;
+            launch_codex_with_cdp(
+                &installed,
+                THEME_CDP_PORT,
+                disable_self_updates,
+                locale.as_deref(),
+            )
+        })
+        .await
+        .map_err(|e| AppError::Internal(format!("主题应用任务失败: {e}")))??;
+
+        let deadline = tokio::time::Instant::now() + CDP_WAIT;
+        while !codex_theme_engine::cdp::cdp_http_ready(THEME_CDP_PORT).await {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(AppError::Engine("Codex 已启动但调试端口未就绪".to_string()));
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        Ok(())
+    }
+
+    /// Restart Codex with loopback-only CDP, persist its official renderer
+    /// locale setting, then prove the requested catalog actually loaded.
+    pub async fn apply_locale_with_restart(
+        &self,
+        settings: &AppSettings,
+    ) -> Result<CodexLocaleApplyResult, AppError> {
+        if !theme_supported() {
+            return Err(AppError::UnsupportedPlatform);
+        }
+        ensure_no_pending_tx()?;
+        let plan = native_hot::codex_locale_plan(
+            settings.codex_locale.as_deref(),
+            settings.codex_theme.as_deref(),
+        )
+        .map_err(|e| AppError::Engine(e.to_string()))?;
+        let mut launch_settings = settings.clone();
+        launch_settings.codex_locale = plan.chromium_locale.clone();
+
+        // A previous fallback directive must not race the official catalog
+        // probe in the newly started renderer.
+        self.set_locale_directive(None).await?;
+
+        if let Some(theme_ref) = plan.active_theme {
+            self.restart_debuggable_and_inject(
+                &launch_settings,
+                &theme_ref,
+                NativeSync::HotThenFile,
+            )
+            .await?;
+        } else {
+            self.restart_debuggable(&launch_settings).await?;
+        }
+
+        let mut targets =
+            codex_theme_engine::cdp::connect_codex_targets(THEME_CDP_PORT, Duration::from_secs(8))
+                .await
+                .map_err(|e| AppError::Engine(e.to_string()))?;
+        let session = targets.remove(0).session;
+        for extra in targets {
+            extra.session.close();
+        }
+        let version_hint = codex_version_hint();
+        let outcome = async {
+            native_hot::write_verified_value(
+                &session,
+                "localeOverride",
+                plan.setting_value,
+                version_hint.as_deref(),
+            )
+            .await
+            .map_err(|e| AppError::Engine(e.to_string()))?;
+            if !plan.requires_catalog {
+                return Ok(CodexLocaleApplyResult {
+                    mode: LocaleMode::SystemDefault,
+                    locale: None,
+                    translated_nodes: 0,
+                    catalog_entries: 0,
+                });
+            }
+
+            match native_hot::wait_for_locale_catalog(&session, "zh-CN", Duration::from_secs(4))
+                .await
+            {
+                Ok(()) => {
+                    return Ok(CodexLocaleApplyResult {
+                        mode: LocaleMode::OfficialCatalog,
+                        locale: Some("zh-CN".to_string()),
+                        translated_nodes: 0,
+                        catalog_entries: 0,
+                    });
+                }
+                Err(error)
+                    if error
+                        .to_string()
+                        .contains("codex-locale-catalog-not-loaded") => {}
+                Err(error) => return Err(AppError::Engine(error.to_string())),
+            }
+
+            let payload = build_zh_cn_payload().map_err(|e| AppError::Engine(e.to_string()))?;
+            self.run_with_locale_fallback(async {
+                session.evaluate(&payload.payload).await.map_err(|e| {
+                    AppError::Engine(format!("codex-locale-runtime-install-failed: {e}"))
+                })?;
+
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+                loop {
+                    let runtime_error =
+                        match session.evaluate(CURRENT_LOCALE_REPORT_EXPRESSION).await {
+                            Ok(value) => {
+                                match serde_json::from_value::<LocaleRuntimeReport>(value) {
+                                    Ok(report) => match validate_runtime_report(&payload, &report) {
+                                        Ok(()) => {
+                                            break Ok(CodexLocaleApplyResult {
+                                                mode: LocaleMode::CompatibilityRuntime,
+                                                locale: Some("zh-CN".to_string()),
+                                                translated_nodes: report.translated_nodes,
+                                                catalog_entries: report.catalog_entries,
+                                            });
+                                        }
+                                        Err(error) => error.to_string(),
+                                    },
+                                    Err(error) => format!(
+                                        "codex-locale-runtime-install-failed: invalid runtime report: {error}"
+                                    ),
+                                }
+                            }
+                            Err(error) => {
+                                format!("codex-locale-runtime-install-failed: {error}")
+                            }
+                        };
+                    if tokio::time::Instant::now() >= deadline {
+                        break Err(AppError::Engine(runtime_error));
+                    }
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+            })
+            .await
+        }
+        .await;
+        session.close();
+        outcome
     }
 
     /// The stopped-Codex fallback (SPEC §8): quiesce → transactional
@@ -1253,12 +1479,13 @@ impl ThemeService {
     ) -> Result<(), AppError> {
         let disable_self_updates = settings.disable_codex_self_updates;
         let previous_active = settings.codex_theme.clone();
+        let locale = settings.codex_locale.clone();
         let native_clone = native.clone();
         let id = theme_id.to_string();
 
         // Blocking half: quit, settle, write-under-transaction, relaunch.
-        let mut tx = tauri::async_runtime::spawn_blocking(
-            move || -> Result<NativeTransaction, AppError> {
+        let mut tx =
+            tauri::async_runtime::spawn_blocking(move || -> Result<NativeTransaction, AppError> {
                 let installed = installed_codex_path()?;
                 let was_running = codex_running();
                 quit_codex(&installed)?;
@@ -1286,7 +1513,8 @@ impl ThemeService {
                         &codex_theme_engine::native::apply_plan(&native_clone),
                     )
                     .map_err(|e| AppError::Engine(e.to_string()))?;
-                    tx.stage(&planned).map_err(|e| AppError::Engine(e.to_string()))?;
+                    tx.stage(&planned)
+                        .map_err(|e| AppError::Engine(e.to_string()))?;
                     codex_theme_engine::native::write_config_atomic(&paths, &planned)
                         .map_err(|e| AppError::Engine(e.to_string()))?;
                     let on_disk = std::fs::read_to_string(&paths.config)
@@ -1299,7 +1527,12 @@ impl ThemeService {
                 })();
                 match staged_write {
                     Ok(()) => {
-                        launch_codex_with_cdp(&installed, THEME_CDP_PORT, disable_self_updates)?;
+                        launch_codex_with_cdp(
+                            &installed,
+                            THEME_CDP_PORT,
+                            disable_self_updates,
+                            locale.as_deref(),
+                        )?;
                         let _ = tx.set_phase(Phase::CodexLaunched);
                         Ok(tx)
                     }
@@ -1313,27 +1546,22 @@ impl ThemeService {
                         Err(error)
                     }
                 }
-            },
-        )
-        .await
-        .map_err(|e| AppError::Internal(format!("主题应用任务失败: {e}")))??;
+            })
+            .await
+            .map_err(|e| AppError::Internal(format!("主题应用任务失败: {e}")))??;
 
         // Async half: CDP ready → inject → daemon confirmation → commit.
         let post_launch: Result<(), AppError> = async {
             let deadline = tokio::time::Instant::now() + CDP_WAIT;
             while !codex_theme_engine::cdp::cdp_http_ready(THEME_CDP_PORT).await {
                 if tokio::time::Instant::now() >= deadline {
-                    return Err(AppError::Engine(
-                        "Codex 已启动但调试端口未就绪".to_string(),
-                    ));
+                    return Err(AppError::Engine("Codex 已启动但调试端口未就绪".to_string()));
                 }
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
-            let handle = self.directive_handle().await;
-            handle
-                .send(Some(dir.to_path_buf()))
-                .map_err(|_| AppError::Internal("主题守护未运行".to_string()))?;
-            self.wait_daemon_theme(theme_id, Duration::from_secs(30)).await?;
+            self.set_theme_directive(Some(dir.to_path_buf())).await?;
+            self.wait_daemon_theme(theme_id, Duration::from_secs(30))
+                .await?;
             Ok(())
         }
         .await;
@@ -1417,7 +1645,8 @@ impl ThemeService {
                 let planned = codex_theme_engine::native::planned_restore_text(&paths, &current)
                     .map_err(|e| AppError::Engine(e.to_string()))?
                     .ok_or_else(|| AppError::Engine("原生备份缺失".to_string()))?;
-                tx.stage(&planned).map_err(|e| AppError::Engine(e.to_string()))?;
+                tx.stage(&planned)
+                    .map_err(|e| AppError::Engine(e.to_string()))?;
                 codex_theme_engine::native::write_config_atomic(&paths, &planned)
                     .map_err(|e| AppError::Engine(e.to_string()))?;
                 let on_disk = std::fs::read_to_string(&paths.config)
@@ -1456,7 +1685,7 @@ impl ThemeService {
 }
 
 #[cfg(target_os = "macos")]
-fn installed_codex_path() -> Result<PathBuf, AppError> {
+pub(crate) fn installed_codex_path() -> Result<PathBuf, AppError> {
     crate::app::mac_update::detect_managed_installed()
         .map(|installed| PathBuf::from(installed.path))
         .ok_or_else(|| AppError::Engine("没有可用的 Codex 安装".to_string()))
@@ -1465,8 +1694,13 @@ fn installed_codex_path() -> Result<PathBuf, AppError> {
 #[cfg(target_os = "macos")]
 fn codex_running() -> bool {
     installed_codex_path()
-        .map(|path| codex_mac_engine::swap::codex_running_at(&path))
+        .and_then(|path| codex_running_at_checked(&path))
         .unwrap_or(false)
+}
+
+#[cfg(target_os = "macos")]
+fn codex_running_at_checked(installed: &std::path::Path) -> Result<bool, AppError> {
+    Ok(codex_mac_engine::swap::codex_running_at(installed))
 }
 
 #[cfg(target_os = "macos")]
@@ -1483,6 +1717,7 @@ fn launch_codex_with_cdp(
     installed: &std::path::Path,
     port: u16,
     disable_self_updates: bool,
+    locale: Option<&str>,
 ) -> Result<(), AppError> {
     if disable_self_updates {
         crate::app::codex_self_update::sync_setting(true)?;
@@ -1499,7 +1734,11 @@ fn launch_codex_with_cdp(
         .arg(installed)
         .arg("--args")
         .arg("--remote-debugging-address=127.0.0.1")
-        .arg(format!("--remote-debugging-port={port}"))
+        .arg(format!("--remote-debugging-port={port}"));
+    if let Some(locale) = locale.map(str::trim).filter(|l| !l.is_empty()) {
+        command.arg(format!("--lang={locale}"));
+    }
+    command
         .spawn()
         .map(|_| ())
         .map_err(|e| AppError::Engine(format!("以调试模式打开 Codex 失败: {e}")))
@@ -1513,9 +1752,9 @@ fn launch_codex_plain() -> Result<(), AppError> {
 #[cfg(target_os = "windows")]
 fn windows_domain_settings() -> crate::domain::settings::AppSettings {
     let saved = AppSettings::load();
-    let mut settings =
-        crate::domain::settings::AppSettings::new(String::new(), saved.install_root);
+    let mut settings = crate::domain::settings::AppSettings::new(String::new(), saved.install_root);
     settings.disable_codex_self_updates = saved.disable_codex_self_updates;
+    settings.locale = saved.codex_locale.clone();
     settings
 }
 
@@ -1527,18 +1766,21 @@ fn installed_windows_codex() -> Result<codex_win_engine::InstalledWindowsCodex, 
 }
 
 #[cfg(target_os = "windows")]
-fn installed_codex_path() -> Result<PathBuf, AppError> {
+pub(crate) fn installed_codex_path() -> Result<PathBuf, AppError> {
     installed_windows_codex().map(|installed| PathBuf::from(installed.path))
 }
 
 #[cfg(target_os = "windows")]
 fn codex_running() -> bool {
     installed_codex_path()
-        .and_then(|path| {
-            codex_win_engine::codex_running_for_root(&path)
-                .map_err(|e| AppError::Engine(e.to_string()))
-        })
+        .and_then(|path| codex_running_at_checked(&path))
         .unwrap_or(false)
+}
+
+#[cfg(target_os = "windows")]
+fn codex_running_at_checked(installed: &std::path::Path) -> Result<bool, AppError> {
+    codex_win_engine::codex_running_for_root(installed)
+        .map_err(|error| AppError::Engine(error.to_string()))
 }
 
 #[cfg(target_os = "windows")]
@@ -1552,6 +1794,7 @@ fn launch_codex_with_cdp(
     installed: &std::path::Path,
     port: u16,
     disable_self_updates: bool,
+    locale: Option<&str>,
 ) -> Result<(), AppError> {
     if disable_self_updates {
         crate::app::codex_self_update::sync_setting(true)?;
@@ -1573,6 +1816,10 @@ fn launch_codex_with_cdp(
         codex_win_engine::LaunchOptions {
             disable_codex_self_updates: disable_self_updates,
             remote_debugging_port: Some(port),
+            locale: locale
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(str::to_string),
         },
     )
     .map_err(|e| AppError::Engine(format!("以调试模式打开 Codex 失败: {e}")))
@@ -1584,13 +1831,18 @@ fn launch_codex_plain() -> Result<(), AppError> {
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-fn installed_codex_path() -> Result<PathBuf, AppError> {
+pub(crate) fn installed_codex_path() -> Result<PathBuf, AppError> {
     Err(AppError::UnsupportedPlatform)
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn codex_running() -> bool {
     false
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn codex_running_at_checked(_installed: &std::path::Path) -> Result<bool, AppError> {
+    Err(AppError::UnsupportedPlatform)
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -1603,6 +1855,7 @@ fn launch_codex_with_cdp(
     _installed: &std::path::Path,
     _port: u16,
     _disable_self_updates: bool,
+    _locale: Option<&str>,
 ) -> Result<(), AppError> {
     Err(AppError::UnsupportedPlatform)
 }
@@ -1612,27 +1865,124 @@ fn launch_codex_plain() -> Result<(), AppError> {
     Err(AppError::UnsupportedPlatform)
 }
 
-/// Launch hook for the ordinary 〔打开 Codex〕 action: when a theme is the
-/// persisted selection, launching through the manager transparently becomes
-/// "launch debuggable + keep themed".
+/// Stop Codex before replacing configuration it persists again on exit.
+pub fn stop_for_external_config_write() -> Result<bool, AppError> {
+    let installed = installed_codex_path()?;
+    stop_detected_codex(&installed, codex_running_at_checked, quit_codex, || {
+        std::thread::sleep(CONFIG_SETTLE)
+    })
+}
+
+pub fn restart_codex_plain() -> Result<(), AppError> {
+    let installed = installed_codex_path()?;
+    stop_detected_codex(&installed, codex_running_at_checked, quit_codex, || {
+        std::thread::sleep(CONFIG_SETTLE)
+    })?;
+    launch_codex_plain()
+}
+
+fn stop_detected_codex<Detect, Quit, Settle>(
+    installed: &std::path::Path,
+    detect: Detect,
+    quit: Quit,
+    settle: Settle,
+) -> Result<bool, AppError>
+where
+    Detect: FnOnce(&std::path::Path) -> Result<bool, AppError>,
+    Quit: FnOnce(&std::path::Path) -> Result<(), AppError>,
+    Settle: FnOnce(),
+{
+    let was_running = detect(installed)?;
+    if was_running {
+        quit(installed)?;
+        settle();
+    }
+    Ok(was_running)
+}
+
+#[cfg(test)]
+mod external_config_write_tests {
+    use std::path::Path;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use super::*;
+
+    #[test]
+    fn process_detection_errors_abort_before_quitting_codex() {
+        let quit_called = AtomicBool::new(false);
+
+        let result = stop_detected_codex(
+            Path::new("Codex"),
+            |_| Err(AppError::Internal("process detection failed".into())),
+            |_| {
+                quit_called.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+            || {},
+        );
+
+        assert!(result.is_err());
+        assert!(!quit_called.load(Ordering::SeqCst));
+    }
+}
+
+/// Launch hook for the ordinary 〔打开 Codex〕 action: persisted themes and
+/// compatibility localization both require loopback CDP, so either selection
+/// transparently becomes a debuggable launch with its daemon active.
 pub async fn launch_with_active_theme(
     service: &ThemeService,
     settings: &AppSettings,
 ) -> Result<bool, AppError> {
-    let Some(theme_ref) = settings.codex_theme.clone() else {
-        return Ok(false);
-    };
     if !theme_supported() {
         return Ok(false);
     }
-    match service.apply_with_restart(settings, &theme_ref).await {
-        Ok(()) => Ok(true),
-        Err(error) => {
-            // A broken/missing theme must never brick the launch button:
-            // surface in logs, launch plainly.
-            log::warn!("themed launch failed, falling back to plain launch: {error}");
-            Ok(false)
-        }
+    if let Some(theme_ref) = settings.codex_theme.clone() {
+        return match service.apply_with_restart(settings, &theme_ref).await {
+            Ok(()) => Ok(true),
+            Err(error) => {
+                // A broken/missing theme must never brick the launch button:
+                // surface in logs, launch plainly.
+                log::warn!("themed launch failed, falling back to plain launch: {error}");
+                Ok(false)
+            }
+        };
+    }
+    if service
+        .start_persisted_locale_daemon(settings.codex_locale_compatibility)
+        .await?
+    {
+        service.restart_debuggable(settings).await?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+#[cfg(test)]
+mod locale_fallback_directive_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn persisted_compatibility_starts_locale_daemon() {
+        let service = ThemeService::new(true);
+        assert!(service.start_persisted_locale_daemon(true).await.unwrap());
+        let handle = service.directive_handle().await;
+
+        assert_eq!(handle.borrow().locale, Some(LocaleDirective::ZhCn));
+        assert!(!handle.is_closed());
+    }
+
+    #[tokio::test]
+    async fn failed_locale_fallback_clears_daemon_directive() {
+        let service = ThemeService::default();
+        let result = service
+            .run_with_locale_fallback(async {
+                Err::<(), AppError>(AppError::Engine("fallback verification failed".to_string()))
+            })
+            .await;
+
+        assert!(result.is_err());
+        let handle = service.directive_handle().await;
+        assert_eq!(handle.borrow().locale, None);
     }
 }
 
@@ -1707,7 +2057,10 @@ mod delete_store_skin_tests {
         std::os::unix::fs::symlink(&target, &link).unwrap();
 
         let err = delete_store_skin(&settings_with_store(&store), "linky").unwrap_err();
-        assert!(matches!(err, AppError::Engine(_)), "a symlink must be refused");
+        assert!(
+            matches!(err, AppError::Engine(_)),
+            "a symlink must be refused"
+        );
         assert!(
             std::fs::symlink_metadata(&link)
                 .unwrap()

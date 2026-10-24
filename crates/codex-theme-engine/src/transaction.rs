@@ -44,7 +44,10 @@ pub enum Phase {
 
 impl Phase {
     pub fn terminal(self) -> bool {
-        matches!(self, Phase::Committed | Phase::RolledBack | Phase::RecoveryRequired)
+        matches!(
+            self,
+            Phase::Committed | Phase::RolledBack | Phase::RecoveryRequired
+        )
     }
 }
 
@@ -99,7 +102,8 @@ fn write_atomic_fsync(path: &Path, bytes: &[u8]) -> Result<()> {
         std::process::id()
     ));
     let mut file = std::fs::File::create(&tmp).map_err(|e| err(format!("tx temp: {e}")))?;
-    file.write_all(bytes).map_err(|e| err(format!("tx write: {e}")))?;
+    file.write_all(bytes)
+        .map_err(|e| err(format!("tx write: {e}")))?;
     file.sync_all().map_err(|e| err(format!("tx fsync: {e}")))?;
     drop(file);
     std::fs::rename(&tmp, path).map_err(|e| err(format!("tx commit: {e}")))?;
@@ -126,10 +130,17 @@ impl LockGuard {
             std::fs::create_dir_all(parent).map_err(|e| err(format!("lock dir: {e}")))?;
         }
         for attempt in 0..2 {
-            match std::fs::OpenOptions::new().write(true).create_new(true).open(path) {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+            {
                 Ok(mut file) => {
                     let _ = file.write_all(std::process::id().to_string().as_bytes());
-                    return Ok(Self { path: path.to_path_buf(), owned: true });
+                    return Ok(Self {
+                        path: path.to_path_buf(),
+                        owned: true,
+                    });
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     if attempt == 0 && Self::holder_is_dead(path) {
@@ -175,9 +186,7 @@ impl LockGuard {
             std::process::Command::new("tasklist")
                 .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
                 .output()
-                .map(|o| {
-                    !String::from_utf8_lossy(&o.stdout).contains(&format!("\"{pid}\""))
-                })
+                .map(|o| !String::from_utf8_lossy(&o.stdout).contains(&format!("\"{pid}\"")))
                 .unwrap_or(false)
         }
         #[cfg(all(not(unix), not(windows)))]
@@ -189,7 +198,10 @@ impl LockGuard {
 
 fn lock_age_secs(path: &Path) -> Option<u64> {
     let modified = std::fs::metadata(path).ok()?.modified().ok()?;
-    std::time::SystemTime::now().duration_since(modified).ok().map(|d| d.as_secs())
+    std::time::SystemTime::now()
+        .duration_since(modified)
+        .ok()
+        .map(|d| d.as_secs())
 }
 
 impl Drop for LockGuard {
@@ -277,8 +289,7 @@ impl NativeTransaction {
     }
 
     pub fn preimage_text(&self) -> Result<String> {
-        std::fs::read_to_string(&self.preimage_path)
-            .map_err(|e| err(format!("read preimage: {e}")))
+        std::fs::read_to_string(&self.preimage_path).map_err(|e| err(format!("read preimage: {e}")))
     }
 
     pub fn preimage_sha256(&self) -> &str {
@@ -467,8 +478,8 @@ pub fn recover_pending(root: &Path, config: &Path) -> Result<Option<RecoveryActi
             let _ = std::fs::remove_dir_all(&pending.dir);
         }
         RecoveryAction::RestorePreimage => {
-            let preimage = std::fs::read(&pending.preimage)
-                .map_err(|e| err(format!("read preimage: {e}")))?;
+            let preimage =
+                std::fs::read(&pending.preimage).map_err(|e| err(format!("read preimage: {e}")))?;
             if sha256_hex(&preimage) != pending.journal.preimage_sha256 {
                 return mark_recovery_required(pending, "preimage 校验失败");
             }
@@ -524,7 +535,8 @@ mod tests {
 
         let mut tx = begin(&root, &config);
         assert_eq!(tx.journal().phase, Phase::Prepared);
-        tx.stage("model = \"o4\"\nappearanceTheme = \"dark\"\n").unwrap();
+        tx.stage("model = \"o4\"\nappearanceTheme = \"dark\"\n")
+            .unwrap();
         tx.set_phase(Phase::CodexStopped).unwrap();
         tx.set_phase(Phase::ConfigCommitted).unwrap();
         tx.commit().unwrap();
@@ -609,7 +621,10 @@ mod tests {
 
         let action = recover_pending(&root, &config).unwrap();
         assert_eq!(action, Some(RecoveryAction::RestorePreimage));
-        assert_eq!(std::fs::read_to_string(&config).unwrap(), "original = true\n");
+        assert_eq!(
+            std::fs::read_to_string(&config).unwrap(),
+            "original = true\n"
+        );
         assert!(!dir.exists(), "evidence cleaned after successful rollback");
         assert!(pending_transaction(&root).unwrap().is_none());
     }

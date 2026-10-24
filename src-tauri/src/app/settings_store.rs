@@ -163,6 +163,14 @@ pub struct AppSettings {
     /// page, which migrates existing skins to the new location.
     #[serde(default)]
     pub codex_theme_store_dir: Option<String>,
+    /// Codex UI locale applied via Chromium `--lang` and the official
+    /// `localeOverride` setting. None = follow the system locale.
+    #[serde(default)]
+    pub codex_locale: Option<String>,
+    /// Whether the last successful Simplified Chinese apply required the
+    /// manager-owned compatibility runtime instead of Codex's official catalog.
+    #[serde(default)]
+    pub codex_locale_compatibility: bool,
     /// User-defined local skin groups, in display order. Each holds an ordered
     /// list of skin ids; a skin may sit in several groups. The source partitions
     /// (store-installed vs dev-local) are derived from each skin's origin, not
@@ -219,6 +227,10 @@ struct RawAppSettings {
     #[serde(default)]
     codex_theme_store_dir: Option<String>,
     #[serde(default)]
+    codex_locale: Option<String>,
+    #[serde(default)]
+    codex_locale_compatibility: bool,
+    #[serde(default)]
     skin_groups: Vec<SkinGroup>,
 }
 
@@ -260,6 +272,8 @@ impl Default for AppSettings {
             codex_theme: None,
             codex_theme_dir: None,
             codex_theme_store_dir: None,
+            codex_locale: None,
+            codex_locale_compatibility: false,
             skin_groups: Vec::new(),
         }
     }
@@ -309,6 +323,8 @@ impl RawAppSettings {
                 codex_theme: self.codex_theme,
                 codex_theme_dir: self.codex_theme_dir,
                 codex_theme_store_dir: self.codex_theme_store_dir,
+                codex_locale: self.codex_locale,
+                codex_locale_compatibility: self.codex_locale_compatibility,
                 skin_groups: self.skin_groups,
             },
             unknown_source,
@@ -348,6 +364,16 @@ impl AppSettings {
         }
         self.custom_url = self.custom_url.trim().to_string();
         self.custom_proxy_url = self.custom_proxy_url.trim().to_string();
+        // A blank/whitespace codex_locale is not a real choice — collapse it to
+        // None so the launch paths omit `--lang` (a bare `--lang=` would reach
+        // Codex otherwise) and disk/runtime agree.
+        if let Some(locale) = &self.codex_locale {
+            let trimmed = locale.trim();
+            self.codex_locale = (!trimmed.is_empty()).then(|| trimmed.to_string());
+        }
+        if self.codex_locale.as_deref() != Some("zh-CN") {
+            self.codex_locale_compatibility = false;
+        }
         // Empty custom modes are not a real runtime choice (update paths fall
         // back silently). Coerce so UI selection, disk, and runtime agree.
         if self.source == UpdateSource::Custom && self.custom_url.is_empty() {
@@ -467,6 +493,108 @@ mod tests {
         assert!(!settings.disable_codex_self_updates);
         assert!(unknown_source.is_none());
         assert!(newer_schema.is_none());
+    }
+
+    #[test]
+    fn codex_locale_defaults_absent_and_round_trips_when_present() {
+        // Old settings.json without the key deserializes to None (back-compat).
+        let raw: RawAppSettings = serde_json::from_str(
+            r#"{
+                "source": "auto",
+                "customUrl": "",
+                "askBefore": true,
+                "signedOnly": true
+            }"#,
+        )
+        .unwrap();
+        let (settings, _, _) = raw.into_settings();
+        assert_eq!(settings.codex_locale, None);
+
+        // A persisted `codexLocale` (camelCase) round-trips to the field.
+        let raw: RawAppSettings = serde_json::from_str(
+            r#"{
+                "source": "auto",
+                "customUrl": "",
+                "askBefore": true,
+                "signedOnly": true,
+                "codexLocale": "zh-CN"
+            }"#,
+        )
+        .unwrap();
+        let (settings, _, _) = raw.into_settings();
+        assert_eq!(settings.codex_locale.as_deref(), Some("zh-CN"));
+
+        // And it serializes back out as camelCase.
+        let json = serde_json::to_value(&settings).unwrap();
+        assert_eq!(json["codexLocale"], "zh-CN");
+    }
+
+    #[test]
+    fn codex_locale_compatibility_defaults_false_and_round_trips_true() {
+        let raw: RawAppSettings = serde_json::from_str(
+            r#"{
+                "source": "auto",
+                "customUrl": "",
+                "askBefore": true,
+                "signedOnly": true,
+                "codexLocale": "zh-CN"
+            }"#,
+        )
+        .unwrap();
+        let (settings, _, _) = raw.into_settings();
+        assert!(!settings.codex_locale_compatibility);
+
+        let mut settings = settings;
+        settings.codex_locale_compatibility = true;
+        let json = serde_json::to_value(&settings).unwrap();
+        assert_eq!(json["codexLocaleCompatibility"], true);
+
+        let raw: RawAppSettings = serde_json::from_value(json).unwrap();
+        let (settings, _, _) = raw.into_settings();
+        assert!(settings.codex_locale_compatibility);
+    }
+
+    #[test]
+    fn normalize_clears_compatibility_without_simplified_chinese_locale() {
+        let mut settings = AppSettings {
+            codex_locale: None,
+            codex_locale_compatibility: true,
+            ..AppSettings::default()
+        };
+        settings.normalize();
+        assert!(!settings.codex_locale_compatibility);
+
+        let mut settings = AppSettings {
+            codex_locale: Some("en-US".to_string()),
+            codex_locale_compatibility: true,
+            ..AppSettings::default()
+        };
+        settings.normalize();
+        assert!(!settings.codex_locale_compatibility);
+    }
+
+    #[test]
+    fn normalize_collapses_blank_codex_locale_and_trims_a_real_one() {
+        let mut settings = AppSettings {
+            codex_locale: Some("   ".to_string()),
+            ..AppSettings::default()
+        };
+        settings.normalize();
+        assert_eq!(settings.codex_locale, None, "whitespace-only -> None");
+
+        let mut settings = AppSettings {
+            codex_locale: Some(String::new()),
+            ..AppSettings::default()
+        };
+        settings.normalize();
+        assert_eq!(settings.codex_locale, None, "empty -> None");
+
+        let mut settings = AppSettings {
+            codex_locale: Some("  zh-CN  ".to_string()),
+            ..AppSettings::default()
+        };
+        settings.normalize();
+        assert_eq!(settings.codex_locale.as_deref(), Some("zh-CN"), "trimmed");
     }
 
     #[test]

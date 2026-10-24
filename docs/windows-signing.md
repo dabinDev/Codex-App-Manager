@@ -12,6 +12,41 @@ was submitted on 2026-07-11 and is still pending; the current Windows artifacts
 remain unsigned. See the public [code-signing policy](code-signing-policy.md) and
 [privacy policy](privacy.md).
 
+## Fail-closed local distributable command
+
+`npm run windows:distribute -- -Brand acid-orange ...` and
+`npm run windows:distribute -- -Brand rotten-tomato ...` are the only local
+commands intended to copy a branded installer into a delivery directory. They
+require an isolated brand worktree, an exact source commit, and a trusted PFX
+through `WINDOWS_CERTIFICATE`. `WINDOWS_EXPECTED_PUBLISHER` is also required and
+must contain the complete expected signer certificate Subject, which is matched exactly. The command signs and verifies the final NSIS
+bytes, archives them under the commit-specific artifact root, compares every
+SHA-256, backs up an existing delivery, and only then replaces it.
+
+The primary worktree is rejected. The isolated worktree may differ from the
+requested commit only by the complete built-in acid-orange or rotten-tomato
+brand profile and its generated Tauri configuration; application identity,
+binary name, updater endpoints, and all other fields remain pinned to the
+requested commit. Distribution builds and signs the exact x64 main executable
+first, bundles that executable into NSIS, then signs and verifies the installer.
+The archived installer is verified again before desktop delivery.
+
+The current machine has no trusted code-signing certificate, so this command is
+expected to fail before building or copying a package. Ordinary `tauri:build`
+remains available for development and may produce unsigned artifacts under the
+target directory, but those files are not distributable output. Smart App Control must not be disabled to work around this gate, and the project does not
+install or recommend a self-signed root certificate.
+
+中文说明：`windows:distribute` 是本地可分发包的强制签名入口。必须同时配置
+`WINDOWS_EXPECTED_PUBLISHER`，并确保它与签名证书 Subject 中的发行者身份匹配。缺少可信 PFX、
+签名无效、发行者不匹配、时间戳缺失或任一阶段哈希不一致时都会失败，并保持桌面旧包
+不变。普通开发构建仍可无签名，但不得作为“可直接安装”的交付包；不得关闭 Smart App
+Control，也不得向用户电脑安装自签根证书来绕过门禁。
+
+主工作树不能用于双品牌交付。品牌必须位于指定提交的隔离工作树，且只允许内置完整品牌
+档案及其自动派生的 Tauri 配置发生变化。交付流程先构建、验证并签名 x64 主程序，再将该
+主程序打入 NSIS 并签名安装器；归档后还会重新验证签名、时间戳与 SHA-256。
+
 ## 中文
 
 ### 当前状态
@@ -88,10 +123,11 @@ installer、主程序和 uninstaller 三层 PE 签名。
 1. 在 `release` environment 配置 secrets:
    - `WINDOWS_CERTIFICATE` — base64 编码的 OV/EV `.pfx`
    - `WINDOWS_CERTIFICATE_PASSWORD` — pfx 密码
-2. (可选) repo variable `WINDOWS_TIMESTAMP_URL` 覆盖默认 RFC3161 时间戳。
-3. 确认 `release.yml` 的 *Authenticode-sign Windows installer* 步骤对 `-setup.exe` 签出 `Valid`。
-4. 将 repo variable `AUTHENTICODE_REQUIRED=true`,使 `verify-windows-authenticode.ps1` 在 `required` 模式下失败即阻断发布。
-5. 中期目标:在 `tauri build` 前导入证书并配置 `bundle.windows.certificateThumbprint`,让主程序 + uninstaller + installer 在打包期一并签名(比只签外层 setup 更完整)。
+2. 配置 repo variable `WINDOWS_EXPECTED_PUBLISHER` 为证书完整 Subject；required 模式会精确匹配。
+3. (可选) repo variable `WINDOWS_TIMESTAMP_URL` 覆盖默认 RFC3161 时间戳。
+4. 确认 `release.yml` 的 *Authenticode-sign Windows installer* 步骤对 `-setup.exe` 签出 `Valid`。
+5. 将 repo variable `AUTHENTICODE_REQUIRED=true`,使 `verify-windows-authenticode.ps1` 在 `required` 模式下失败即阻断发布。
+6. 中期目标:在 `tauri build` 前导入证书并配置 `bundle.windows.certificateThumbprint`,让主程序 + uninstaller + installer 在打包期一并签名(比只签外层 setup 更完整)。
 
 脚本:
 
@@ -197,10 +233,11 @@ verify all three PE layers: installer, main executable, and uninstaller.
 1. Add secrets on the `release` environment:
    - `WINDOWS_CERTIFICATE` — base64-encoded OV/EV `.pfx`
    - `WINDOWS_CERTIFICATE_PASSWORD` — pfx password
-2. Optionally set repo variable `WINDOWS_TIMESTAMP_URL` for the RFC3161 timestamp server.
-3. Confirm the *Authenticode-sign Windows installer* step produces `Valid` on `-setup.exe`.
-4. Set repo variable `AUTHENTICODE_REQUIRED=true` so `verify-windows-authenticode.ps1` runs in `required` mode and fails the release if unsigned.
-5. Medium-term: import the cert before `tauri build` and set `bundle.windows.certificateThumbprint` so the main binary, uninstaller, and installer are all signed during packaging (more complete than outer-setup-only signing).
+2. Set repo variable `WINDOWS_EXPECTED_PUBLISHER` to the certificate's complete Subject; required mode compares it exactly.
+3. Optionally set repo variable `WINDOWS_TIMESTAMP_URL` for the RFC3161 timestamp server.
+4. Confirm the *Authenticode-sign Windows installer* step produces `Valid` on `-setup.exe`.
+5. Set repo variable `AUTHENTICODE_REQUIRED=true` so `verify-windows-authenticode.ps1` runs in `required` mode and fails the release if unsigned.
+6. Medium-term: import the cert before `tauri build` and set `bundle.windows.certificateThumbprint` so the main binary, uninstaller, and installer are all signed during packaging (more complete than outer-setup-only signing).
 
 Scripts:
 

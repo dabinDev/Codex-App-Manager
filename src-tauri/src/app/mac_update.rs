@@ -86,8 +86,9 @@ pub struct MacStageReport {
 /// arm64 / x64 Sparkle appcasts, served by the mirror (CN-reachable; enclosure
 /// URLs rewritten to R2/S3). EdDSA signatures are preserved (they sign bytes,
 /// not URLs), so the pinned-key verification still passes against mirrored files.
-pub const PROD_ARM64_APPCAST: &str = "https://codexapp.agentsmirror.com/latest/appcast.xml";
-pub const PROD_X64_APPCAST: &str = "https://codexapp.agentsmirror.com/latest/appcast-x64.xml";
+pub const PROD_ARM64_APPCAST: &str = concat!(env!("BRAND_MIRROR_BASE_URL"), "/latest/appcast.xml");
+pub const PROD_X64_APPCAST: &str =
+    concat!(env!("BRAND_MIRROR_BASE_URL"), "/latest/appcast-x64.xml");
 
 /// OpenAI's own Sparkle appcast (for users who can reach OpenAI directly — e.g.
 /// overseas users whose only blocker is that Windows can't use the Store).
@@ -815,13 +816,7 @@ pub fn perform_macos_update_with_network(
     progress: &dyn Fn(DownloadProgress),
     network: &NetworkConfig,
 ) -> Result<MacPerformReport, AppError> {
-    perform_macos_update_with_network_and_phase(
-        binary_delta,
-        expected,
-        progress,
-        network,
-        None,
-    )
+    perform_macos_update_with_network_and_phase(binary_delta, expected, progress, network, None)
 }
 
 pub fn perform_macos_update_with_network_and_phase(
@@ -1467,7 +1462,8 @@ fn install_macos_in_staging(
     } else {
         outcome.path = Some(install_path.to_string_lossy().into_owned());
         outcome.provenance = StepOutcome::failed("安装后未能读取 bundle 版本，托管记录未写入");
-        outcome.push_warning("已写入应用，但未能确认版本；请重新检查状态或「开始管理」".to_string());
+        outcome
+            .push_warning("已写入应用，但未能确认版本；请重新检查状态或「开始管理」".to_string());
         outcome.push_recovery(recovery::RECORD_PROVENANCE);
         outcome.install_class = Some("external".to_string());
         // Honest: app may be present but we couldn't classify it as managed.
@@ -1495,19 +1491,33 @@ pub fn launch_codex() -> Result<(), AppError> {
     }
     let path = &installed.path;
     log::info!("macOS launch Codex path={path}");
+    let locale = settings
+        .codex_locale
+        .as_deref()
+        .map(str::trim)
+        .filter(|l| !l.is_empty());
     let mut command = std::process::Command::new(OPEN);
     crate::app::codex_self_update::apply_to_command(
         &mut command,
         settings.disable_codex_self_updates,
     );
-    command
-        .arg(&installed.path)
-        .spawn()
-        .map(|_| ())
-        .map_err(|e| {
-            log::warn!("macOS launch Codex failed error={e}");
-            AppError::Engine(format!("打开 Codex 失败: {e}"))
-        })
+    // Forcing a UI locale needs the argument to reach the app itself. Plain
+    // `open <bundle>` merely activates it and drops trailing args, so switch to
+    // `open -n <bundle> --args --lang=<locale>` (a fresh instance) only when a
+    // locale override is set. `-n` must precede the bundle path.
+    if let Some(locale) = locale {
+        command
+            .arg("-n")
+            .arg(&installed.path)
+            .arg("--args")
+            .arg(format!("--lang={locale}"));
+    } else {
+        command.arg(&installed.path);
+    }
+    command.spawn().map(|_| ()).map_err(|e| {
+        log::warn!("macOS launch Codex failed error={e}");
+        AppError::Engine(format!("打开 Codex 失败: {e}"))
+    })
 }
 
 /// Preparing-phase abort latch. The download loop has its own cancel flag once
@@ -1740,11 +1750,7 @@ where
         match detect_install() {
             Some(installed) => {
                 let mut store = ProvenanceStore::load();
-                store.record(
-                    installed.path.clone(),
-                    installed.build,
-                    "manager-installed",
-                );
+                store.record(installed.path.clone(), installed.build, "manager-installed");
                 match store.save() {
                     Ok(()) => {
                         outcome.provenance = StepOutcome::ok();

@@ -22,6 +22,8 @@ pub enum OperationKind {
     Uninstall,
     SetInstallRoot,
     Adopt,
+    ProviderWrite,
+    ConversationAlignment,
 }
 
 impl OperationKind {
@@ -32,6 +34,8 @@ impl OperationKind {
             Self::Uninstall => "uninstall",
             Self::SetInstallRoot => "set-install-root",
             Self::Adopt => "adopt",
+            Self::ProviderWrite => "provider-write",
+            Self::ConversationAlignment => "conversation-alignment",
         }
     }
 }
@@ -412,10 +416,7 @@ impl OperationManager {
     /// Record positive evidence that every observed portable install-root
     /// mutation was restored. This does not clear `outcome_ambiguous`: a prior
     /// platform call such as Add-AppxPackage may still have changed system state.
-    pub fn mark_mutation_rolled_back(
-        &self,
-        token: &OperationToken,
-    ) -> Result<(), OperationError> {
+    pub fn mark_mutation_rolled_back(&self, token: &OperationToken) -> Result<(), OperationError> {
         let mut inner = self
             .inner
             .lock()
@@ -717,11 +718,7 @@ impl OperationManager {
 
     /// Mark the active op as paused (or clear the flag). Used when the UI
     /// requests pause so a reloaded frontend can restore the paused screen.
-    pub fn set_paused(
-        &self,
-        token: &OperationToken,
-        paused: bool,
-    ) -> Result<(), OperationError> {
+    pub fn set_paused(&self, token: &OperationToken, paused: bool) -> Result<(), OperationError> {
         let mut inner = self
             .inner
             .lock()
@@ -1151,10 +1148,7 @@ mod tests {
             }
         ));
         // Force quit still wins.
-        assert_eq!(
-            manager.quit_policy(true, true),
-            QuitPolicy::Allow
-        );
+        assert_eq!(manager.quit_policy(true, true), QuitPolicy::Allow);
 
         manager.end(token).unwrap();
         assert_eq!(manager.phase(), OperationPhase::Idle);
@@ -1164,8 +1158,8 @@ mod tests {
 
     #[test]
     fn snapshot_exposes_progress_phase_and_flags() {
-        use crate::app::op_phase::OperationPhase;
         use super::OperationProgress;
+        use crate::app::op_phase::OperationPhase;
 
         let path = lock_path("snapshot");
         let manager = OperationManager::new(path.clone());
@@ -1523,9 +1517,7 @@ mod tests {
 
         let ambiguous_rollback = manager.begin_detached(OperationKind::Update).unwrap();
         manager.validate(&ambiguous_rollback).unwrap();
-        manager
-            .mark_outcome_ambiguous(&ambiguous_rollback)
-            .unwrap();
+        manager.mark_outcome_ambiguous(&ambiguous_rollback).unwrap();
         manager.mark_mutation_started(&ambiguous_rollback).unwrap();
         manager
             .mark_mutation_rolled_back(&ambiguous_rollback)
@@ -1538,11 +1530,15 @@ mod tests {
 
         let mutation_after_rollback = manager.begin_detached(OperationKind::Update).unwrap();
         manager.validate(&mutation_after_rollback).unwrap();
-        manager.mark_mutation_started(&mutation_after_rollback).unwrap();
+        manager
+            .mark_mutation_started(&mutation_after_rollback)
+            .unwrap();
         manager
             .mark_mutation_rolled_back(&mutation_after_rollback)
             .unwrap();
-        manager.mark_mutation_started(&mutation_after_rollback).unwrap();
+        manager
+            .mark_mutation_started(&mutation_after_rollback)
+            .unwrap();
         let completion = manager
             .record_completion(&mutation_after_rollback, false)
             .unwrap();
@@ -1551,9 +1547,7 @@ mod tests {
 
         let ambiguous_call = manager.begin_detached(OperationKind::Update).unwrap();
         manager.validate(&ambiguous_call).unwrap();
-        manager
-            .mark_outcome_ambiguous(&ambiguous_call)
-            .unwrap();
+        manager.mark_outcome_ambiguous(&ambiguous_call).unwrap();
         let completion = manager.record_completion(&ambiguous_call, false).unwrap();
         assert_eq!(completion.state, OperationCompletionState::OutcomeUnknown);
         manager.end(ambiguous_call.clone()).unwrap();

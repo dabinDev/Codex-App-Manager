@@ -27,7 +27,7 @@ vi.mock("../services/managerApi", () => ({
     reportFrontendError: vi.fn(() => Promise.resolve()),
     getOperationSnapshot: vi.fn(() => Promise.resolve(null)),
     confirmQuit: vi.fn(() => Promise.resolve()),
-    frontendReady: vi.fn(() => Promise.resolve()),
+    frontendReady: vi.fn(() => Promise.resolve(null)),
     getSettings: vi.fn(() =>
       Promise.resolve({
         confirmClose: true,
@@ -102,7 +102,7 @@ beforeEach(() => {
   getDiagnostics.mockResolvedValue(diagnostics);
   getOperationSnapshot.mockResolvedValue(null);
   confirmQuit.mockResolvedValue(undefined);
-  frontendReady.mockResolvedValue(undefined);
+  frontendReady.mockResolvedValue(null);
   listenMock.mockResolvedValue(() => {});
 });
 
@@ -229,7 +229,7 @@ describe("ErrorBoundary", () => {
 
   it("retries a transient frontend-ready IPC failure until queued events can drain", async () => {
     const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
-    frontendReady.mockRejectedValueOnce(new Error("IPC warming up")).mockResolvedValue(undefined);
+    frontendReady.mockRejectedValueOnce(new Error("IPC warming up")).mockResolvedValue(null);
 
     render(
       <ThemeProvider>
@@ -253,11 +253,11 @@ describe("ErrorBoundary", () => {
     frontendReady
       .mockImplementationOnce(
         () =>
-          new Promise<void>((resolve) => {
-            resolveFirst = resolve;
+          new Promise<null>((resolve) => {
+            resolveFirst = () => resolve(null);
           }),
       )
-      .mockResolvedValue(undefined);
+      .mockResolvedValue(null);
 
     render(
       <ThemeProvider>

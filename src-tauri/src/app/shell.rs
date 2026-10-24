@@ -1,8 +1,7 @@
 use std::sync::Mutex;
 
+pub use crate::app::brand::PRODUCT_NAME;
 use crate::app::op_phase::QuitPolicy;
-
-pub const PRODUCT_NAME: &str = "Codex App Manager";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeLocale {
@@ -55,12 +54,12 @@ impl NativeLocale {
     pub fn menu(self) -> NativeMenuCopy {
         match self {
             Self::En => NativeMenuCopy {
-                about: "About Codex App Manager",
+                about: "About {product}",
                 services: "Services",
-                hide: "Hide Codex App Manager",
+                hide: "Hide {product}",
                 hide_others: "Hide Others",
                 show_all: "Show All",
-                quit: "Quit Codex App Manager",
+                quit: "Quit {product}",
                 edit: "Edit",
                 undo: "Undo",
                 redo: "Redo",
@@ -73,12 +72,12 @@ impl NativeLocale {
                 close_window: "Close Window",
             },
             Self::ZhCn => NativeMenuCopy {
-                about: "关于 Codex App Manager",
+                about: "关于 {product}",
                 services: "服务",
-                hide: "隐藏 Codex App Manager",
+                hide: "隐藏 {product}",
                 hide_others: "隐藏其他",
                 show_all: "全部显示",
-                quit: "退出 Codex App Manager",
+                quit: "退出 {product}",
                 edit: "编辑",
                 undo: "撤销",
                 redo: "重做",
@@ -91,12 +90,12 @@ impl NativeLocale {
                 close_window: "关闭窗口",
             },
             Self::ZhTw => NativeMenuCopy {
-                about: "關於 Codex App Manager",
+                about: "關於 {product}",
                 services: "服務",
-                hide: "隱藏 Codex App Manager",
+                hide: "隱藏 {product}",
                 hide_others: "隱藏其他",
                 show_all: "全部顯示",
-                quit: "結束 Codex App Manager",
+                quit: "結束 {product}",
                 edit: "編輯",
                 undo: "還原",
                 redo: "重做",
@@ -109,12 +108,12 @@ impl NativeLocale {
                 close_window: "關閉視窗",
             },
             Self::Ja => NativeMenuCopy {
-                about: "Codex App Managerについて",
+                about: "{product}について",
                 services: "サービス",
-                hide: "Codex App Managerを隠す",
+                hide: "{product}を隠す",
                 hide_others: "ほかを隠す",
                 show_all: "すべてを表示",
-                quit: "Codex App Managerを終了",
+                quit: "{product}を終了",
                 edit: "編集",
                 undo: "取り消す",
                 redo: "やり直す",
@@ -127,12 +126,12 @@ impl NativeLocale {
                 close_window: "ウインドウを閉じる",
             },
             Self::Ko => NativeMenuCopy {
-                about: "Codex App Manager에 관하여",
+                about: "{product}에 관하여",
                 services: "서비스",
-                hide: "Codex App Manager 가리기",
+                hide: "{product} 가리기",
                 hide_others: "기타 가리기",
                 show_all: "모두 보기",
-                quit: "Codex App Manager 종료",
+                quit: "{product} 종료",
                 edit: "편집",
                 undo: "실행 취소",
                 redo: "실행 복귀",
@@ -145,12 +144,12 @@ impl NativeLocale {
                 close_window: "윈도우 닫기",
             },
             Self::Fr => NativeMenuCopy {
-                about: "À propos de Codex App Manager",
+                about: "À propos de {product}",
                 services: "Services",
-                hide: "Masquer Codex App Manager",
+                hide: "Masquer {product}",
                 hide_others: "Masquer les autres",
                 show_all: "Tout afficher",
-                quit: "Quitter Codex App Manager",
+                quit: "Quitter {product}",
                 edit: "Édition",
                 undo: "Annuler",
                 redo: "Rétablir",
@@ -163,12 +162,12 @@ impl NativeLocale {
                 close_window: "Fermer la fenêtre",
             },
             Self::De => NativeMenuCopy {
-                about: "Über Codex App Manager",
+                about: "Über {product}",
                 services: "Dienste",
-                hide: "Codex App Manager ausblenden",
+                hide: "{product} ausblenden",
                 hide_others: "Andere ausblenden",
                 show_all: "Alle einblenden",
-                quit: "Codex App Manager beenden",
+                quit: "{product} beenden",
                 edit: "Bearbeiten",
                 undo: "Widerrufen",
                 redo: "Wiederholen",
@@ -181,12 +180,12 @@ impl NativeLocale {
                 close_window: "Fenster schließen",
             },
             Self::Es => NativeMenuCopy {
-                about: "Acerca de Codex App Manager",
+                about: "Acerca de {product}",
                 services: "Servicios",
-                hide: "Ocultar Codex App Manager",
+                hide: "Ocultar {product}",
                 hide_others: "Ocultar otros",
                 show_all: "Mostrar todo",
-                quit: "Salir de Codex App Manager",
+                quit: "Salir de {product}",
                 edit: "Edición",
                 undo: "Deshacer",
                 redo: "Rehacer",
@@ -199,12 +198,12 @@ impl NativeLocale {
                 close_window: "Cerrar ventana",
             },
             Self::PtBr => NativeMenuCopy {
-                about: "Sobre o Codex App Manager",
+                about: "Sobre o {product}",
                 services: "Serviços",
-                hide: "Ocultar Codex App Manager",
+                hide: "Ocultar {product}",
                 hide_others: "Ocultar Outros",
                 show_all: "Mostrar Tudo",
-                quit: "Encerrar Codex App Manager",
+                quit: "Encerrar {product}",
                 edit: "Editar",
                 undo: "Desfazer",
                 redo: "Refazer",
@@ -217,12 +216,12 @@ impl NativeLocale {
                 close_window: "Fechar Janela",
             },
             Self::Ru => NativeMenuCopy {
-                about: "О программе Codex App Manager",
+                about: "О программе {product}",
                 services: "Службы",
-                hide: "Скрыть Codex App Manager",
+                hide: "Скрыть {product}",
                 hide_others: "Скрыть остальные",
                 show_all: "Показать все",
-                quit: "Завершить Codex App Manager",
+                quit: "Завершить {product}",
                 edit: "Правка",
                 undo: "Отменить",
                 redo: "Повторить",
@@ -235,12 +234,12 @@ impl NativeLocale {
                 close_window: "Закрыть окно",
             },
             Self::Ar => NativeMenuCopy {
-                about: "حول Codex App Manager",
+                about: "حول {product}",
                 services: "الخدمات",
-                hide: "إخفاء Codex App Manager",
+                hide: "إخفاء {product}",
                 hide_others: "إخفاء الآخرين",
                 show_all: "إظهار الكل",
-                quit: "إنهاء Codex App Manager",
+                quit: "إنهاء {product}",
                 edit: "تحرير",
                 undo: "تراجع",
                 redo: "إعادة",
@@ -274,6 +273,20 @@ pub struct NativeMenuCopy {
     pub window: &'static str,
     pub minimize: &'static str,
     pub close_window: &'static str,
+}
+
+impl NativeMenuCopy {
+    pub fn about_product(&self) -> String {
+        self.about.replace("{product}", PRODUCT_NAME)
+    }
+
+    pub fn hide_product(&self) -> String {
+        self.hide.replace("{product}", PRODUCT_NAME)
+    }
+
+    pub fn quit_product(&self) -> String {
+        self.quit.replace("{product}", PRODUCT_NAME)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -548,7 +561,7 @@ impl FrontendGate {
 mod tests {
     use super::{
         FrontendFailureResult, FrontendGate, FrontendReadyResult, NativeLocale, ShellDispatch,
-        ShellEvent,
+        ShellEvent, PRODUCT_NAME,
     };
     use crate::app::op_phase::{OperationPhase, QuitPolicy};
 
@@ -588,7 +601,7 @@ mod tests {
             let menu = locale.menu();
             assert!(!menu.edit.is_empty(), "{tag}:edit");
             assert!(!menu.window.is_empty(), "{tag}:window");
-            assert!(menu.quit.contains("Codex App Manager"), "{tag}:quit");
+            assert!(menu.quit_product().contains(PRODUCT_NAME), "{tag}:quit");
         }
         assert_eq!(NativeLocale::from_tag("unsupported"), NativeLocale::En);
     }

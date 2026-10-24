@@ -8,7 +8,10 @@
 // Usage: node scripts/gen-updater-manifest.mjs <tag> <artifacts-dir>
 import { createHash } from "node:crypto";
 import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+import { artifactDownloadUrl, buildUpdaterManifest } from "./updater-manifest-lib.mjs";
 
 const [, , tag, dir] = process.argv;
 if (!tag || !dir) {
@@ -16,9 +19,8 @@ if (!tag || !dir) {
   process.exit(2);
 }
 const version = tag.replace(/^v/, "");
-const REPO = "Wangnov/Codex-App-Manager";
-const downloadUrl = (file) =>
-  `https://github.com/${REPO}/releases/download/${tag}/${encodeURIComponent(file)}`;
+const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
+const brand = JSON.parse(readFileSync(join(repoRoot, "brand.config.json"), "utf8"));
 
 const files = readdirSync(dir);
 const findSig = (re) => files.find((f) => re.test(f) && f.endsWith(".sig"));
@@ -34,7 +36,7 @@ const MATCHERS = [
 const REQUIRED_PLATFORMS = MATCHERS.map(([key]) => key);
 const allowPartialRelease = process.env.ALLOW_PARTIAL_RELEASE === "1";
 
-const platforms = {};
+const platformInputs = {};
 const resolved = [];
 for (const [key, re] of MATCHERS) {
   const sig = findSig(re);
@@ -48,10 +50,10 @@ for (const [key, re] of MATCHERS) {
     console.error(`[manifest] signature ${sig} resolved ${bundle}, but the bundle is missing`);
     process.exit(1);
   }
-  const url = downloadUrl(bundle);
-  platforms[key] = {
+  const url = artifactDownloadUrl(brand.updates.artifactBaseUrl, tag, bundle);
+  platformInputs[key] = {
     signature: readFileSync(join(dir, sig), "utf8").trim(),
-    url,
+    bundle,
   };
   resolved.push({
     platform: key,
@@ -62,12 +64,12 @@ for (const [key, re] of MATCHERS) {
   });
 }
 
-if (Object.keys(platforms).length === 0) {
+if (Object.keys(platformInputs).length === 0) {
   console.error("[manifest] no platforms resolved — check artifact globs");
   process.exit(1);
 }
 
-const missing = REQUIRED_PLATFORMS.filter((key) => !platforms[key]);
+const missing = REQUIRED_PLATFORMS.filter((key) => !platformInputs[key]);
 if (missing.length > 0) {
   const message = `[manifest] missing required platform artifacts: ${missing.join(", ")}`;
   if (!allowPartialRelease) {
@@ -78,12 +80,13 @@ if (missing.length > 0) {
   console.warn(`::warning::partial release allowed: missing ${missing.join(", ")}`);
 }
 
-const manifest = {
-  version,
-  notes: `Codex App Manager ${tag}`,
-  pub_date: new Date().toISOString(),
-  platforms,
-};
+const manifest = buildUpdaterManifest({
+  tag,
+  productName: brand.productName,
+  artifactBaseUrl: brand.updates.artifactBaseUrl,
+  pubDate: new Date().toISOString(),
+  platforms: platformInputs,
+});
 if (missing.length > 0) {
   manifest.partial = true;
   manifest.missing = missing;
@@ -100,8 +103,8 @@ writeFileSync(
       partial: missing.length > 0,
       required_platforms: REQUIRED_PLATFORMS.map((platform) => ({
         platform,
-        present: Boolean(platforms[platform]),
-        missing: !platforms[platform],
+        present: Boolean(platformInputs[platform]),
+        missing: !platformInputs[platform],
       })),
       missing,
       artifacts: resolved,

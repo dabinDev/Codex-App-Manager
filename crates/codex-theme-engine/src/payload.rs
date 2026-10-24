@@ -210,7 +210,11 @@ mod tests {
         )
         .unwrap();
         std::fs::write(dir.join("theme.css"), "html.codex-theme-studio body {}\n").unwrap();
-        std::fs::write(dir.join("chrome.html"), "<div data-cts-layer=\"stage\"></div>").unwrap();
+        std::fs::write(
+            dir.join("chrome.html"),
+            "<div data-cts-layer=\"stage\"></div>",
+        )
+        .unwrap();
         // Tiny valid-enough PNG bytes (content is never decoded, only inlined).
         std::fs::write(dir.join("assets/wall.png"), [0x89, b'P', b'N', b'G', 0, 1]).unwrap();
         dir
@@ -220,12 +224,19 @@ mod tests {
     fn payload_substitutes_every_placeholder() {
         let tmp = tempfile::tempdir().unwrap();
         let built = build_payload(&fixture_theme(tmp.path())).unwrap();
-        assert!(!built.payload.contains("__CTS_"), "unsubstituted placeholder");
+        assert!(
+            !built.payload.contains("__CTS_"),
+            "unsubstituted placeholder"
+        );
         // The CSS rides as a JSON string literal, so quotes appear escaped.
-        assert!(built.payload.contains("--cts-asset-wall: url(\\\"data:image/png;base64,"));
+        assert!(built
+            .payload
+            .contains("--cts-asset-wall: url(\\\"data:image/png;base64,"));
         assert!(built.payload.contains("data-cts-layer"));
         assert_eq!(built.asset_count, 1);
-        assert!(built.stamp.starts_with(&format!("{ENGINE_VERSION}:fixture:")));
+        assert!(built
+            .stamp
+            .starts_with(&format!("{ENGINE_VERSION}:fixture:")));
     }
 
     #[test]
@@ -233,10 +244,21 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = fixture_theme(tmp.path());
         let first = build_payload(&dir).unwrap().stamp;
-        assert_eq!(first, build_payload(&dir).unwrap().stamp, "stamp must be stable");
-        std::fs::write(dir.join("theme.css"), "html.codex-theme-studio body { color: red }\n")
-            .unwrap();
-        assert_ne!(first, build_payload(&dir).unwrap().stamp, "css change must re-stamp");
+        assert_eq!(
+            first,
+            build_payload(&dir).unwrap().stamp,
+            "stamp must be stable"
+        );
+        std::fs::write(
+            dir.join("theme.css"),
+            "html.codex-theme-studio body { color: red }\n",
+        )
+        .unwrap();
+        assert_ne!(
+            first,
+            build_payload(&dir).unwrap().stamp,
+            "css change must re-stamp"
+        );
     }
 
     #[test]
@@ -249,7 +271,10 @@ mod tests {
     #[test]
     fn removal_covers_every_runtime_owned_layer() {
         for id in ["cts-style", "cts-chrome", "cts-stage", "cts-intro"] {
-            assert!(REMOVE_EXPRESSION.contains(id), "remove expression misses {id}");
+            assert!(
+                REMOVE_EXPRESSION.contains(id),
+                "remove expression misses {id}"
+            );
             assert!(
                 VERIFY_REMOVED_EXPRESSION.contains(id),
                 "removal verification misses {id}"

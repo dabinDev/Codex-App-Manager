@@ -1,3 +1,5 @@
+import { BRAND } from "./brand";
+
 function toStaticError(value: unknown): Error {
   if (value instanceof Error) return value;
   if (value && typeof value === "object" && "message" in value) {
@@ -188,8 +190,8 @@ export function renderStaticCrashFallback(
     minHeight: "100vh",
     padding: "24px",
     borderRadius: "16px",
-    background: "#17171d",
-    color: "#f7f6fa",
+    background: "#18201e",
+    color: "#f4f7f5",
     fontFamily: "system-ui, sans-serif",
     display: "flex",
     flexDirection: "column",
@@ -198,7 +200,7 @@ export function renderStaticCrashFallback(
   });
 
   const title = doc.createElement("h1");
-  title.textContent = "Codex App Manager could not start / 管理器界面无法启动";
+  title.textContent = `${BRAND.productName} could not start / 管理器界面无法启动`;
   const body = doc.createElement("p");
   body.textContent =
     "Reload the interface. Any backend operation remains protected. / 请重新加载界面；后台操作仍受保护。";

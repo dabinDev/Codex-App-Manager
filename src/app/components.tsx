@@ -15,6 +15,7 @@ import { errorMessage, managerApi } from "../services/managerApi";
 import type { FailureSurface } from "./errorCopy";
 import { Icon, type IconName, CodexMark } from "./icons";
 import { useI18n } from "./i18n";
+import { runPackagedAlignmentSmoke } from "./packagedAlignmentSmoke";
 import { Sheet } from "./Sheet";
 import { useWindowModeOptional } from "./windowMode";
 
@@ -137,6 +138,7 @@ export function QuitConfirm() {
   const [blockedCode, setBlockedCode] = useState<string | null>(null);
   const [blockedFallback, setBlockedFallback] = useState<string | null>(null);
   const [listenersReady, setListenersReady] = useState(false);
+  const packagedSmokeRuns = useRef(new Set<string>());
   const titleId = useId();
   const bodyId = useId();
 
@@ -250,7 +252,18 @@ export function QuitConfirm() {
       attempt += 1;
       inFlight = true;
       try {
-        await managerApi.frontendReady(lang, readiness.generation, readiness.token);
+        const smoke = await managerApi.frontendReady(lang, readiness.generation, readiness.token);
+        if (smoke?.alignment && !packagedSmokeRuns.current.has(smoke.runId)) {
+          packagedSmokeRuns.current.add(smoke.runId);
+          void runPackagedAlignmentSmoke(smoke).catch((cause) => {
+            void managerApi.reportFrontendError({
+              kind: "packaged-alignment-smoke",
+              message: errorMessage(cause),
+              stack: cause instanceof Error ? cause.stack ?? null : null,
+              componentStack: null,
+            });
+          });
+        }
       } catch (cause) {
         if (cancelled) return;
         const message = errorMessage(cause);

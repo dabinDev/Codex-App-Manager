@@ -168,10 +168,7 @@ pub fn cleanup_stale_staging(ops: &OperationManager) -> CleanupSummary {
             }
             summary.scanned += 1;
             if crate::app::install_tx::path_is_protected(&path, &protected) {
-                log::info!(
-                    "staging cleanup skipped protected path={}",
-                    path.display()
-                );
+                log::info!("staging cleanup skipped protected path={}", path.display());
                 continue;
             }
             if !is_stale(&path, now) {

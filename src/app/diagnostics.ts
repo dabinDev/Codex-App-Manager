@@ -1,4 +1,5 @@
 import type { Diagnostics } from "../shared/types";
+import { BRAND } from "./brand";
 
 export function formatDiagnostics(diagnostics: Diagnostics, jsError?: Error | null): string {
   const health = diagnostics.configHealth;
@@ -6,7 +7,7 @@ export function formatDiagnostics(diagnostics: Diagnostics, jsError?: Error | nu
     ? diagnostics.recentErrors.map((line) => `- ${line}`).join("\n")
     : "- none";
   const lines = [
-    "# Codex App Manager diagnostics",
+    `# ${BRAND.productName} diagnostics`,
     "",
     `Generated: ${new Date(diagnostics.generatedAtUnix * 1000).toISOString()}`,
     `Version: ${diagnostics.appVersion}`,

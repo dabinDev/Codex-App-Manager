@@ -4,6 +4,11 @@ import { relaunch } from "@tauri-apps/plugin-process";
 import type {
   AncillaryRetryReport,
   AncillaryRetryRequest,
+  ApiConfigKeyList,
+  ApiConfigSession,
+  ApiConfigWriteReport,
+  AlignmentReport,
+  AlignmentScan,
   AppSettings,
   CatalogSkin,
   CodexThemeStatusReport,
@@ -31,6 +36,7 @@ import type {
   WinUninstallReport,
   WinUpdateReport,
 } from "../shared/types";
+import { BRAND } from "../app/brand";
 import { DEFAULT_SETTINGS, emptyOperationOutcome } from "../shared/types";
 
 const SETTINGS_LS = "cam.settings";
@@ -41,7 +47,6 @@ const MAX_PERIODIC_CHECK_INTERVAL_SECONDS = 7 * 24 * 60 * 60;
 
 export type ManagerUpdateCheck =
   | { kind: "development" }
-  | { kind: "unavailable" }
   | { kind: "none" }
   | ManagerUpdateAvailable;
 
@@ -65,6 +70,34 @@ export interface FrontendErrorPayload {
   message: string;
   stack: string | null;
   componentStack: string | null;
+}
+
+export interface PackagedSmokeContext {
+  runId: string;
+  alignment: true;
+}
+
+export interface CodexLocaleApplyResult {
+  mode: "official_catalog" | "compatibility_runtime" | "system_default";
+  locale: string | null;
+  translatedNodes: number;
+  catalogEntries: number;
+}
+
+function packagedSmokeContext(raw: unknown): PackagedSmokeContext | null {
+  if (raw === null) return null;
+  if (!raw || typeof raw !== "object") {
+    throw new Error("invalid packaged smoke context");
+  }
+  const value = raw as Record<string, unknown>;
+  if (
+    typeof value.runId !== "string" ||
+    !/^[A-Za-z0-9_-]{1,64}$/.test(value.runId) ||
+    value.alignment !== true
+  ) {
+    throw new Error("invalid packaged smoke context");
+  }
+  return { runId: value.runId, alignment: true };
 }
 
 function normalizedInterval(value: unknown): number {
@@ -97,6 +130,23 @@ function normalizedSkippedCodexUpdate(value: unknown): SkippedCodexUpdate | null
     version,
     skippedAt: Math.max(0, Math.floor(skippedAt)),
   };
+}
+
+/**
+ * Codex UI locales the manager can apply through Chromium's `--lang` switch
+ * and Codex's official `localeOverride`. `null` follows the system language.
+ * Kept as the single source of truth so the
+ * Toolbox picker and the settings sanitizer never drift apart; extend this list
+ * to offer more languages (Codex ships native react-intl catalogs).
+ */
+export const CODEX_LOCALE_OPTIONS = ["zh-CN"] as const;
+export type CodexLocaleOption = (typeof CODEX_LOCALE_OPTIONS)[number];
+
+function normalizedCodexLocale(value: unknown): string | null {
+  return typeof value === "string" &&
+    (CODEX_LOCALE_OPTIONS as readonly string[]).includes(value)
+    ? value
+    : null;
 }
 
 function normalizeSettings(raw: Partial<AppSettings>): AppSettings {
@@ -144,6 +194,7 @@ function normalizeSettings(raw: Partial<AppSettings>): AppSettings {
       typeof raw.codexThemeStoreDir === "string" && raw.codexThemeStoreDir.trim()
         ? raw.codexThemeStoreDir
         : null,
+    codexLocale: normalizedCodexLocale(raw.codexLocale),
   };
 }
 
@@ -284,9 +335,9 @@ const WIN_FALLBACK_INSTALLED = {
 };
 
 const WIN_FALLBACK_PLAN: WinUpdateReport = {
-  manifestUrl: "https://codexapp.agentsmirror.com/latest/manifest",
-  checksumsUrl: "https://codexapp.agentsmirror.com/latest/checksums",
-  packageUrl: "https://codexapp.agentsmirror.com/latest/win",
+  manifestUrl: `${BRAND.sites.mirror}/latest/manifest`,
+  checksumsUrl: `${BRAND.sites.mirror}/latest/checksums`,
+  packageUrl: `${BRAND.sites.mirror}/latest/win`,
   release: {
     version: "26.623.42026",
     packageVersion: "26.623.5546.0",
@@ -314,7 +365,7 @@ const WIN_FALLBACK_PLAN: WinUpdateReport = {
     currentVersion: "26.623.42026",
     latestVersion: "26.623.42026",
     packageMoniker: "OpenAI.Codex_26.623.5546.0_x64__2p2nqsd0c76g0",
-    packageUrl: "https://codexapp.agentsmirror.com/latest/win",
+    packageUrl: `${BRAND.sites.mirror}/latest/win`,
     downloadSize: 671037642,
     sha256: "6dc2e05ac2b760bbc77ce3f8a992efdb327363512c9c4744b9a146c41bc4d55a",
     route: "msix-sideload",
@@ -603,7 +654,252 @@ function guardWinReport(report: WinUpdateReport): WinUpdateReport {
   return report;
 }
 
+const API_CONFIG_CONNECTIONS = new Set(["signed_out", "connected", "interrupted"]);
+const API_CONFIG_KEY_STATUSES = new Set([
+  "active",
+  "inactive",
+  "quota_exhausted",
+  "expired",
+]);
+const API_CONFIG_WRITE_OUTCOMES = new Set([
+  "committed",
+  "failed_before_mutation",
+  "restored",
+  "recovery_required",
+]);
+const ALIGNMENT_OUTCOMES = new Set([
+  "committed",
+  "no_changes",
+  "stale_plan",
+  "restored",
+  "recovery_required",
+]);
+
+function nullableString(value: unknown): boolean {
+  return value === null || typeof value === "string";
+}
+
+function guardApiConfigSession(session: ApiConfigSession): ApiConfigSession {
+  const value = session as unknown;
+  if (
+    !isRecord(value) ||
+    typeof value.authenticated !== "boolean" ||
+    !nullableString(value.email) ||
+    typeof value.remembered !== "boolean" ||
+    typeof value.connection !== "string" ||
+    !API_CONFIG_CONNECTIONS.has(value.connection) ||
+    !nullableString(value.warning)
+  ) {
+    throw contractError("API configuration session");
+  }
+  return session;
+}
+
+function guardApiConfigKeys(keys: ApiConfigKeyList): ApiConfigKeyList {
+  const value = keys as unknown;
+  if (
+    !isRecord(value) ||
+    !Array.isArray(value.items) ||
+    typeof value.stale !== "boolean" ||
+    typeof value.fetchedAtUnix !== "number" ||
+    !Number.isFinite(value.fetchedAtUnix)
+  ) {
+    throw contractError("API key list");
+  }
+  for (const item of value.items) {
+    if (
+      !isRecord(item) ||
+      typeof item.id !== "number" ||
+      !Number.isSafeInteger(item.id) ||
+      item.id < 0 ||
+      typeof item.name !== "string" ||
+      typeof item.groupName !== "string" ||
+      typeof item.maskedKey !== "string" ||
+      typeof item.status !== "string" ||
+      !API_CONFIG_KEY_STATUSES.has(item.status) ||
+      typeof item.quota !== "number" ||
+      !Number.isFinite(item.quota) ||
+      typeof item.quotaUsed !== "number" ||
+      !Number.isFinite(item.quotaUsed) ||
+      !nullableString(item.expiresAt) ||
+      typeof item.actionable !== "boolean" ||
+      typeof item.enabled !== "boolean"
+    ) {
+      throw contractError("API key list");
+    }
+  }
+  return keys;
+}
+
+function guardApiConfigWrite(report: ApiConfigWriteReport): ApiConfigWriteReport {
+  const value = report as unknown;
+  if (
+    !isRecord(value) ||
+    typeof value.outcome !== "string" ||
+    !API_CONFIG_WRITE_OUTCOMES.has(value.outcome) ||
+    !nullableString(value.backupDir) ||
+    typeof value.configPath !== "string" ||
+    typeof value.authPath !== "string" ||
+    typeof value.codexWasRunning !== "boolean" ||
+    typeof value.writeVerified !== "boolean" ||
+    typeof value.rollbackVerified !== "boolean" ||
+    !nullableString(value.errorCode)
+  ) {
+    throw contractError("API configuration write report");
+  }
+  return report;
+}
+
+function nonNegativeInteger(value: unknown): boolean {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+function guardAlignmentScan(scan: AlignmentScan): AlignmentScan {
+  const value = scan as unknown;
+  if (
+    !isRecord(value) ||
+    typeof value.scanToken !== "string" ||
+    !value.scanToken ||
+    typeof value.activeProvider !== "string" ||
+    !nonNegativeInteger(value.databaseCount) ||
+    !nonNegativeInteger(value.threadCount) ||
+    !nonNegativeInteger(value.mismatchedThreads) ||
+    !nonNegativeInteger(value.rolloutCount) ||
+    !nonNegativeInteger(value.mismatchedRollouts) ||
+    !nonNegativeInteger(value.skippedRollouts) ||
+    !Array.isArray(value.skipReasons) ||
+    !value.skipReasons.every((reason) => typeof reason === "string") ||
+    typeof value.desktopRunning !== "boolean" ||
+    typeof value.cliRunning !== "boolean" ||
+    typeof value.canExecute !== "boolean" ||
+    !Array.isArray(value.warnings) ||
+    !value.warnings.every((warning) => typeof warning === "string")
+  ) {
+    throw contractError("conversation alignment scan");
+  }
+  return scan;
+}
+
+function guardAlignmentReport(report: AlignmentReport): AlignmentReport {
+  const value = report as unknown;
+  if (
+    !isRecord(value) ||
+    typeof value.outcome !== "string" ||
+    !ALIGNMENT_OUTCOMES.has(value.outcome) ||
+    !nullableString(value.recoveryId) ||
+    !nullableString(value.backupDir) ||
+    !nonNegativeInteger(value.threadsUpdated) ||
+    !nonNegativeInteger(value.rolloutsUpdated) ||
+    !nonNegativeInteger(value.rolloutsSkipped) ||
+    typeof value.writeVerified !== "boolean" ||
+    typeof value.rollbackVerified !== "boolean" ||
+    typeof value.codexWasRunning !== "boolean" ||
+    typeof value.restartAllowed !== "boolean" ||
+    typeof value.undoAllowed !== "boolean" ||
+    typeof value.elevationRequired !== "boolean" ||
+    !nullableString(value.errorCode)
+  ) {
+    throw contractError("conversation alignment report");
+  }
+  return report;
+}
+
+function desktopRequired(): Promise<never> {
+  return Promise.reject({
+    code: "desktop_required",
+    message: "This action requires the desktop app.",
+  } satisfies CommandError);
+}
+
 export const managerApi = {
+  apiConfigSession(): Promise<ApiConfigSession> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve({
+        authenticated: false,
+        email: null,
+        remembered: false,
+        connection: "signed_out",
+        warning: "desktop_required",
+      });
+    }
+    return invoke<ApiConfigSession>("api_config_session").then(guardApiConfigSession);
+  },
+  apiConfigLogin(email: string, password: string, remember: boolean): Promise<ApiConfigSession> {
+    if (!hasTauriRuntime()) return desktopRequired();
+    return invoke<ApiConfigSession>("api_config_login", { email, password, remember }).then(
+      guardApiConfigSession,
+    );
+  },
+  apiConfigKeys(): Promise<ApiConfigKeyList> {
+    if (!hasTauriRuntime()) return desktopRequired();
+    return invoke<ApiConfigKeyList>("api_config_keys").then(guardApiConfigKeys);
+  },
+  apiConfigLogout(): Promise<ApiConfigSession> {
+    if (!hasTauriRuntime()) return desktopRequired();
+    return invoke<ApiConfigSession>("api_config_logout").then(guardApiConfigSession);
+  },
+  apiConfigImportCcs(keyId: number): Promise<void> {
+    if (!hasTauriRuntime()) return desktopRequired();
+    return invoke<void>("api_config_import_ccs", { keyId });
+  },
+  apiConfigWriteLocal(keyId: number): Promise<ApiConfigWriteReport> {
+    if (!hasTauriRuntime()) return desktopRequired();
+    return invoke<ApiConfigWriteReport>("api_config_write_local", { keyId }).then(
+      guardApiConfigWrite,
+    );
+  },
+  apiConfigRestartCodex(): Promise<void> {
+    if (!hasTauriRuntime()) return desktopRequired();
+    return invoke<void>("api_config_restart_codex");
+  },
+  toolboxAlignmentScan(): Promise<AlignmentScan> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve({
+        scanToken: "browser-preview",
+        activeProvider: "OpenAI",
+        databaseCount: 1,
+        threadCount: 24,
+        mismatchedThreads: 3,
+        rolloutCount: 8,
+        mismatchedRollouts: 2,
+        skippedRollouts: 0,
+        skipReasons: [],
+        desktopRunning: false,
+        cliRunning: false,
+        canExecute: false,
+        warnings: ["desktop_required"],
+      });
+    }
+    return invoke<AlignmentScan>("toolbox_alignment_scan").then(guardAlignmentScan);
+  },
+  toolboxAlignmentExecute(scanToken: string): Promise<AlignmentReport> {
+    if (!hasTauriRuntime()) return desktopRequired();
+    return invoke<AlignmentReport>("toolbox_alignment_execute", { scanToken }).then(
+      guardAlignmentReport,
+    );
+  },
+  toolboxAlignmentRestore(recoveryId: string): Promise<AlignmentReport> {
+    if (!hasTauriRuntime()) return desktopRequired();
+    return invoke<AlignmentReport>("toolbox_alignment_restore", { recoveryId }).then(
+      guardAlignmentReport,
+    );
+  },
+  toolboxAlignmentOpenBackup(recoveryId: string): Promise<void> {
+    if (!hasTauriRuntime()) return desktopRequired();
+    return invoke<void>("toolbox_alignment_open_backup", { recoveryId });
+  },
+  toolboxAlignmentRestart(): Promise<void> {
+    if (!hasTauriRuntime()) return desktopRequired();
+    return invoke<void>("toolbox_alignment_restart");
+  },
+  toolboxForceRestartCodex(confirmed: boolean): Promise<void> {
+    if (!hasTauriRuntime()) return desktopRequired();
+    return invoke<void>("toolbox_force_restart_codex", { confirmed });
+  },
+  toolboxApplyCodexLocale(confirmed: boolean): Promise<CodexLocaleApplyResult> {
+    if (!hasTauriRuntime()) return desktopRequired();
+    return invoke<CodexLocaleApplyResult>("toolbox_apply_codex_locale", { confirmed });
+  },
   armDestructive(kind: OperationKind): Promise<OperationToken> {
     if (!hasTauriRuntime()) {
       return Promise.resolve(`browser-dev-token-${kind}`);
@@ -672,14 +968,7 @@ export const managerApi = {
     if (!hasTauriRuntime()) {
       return { kind: "development" };
     }
-    // A routine check shouldn't surface a scary error when the release feed
-    // isn't published yet or is unreachable.
-    const update = await invoke<ManagerUpdateMetadata | null>("manager_check_update").catch(
-      () => undefined,
-    );
-    if (update === undefined) {
-      return { kind: "unavailable" };
-    }
+    const update = await invoke<ManagerUpdateMetadata | null>("manager_check_update");
     if (!update) {
       return { kind: "none" };
     }
@@ -804,11 +1093,31 @@ export const managerApi = {
       console.error("[frontend]", payload, cause);
     });
   },
-  frontendReady(lang: string, generation: number, token: string): Promise<void> {
+  async frontendReady(
+    lang: string,
+    generation: number,
+    token: string,
+  ): Promise<PackagedSmokeContext | null> {
     if (!hasTauriRuntime()) {
-      return Promise.resolve();
+      return null;
     }
-    return invoke<void>("frontend_ready", { lang, generation, token });
+    return packagedSmokeContext(
+      await invoke<unknown>("frontend_ready", { lang, generation, token }),
+    );
+  },
+  recordPackagedAlignmentSmokeResult(
+    runId: string,
+    status: "passed" | "failed",
+    message: string | null,
+  ): Promise<void> {
+    if (!hasTauriRuntime()) {
+      return Promise.reject(new Error("packaged alignment smoke result IPC is unavailable"));
+    }
+    return invoke<void>("record_packaged_alignment_smoke_result", {
+      runId,
+      status,
+      message,
+    });
   },
 
   // Settings (update source + general). The backend persists them so the source

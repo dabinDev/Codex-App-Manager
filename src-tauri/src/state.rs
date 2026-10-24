@@ -2,6 +2,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Mutex;
 
 use crate::adapters::host;
+use crate::app::brand::MIRROR_BASE_URL;
 use crate::app::config_health::ConfigHealth;
 use crate::app::oplock::OperationManager;
 use crate::app::provenance::ProvenanceStore;
@@ -32,6 +33,8 @@ pub struct ManagerState {
     pub frontend: FrontendGate,
     /// Codex UI theme orchestration (daemon handle + status).
     pub codex_theme: crate::app::codex_theme::ThemeService,
+    /// OrangeAPI authentication and full-key cache. Secrets remain in Rust.
+    pub orange: crate::app::orange_session::OrangeSessionService,
 }
 
 #[cfg(any(target_os = "windows", test))]
@@ -61,8 +64,9 @@ fn webview_startup_gate(safe_to_show: bool, failed: bool) -> WebviewStartupGate 
 impl ManagerState {
     pub fn new() -> Self {
         let target = Target::current();
-        let mirror_base_url = "https://codexapp.agentsmirror.com".to_string();
+        let mirror_base_url = MIRROR_BASE_URL.to_string();
         let (saved, settings_health) = PersistedAppSettings::load_with_health();
+        let codex_locale_compatibility = saved.codex_locale_compatibility;
         let (_, provenance_health) = ProvenanceStore::load_with_health();
         let config_health = Mutex::new(
             ConfigHealth::from_parts(settings_health, provenance_health).with_live_backup_flags(),
@@ -91,7 +95,8 @@ impl ManagerState {
             operations,
             config_health,
             frontend: FrontendGate::default(),
-            codex_theme: crate::app::codex_theme::ThemeService::default(),
+            codex_theme: crate::app::codex_theme::ThemeService::new(codex_locale_compatibility),
+            orange: crate::app::orange_session::OrangeSessionService::default(),
         }
     }
 

@@ -6,9 +6,9 @@ import { navLocked, subscribeNavLock } from "./navLock";
 import { useWindowModeOptional } from "./windowMode";
 
 /** Views the rail can jump to directly. Sub-views that live *under* Settings
- *  (About, Uninstall, Codex config) highlight the Settings item — the rail
+ *  (About and Uninstall) highlight the Settings item — the rail
  *  reflects sections, not the full view stack. */
-export type RailSection = "home" | "themes" | "settings";
+export type RailSection = "home" | "config" | "themes" | "toolbox" | "settings";
 
 /** Left navigation card, shown only in the expanded workbench. It is a second
  *  floating `.pop` card beside the active view's card — same material, same
@@ -32,7 +32,9 @@ export function Rail({
 
   const items: Array<{ key: RailSection; icon: IconName; label: string }> = [
     { key: "home", icon: "house", label: t("rail.home") },
+    { key: "config", icon: "key", label: t("config.title") },
     { key: "themes", icon: "palette", label: t("themes.title") },
+    { key: "toolbox", icon: "sliders", label: t("toolbox.title") },
     { key: "settings", icon: "gear", label: t("nav.settings") },
   ];
 

@@ -142,9 +142,7 @@ pub struct ShareTheme {
 }
 
 fn is_hex6(value: &str) -> bool {
-    value.len() == 7
-        && value.starts_with('#')
-        && value[1..].bytes().all(|b| b.is_ascii_hexdigit())
+    value.len() == 7 && value.starts_with('#') && value[1..].bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 fn is_code_theme_id(value: &str) -> bool {
@@ -258,15 +256,23 @@ fn parse_variant_block(
         },
         None => {
             problems.push(format!("{path}.fonts must be an object"));
-            VariantFonts { code: None, ui: None }
+            VariantFonts {
+                code: None,
+                ui: None,
+            }
         }
     };
 
     let semantic = match obj.get("semanticColors").filter(|v| v.is_object()) {
         Some(sc) => {
-            let diff_added = hex_field(sc, &format!("{path}.semanticColors"), "diffAdded", problems);
-            let diff_removed =
-                hex_field(sc, &format!("{path}.semanticColors"), "diffRemoved", problems);
+            let diff_added =
+                hex_field(sc, &format!("{path}.semanticColors"), "diffAdded", problems);
+            let diff_removed = hex_field(
+                sc,
+                &format!("{path}.semanticColors"),
+                "diffRemoved",
+                problems,
+            );
             let skill = hex_field(sc, &format!("{path}.semanticColors"), "skill", problems);
             match (diff_added, diff_removed, skill) {
                 (Some(a), Some(r), Some(s)) => Some(SemanticColors {
@@ -414,10 +420,14 @@ pub fn parse_share_string(value: &str, expected_variant: Variant) -> Result<Shar
     let payload: SharePayload = serde_json::from_str(body)
         .map_err(|e| ThemeEngineError::Theme(format!("share parse: {e}")))?;
     if payload.variant != expected_variant {
-        return Err(ThemeEngineError::Theme("share variant mismatch".to_string()));
+        return Err(ThemeEngineError::Theme(
+            "share variant mismatch".to_string(),
+        ));
     }
     if !is_code_theme_id(&payload.code_theme_id) {
-        return Err(ThemeEngineError::Theme("share codeThemeId invalid".to_string()));
+        return Err(ThemeEngineError::Theme(
+            "share codeThemeId invalid".to_string(),
+        ));
     }
     Ok(payload)
 }
@@ -525,22 +535,53 @@ mod tests {
         let payload = parse_share_string(&s, Variant::Light).unwrap();
         assert_eq!(payload.code_theme_id, "absolutely");
         assert_eq!(payload.theme.surface, "#FFF8E8");
-        assert!(parse_share_string(&s, Variant::Dark).is_err(), "variant gate");
+        assert!(
+            parse_share_string(&s, Variant::Dark).is_err(),
+            "variant gate"
+        );
     }
 
     #[test]
     fn rejects_each_contract_violation() {
         let cases: Vec<(&str, Box<dyn Fn(&mut Value)>)> = vec![
-            ("missing dark", Box::new(|v| { v.as_object_mut().unwrap().remove("dark"); })),
-            ("missing light", Box::new(|v| { v.as_object_mut().unwrap().remove("light"); })),
+            (
+                "missing dark",
+                Box::new(|v| {
+                    v.as_object_mut().unwrap().remove("dark");
+                }),
+            ),
+            (
+                "missing light",
+                Box::new(|v| {
+                    v.as_object_mut().unwrap().remove("light");
+                }),
+            ),
             ("bad hex", Box::new(|v| v["dark"]["accent"] = "#zzz".into())),
             ("short hex", Box::new(|v| v["dark"]["ink"] = "#fff".into())),
-            ("contrast range", Box::new(|v| v["light"]["contrast"] = 101.into())),
-            ("contrast type", Box::new(|v| v["light"]["contrast"] = "60".into())),
-            ("opaque type", Box::new(|v| v["dark"]["opaqueWindows"] = "yes".into())),
-            ("font empty", Box::new(|v| v["dark"]["fonts"]["code"] = "  ".into())),
-            ("appearance", Box::new(|v| v["appearanceTheme"] = "auto".into())),
-            ("code id", Box::new(|v| v["codeThemeIds"]["dark"] = "-bad".into())),
+            (
+                "contrast range",
+                Box::new(|v| v["light"]["contrast"] = 101.into()),
+            ),
+            (
+                "contrast type",
+                Box::new(|v| v["light"]["contrast"] = "60".into()),
+            ),
+            (
+                "opaque type",
+                Box::new(|v| v["dark"]["opaqueWindows"] = "yes".into()),
+            ),
+            (
+                "font empty",
+                Box::new(|v| v["dark"]["fonts"]["code"] = "  ".into()),
+            ),
+            (
+                "appearance",
+                Box::new(|v| v["appearanceTheme"] = "auto".into()),
+            ),
+            (
+                "code id",
+                Box::new(|v| v["codeThemeIds"]["dark"] = "-bad".into()),
+            ),
             (
                 "low contrast",
                 Box::new(|v| {
@@ -565,7 +606,10 @@ mod tests {
         assert!(parse_codex_theme(&block, ValidateOptions::default()).is_err());
         let lenient = parse_codex_theme(
             &block,
-            ValidateOptions { require_code_theme_ids: false, ..Default::default() },
+            ValidateOptions {
+                require_code_theme_ids: false,
+                ..Default::default()
+            },
         )
         .unwrap();
         assert!(lenient.code_theme_ids.is_none());

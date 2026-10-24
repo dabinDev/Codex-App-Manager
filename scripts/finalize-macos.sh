@@ -2,7 +2,7 @@
 # One-shot macOS distribution finalize for a freshly `tauri build`-ed bundle.
 # Chains the whole post-build pipeline so CI (and you, locally) call ONE script:
 #
-#   1. inject the macOS 26 adaptive (Liquid Glass) icon      (adaptive-icon.sh)
+#   1. inject the macOS 26 adaptive icon when supported      (adaptive-icon.sh)
 #   2. inside-out Developer ID code-sign + hardened runtime  (sign-macos-app.sh)
 #   3. notarize + staple                                     (notarize-macos.sh)
 #   4. repackage the updater tarball (+ re-sign) from the finalized app
@@ -26,7 +26,7 @@ APP="$(/usr/bin/find "$BUNDLE/macos" -maxdepth 1 -name '*.app' 2>/dev/null | hea
 NAME="$(basename "$APP" .app)"
 log() { printf '\033[32m[finalize]\033[0m %s\n' "$*"; }
 
-# 1) adaptive icon  2) sign  3) notarize/staple
+# 1) adaptive icon (or branded .icns fallback)  2) sign  3) notarize/staple
 bash "$ROOT/scripts/macos-adaptive-icon.sh" "$APP"
 bash "$ROOT/scripts/sign-macos-app.sh" "$APP" "${APPLE_SIGNING_IDENTITY:--}"
 if [[ -n "${AC_API_KEY_ID:-}" ]]; then

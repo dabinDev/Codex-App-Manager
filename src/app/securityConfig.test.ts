@@ -1,11 +1,23 @@
 import { describe, expect, it } from "vitest";
 
+import indexHtml from "../../index.html?raw";
 import capabilityJson from "../../src-tauri/capabilities/default.json";
 import tauriConfigJson from "../../src-tauri/tauri.conf.json";
 
+interface TauriWindowConfig {
+  label: string;
+  create?: boolean;
+  width?: number;
+  height?: number;
+  minWidth?: number;
+  minHeight?: number;
+  resizable?: boolean;
+  shadow?: boolean;
+}
+
 interface TauriConfig {
   app: {
-    windows: Array<{ label: string; create?: boolean }>;
+    windows: TauriWindowConfig[];
     security: { csp: string; devCsp: string };
   };
 }
@@ -15,9 +27,25 @@ interface Capability {
 }
 
 describe("desktop trust-boundary config", () => {
+  it("stamps expanded mode before the renderer's first paint", () => {
+    expect(indexHtml).toContain('<html lang="zh-CN" data-window-mode="expanded">');
+  });
+
   it("keeps the main webview under the native navigation builder", () => {
     const config = tauriConfigJson as TauriConfig;
     expect(config.app.windows.find((window) => window.label === "main")?.create).toBe(false);
+  });
+
+  it("declares the main window as an expanded workbench", () => {
+    const config = tauriConfigJson as TauriConfig;
+    expect(config.app.windows.find((window) => window.label === "main")).toMatchObject({
+      width: 1100,
+      height: 720,
+      minWidth: 960,
+      minHeight: 640,
+      resizable: true,
+      shadow: true,
+    });
   });
 
   it("uses a local-only production CSP and a loopback-only HMR policy", () => {

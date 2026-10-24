@@ -1,0 +1,44 @@
+{
+  "productName": "Codex App Manager",
+  "serviceName": "OrangeAPI",
+  "displayNames": {
+    "en": "Codex App Manager",
+    "zh-CN": "Codex App 管理器",
+    "zh-TW": "Codex App 管理員",
+    "ja": "Codex App マネージャー",
+    "ko": "Codex App 관리자",
+    "fr": "Gestionnaire Codex",
+    "de": "Codex App Manager",
+    "es": "Codex App Manager",
+    "pt-BR": "Gerenciador do Codex App",
+    "ru": "Менеджер Codex App",
+    "ar": "مدير تطبيق Codex"
+  },
+  "sites": {
+    "support": "https://github.com/Wangnov/Codex-App-Manager",
+    "service": "https://token.cylonai.cn",
+    "mirror": "https://codexapp.agentsmirror.com",
+    "skins": "https://skins.agentsmirror.com",
+    "updater": [
+      "https://codexapp.agentsmirror.com/manager/latest.json",
+      "https://github.com/Wangnov/Codex-App-Manager/releases/latest/download/latest.json"
+    ]
+  },
+  "updates": {
+    "artifactBaseUrl": "https://github.com/Wangnov/Codex-App-Manager/releases/download"
+  },
+  "icons": {
+    "frontend": {
+      "light": "src/app/assets/logo-light.png",
+      "dark": "src/app/assets/logo-dark.png"
+    },
+    "bundle": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "windowsInstaller": "icons/icon.ico"
+  }
+}

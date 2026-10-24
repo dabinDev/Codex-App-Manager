@@ -155,9 +155,7 @@ fn check_unambiguous(lines: &[&str]) -> Result<()> {
                 if (name == prefix || name.starts_with(&format!("{prefix}.")))
                     && !seen.insert(name.to_string())
                 {
-                    return Err(err(format!(
-                        "受管 section [{name}] 重复出现，无法安全归并"
-                    )));
+                    return Err(err(format!("受管 section [{name}] 重复出现，无法安全归并")));
                 }
             }
         }
@@ -476,7 +474,10 @@ fn chrome_theme_block(section_name: &str, theme: &ChromeTheme) -> String {
         "diffRemoved = {}",
         toml_string(&theme.semantic_colors.diff_removed)
     ));
-    lines.push(format!("skill = {}", toml_string(&theme.semantic_colors.skill)));
+    lines.push(format!(
+        "skill = {}",
+        toml_string(&theme.semantic_colors.skill)
+    ));
     lines.join("\n")
 }
 
@@ -597,7 +598,10 @@ pub fn backup_native_theme(paths: &NativeThemePaths) -> Result<bool> {
         state.light_chrome.clone().unwrap_or_default(),
     );
     let mut top_keys = BTreeMap::new();
-    top_keys.insert("appearanceTheme".to_string(), state.appearance_theme.clone());
+    top_keys.insert(
+        "appearanceTheme".to_string(),
+        state.appearance_theme.clone(),
+    );
     top_keys.insert(
         "appearanceDarkCodeThemeId".to_string(),
         state.dark_code_id.clone(),
@@ -617,11 +621,10 @@ pub fn backup_native_theme(paths: &NativeThemePaths) -> Result<bool> {
     if let Some(parent) = paths.backup.parent() {
         std::fs::create_dir_all(parent).map_err(|e| err(format!("backup dir: {e}")))?;
     }
-    let rendered = serde_json::to_string_pretty(&backup)
-        .map_err(|e| err(format!("backup serialize: {e}")))?;
+    let rendered =
+        serde_json::to_string_pretty(&backup).map_err(|e| err(format!("backup serialize: {e}")))?;
     let tmp = paths.backup.with_extension("json.tmp");
-    std::fs::write(&tmp, format!("{rendered}\n"))
-        .map_err(|e| err(format!("write backup: {e}")))?;
+    std::fs::write(&tmp, format!("{rendered}\n")).map_err(|e| err(format!("write backup: {e}")))?;
     std::fs::rename(&tmp, &paths.backup).map_err(|e| err(format!("commit backup: {e}")))?;
     Ok(true)
 }
@@ -650,10 +653,7 @@ pub fn apply_plan(theme: &CodexTheme) -> NativePlanInput {
             theme.code_theme_ids.as_ref().map(|i| i.light.as_str()),
             "appearanceLightCodeThemeId",
         ),
-        dark_chrome: UnitPlan::Set(chrome_theme_block(
-            "appearanceDarkChromeTheme",
-            &theme.dark,
-        )),
+        dark_chrome: UnitPlan::Set(chrome_theme_block("appearanceDarkChromeTheme", &theme.dark)),
         light_chrome: UnitPlan::Set(chrome_theme_block(
             "appearanceLightChromeTheme",
             &theme.light,
@@ -894,7 +894,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let p = paths(tmp.path());
         // No appearanceTheme, no code ids, no sections at all.
-        std::fs::write(&p.config, "model = \"o4\"\n\n[profiles.a]\nkey = \"kept\"\n").unwrap();
+        std::fs::write(
+            &p.config,
+            "model = \"o4\"\n\n[profiles.a]\nkey = \"kept\"\n",
+        )
+        .unwrap();
 
         apply_native_theme(&p, &full_theme()).unwrap();
         let themed = std::fs::read_to_string(&p.config).unwrap();
@@ -903,7 +907,10 @@ mod tests {
 
         assert!(restore_native_theme(&p).unwrap());
         let text = std::fs::read_to_string(&p.config).unwrap();
-        assert!(!text.contains("appearanceTheme"), "introduced switch deleted");
+        assert!(
+            !text.contains("appearanceTheme"),
+            "introduced switch deleted"
+        );
         assert!(!text.contains("CodeThemeId"), "introduced ids deleted");
         assert!(!text.contains("ChromeTheme"), "introduced sections deleted");
         assert!(text.contains("model = \"o4\""));
@@ -930,7 +937,10 @@ mod tests {
 
         restore_native_theme(&p).unwrap();
         let text = std::fs::read_to_string(&p.config).unwrap();
-        assert!(text.contains("appearanceTheme = \"light\""), "user switch back");
+        assert!(
+            text.contains("appearanceTheme = \"light\""),
+            "user switch back"
+        );
         assert!(text.contains("appearanceDarkCodeThemeId = \"userdark\""));
         assert!(text.contains("accent = \"#111111\""));
         assert!(text.contains("code = \"UserMono\""));
@@ -949,7 +959,10 @@ mod tests {
         let themed = std::fs::read_to_string(&p.config).unwrap();
         assert!(themed.contains("# top comment\r\n"), "CRLF comment kept");
         assert!(themed.contains("# inner comment\r\n"));
-        assert!(themed.contains("appearanceTheme = \"dark\"\r"), "managed line uses file EOL");
+        assert!(
+            themed.contains("appearanceTheme = \"dark\"\r"),
+            "managed line uses file EOL"
+        );
 
         restore_native_theme(&p).unwrap();
         let restored = std::fs::read_to_string(&p.config).unwrap();
@@ -994,7 +1007,10 @@ mod tests {
         let text = std::fs::read_to_string(&p.config).unwrap();
         assert!(text.contains("appearanceTheme = \"system\""));
         assert!(text.contains("appearanceDarkCodeThemeId = \"absolutely\""));
-        assert!(!text.contains("appearanceLightCodeThemeId"), "absent value deletes");
+        assert!(
+            !text.contains("appearanceLightCodeThemeId"),
+            "absent value deletes"
+        );
         assert!(text.contains("accent = \"#f1b83b\""));
         assert!(!text.contains("[desktop.appearanceLightChromeTheme]"));
         assert!(text.contains("[profiles.a]"));

@@ -189,10 +189,10 @@ fn show_native_shell_event(app: tauri::AppHandle, event: ShellEvent) {
         ShellEvent::ConfirmQuit => {
             let mut dialog = app
                 .dialog()
-                .message(
-                    "The interface is not responding. Quit Codex App Manager safely?\n\n\
-                     界面没有响应。是否安全退出 Codex App Manager？",
-                )
+                .message(format!(
+                    "The interface is not responding. Quit {PRODUCT_NAME} safely?\n\n\
+                     界面没有响应。是否安全退出 {PRODUCT_NAME}？"
+                ))
                 .title(PRODUCT_NAME)
                 .kind(MessageDialogKind::Warning)
                 .buttons(MessageDialogButtons::OkCancelCustom(
@@ -227,8 +227,8 @@ fn show_native_shell_event(app: tauri::AppHandle, event: ShellEvent) {
             let mut dialog = app
                 .dialog()
                 .message(format!(
-                    "Codex App Manager must stay open until the protected step finishes.\n\
-                     {reason}\n\n受保护步骤完成前，Codex App Manager 必须保持打开。"
+                    "{PRODUCT_NAME} must stay open until the protected step finishes.\n\
+                     {reason}\n\n受保护步骤完成前，{PRODUCT_NAME} 必须保持打开。"
                 ))
                 .title(PRODUCT_NAME)
                 .kind(MessageDialogKind::Warning)
@@ -321,7 +321,9 @@ fn initial_main_window_visibility(
 fn show_windows_startup_error(detail: &str) {
     use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
 
-    let title: Vec<u16> = "Codex App Manager startup error\0".encode_utf16().collect();
+    let title: Vec<u16> = format!("{PRODUCT_NAME} startup error\0")
+        .encode_utf16()
+        .collect();
     let body: Vec<u16> = format!(
         "The secure Windows interface could not be initialized. The app will close.\n\n{detail}\0"
     )
@@ -356,8 +358,11 @@ fn configure_windows_browser_accelerators(
     window: &tauri::WebviewWindow<tauri::Wry>,
     enabled: bool,
 ) -> tauri::Result<()> {
-    use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Settings3;
+    use webview2_com::Microsoft::Web::WebView2::Win32::{
+        ICoreWebView2Settings, ICoreWebView2Settings3,
+    };
     use windows_core::Interface;
+    use windows_core_wry::Interface as WryInterface;
 
     if enabled {
         return Ok(());
@@ -368,11 +373,23 @@ fn configure_windows_browser_accelerators(
     let app_handle = app.handle().clone();
     let callback_result = window.with_webview(move |platform_webview| {
         let result = unsafe {
-            (|| -> windows_core::Result<()> {
-                let webview = platform_webview.controller().CoreWebView2()?;
-                let settings = webview.Settings()?;
-                let settings3 = settings.cast::<ICoreWebView2Settings3>()?;
-                settings3.SetAreBrowserAcceleratorKeysEnabled(false)
+            (|| -> Result<(), String> {
+                let webview = platform_webview
+                    .controller()
+                    .CoreWebView2()
+                    .map_err(|error| error.to_string())?;
+                let legacy_settings = webview.Settings().map_err(|error| error.to_string())?;
+
+                // Tauri/Wry returns a windows-core 0.61 wrapper. Move its one
+                // COM reference into the 0.62 wrapper for the same interface.
+                let raw_settings = WryInterface::into_raw(legacy_settings);
+                let settings = ICoreWebView2Settings::from_raw(raw_settings);
+                let settings3 = settings
+                    .cast::<ICoreWebView2Settings3>()
+                    .map_err(|error| error.to_string())?;
+                settings3
+                    .SetAreBrowserAcceleratorKeysEnabled(false)
+                    .map_err(|error| error.to_string())
             })()
         };
         match result {
@@ -456,6 +473,17 @@ fn build_main_window(app: &tauri::App) -> tauri::Result<()> {
         .build()?;
     #[cfg(target_os = "windows")]
     configure_windows_browser_accelerators(app, &window, browser_accelerators_enabled(cfg!(dev)))?;
+    crate::app::window_mode::apply_window_mode(
+        app.handle(),
+        crate::app::window_mode::INITIAL_WINDOW_MODE,
+        None,
+        None,
+    )
+    .map_err(|error| {
+        tauri::Error::Io(std::io::Error::other(format!(
+            "failed to establish initial window mode: {error}"
+        )))
+    })?;
     #[cfg(not(target_os = "windows"))]
     let _ = window;
     Ok(())
@@ -471,6 +499,9 @@ fn install_macos_menu(app: &tauri::AppHandle, locale: NativeLocale) -> tauri::Re
     use tauri::menu::{AboutMetadata, MenuBuilder, MenuItemBuilder, SubmenuBuilder};
 
     let copy = locale.menu();
+    let about = copy.about_product();
+    let hide = copy.hide_product();
+    let quit_label = copy.quit_product();
     let metadata = AboutMetadata {
         name: Some(PRODUCT_NAME.to_string()),
         version: Some(app.package_info().version.to_string()),
@@ -478,7 +509,7 @@ fn install_macos_menu(app: &tauri::AppHandle, locale: NativeLocale) -> tauri::Re
         copyright: app.config().bundle.copyright.clone(),
         ..AboutMetadata::default()
     };
-    let quit = MenuItemBuilder::with_id("cam-quit", copy.quit)
+    let quit = MenuItemBuilder::with_id("cam-quit", &quit_label)
         .accelerator("Cmd+Q")
         .build(app)?;
     let minimize = MenuItemBuilder::with_id("cam-minimize", copy.minimize)
@@ -488,11 +519,11 @@ fn install_macos_menu(app: &tauri::AppHandle, locale: NativeLocale) -> tauri::Re
         .accelerator("Cmd+W")
         .build(app)?;
     let app_menu = SubmenuBuilder::new(app, PRODUCT_NAME)
-        .about_with_text(copy.about, Some(metadata))
+        .about_with_text(&about, Some(metadata))
         .separator()
         .services_with_text(copy.services)
         .separator()
-        .hide_with_text(copy.hide)
+        .hide_with_text(&hide)
         .hide_others_with_text(copy.hide_others)
         .show_all_with_text(copy.show_all)
         .separator()
@@ -527,6 +558,64 @@ fn install_macos_menu(app: &tauri::AppHandle, locale: NativeLocale) -> tauri::Re
 /// The first handshake reveals the initially hidden window and drains any
 /// close/quit decisions queued during WebView startup. Later calls only update
 /// the native menu when the user changes the application language.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PackagedAlignmentSmokeContext {
+    run_id: String,
+    alignment: bool,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PackagedAlignmentSmokeResult {
+    schema_version: u8,
+    run_id: String,
+    status: String,
+    message: Option<String>,
+}
+
+fn packaged_alignment_smoke_context(
+    run_id: Option<String>,
+    codex_home: Option<std::path::PathBuf>,
+) -> Option<PackagedAlignmentSmokeContext> {
+    codex_home?;
+    Some(PackagedAlignmentSmokeContext {
+        run_id: run_id?,
+        alignment: true,
+    })
+}
+
+fn packaged_alignment_smoke_result_document(
+    run_id: &str,
+    status: &str,
+    message: Option<String>,
+) -> Result<Vec<u8>, String> {
+    if !matches!(status, "passed" | "failed") {
+        return Err("invalid packaged alignment smoke status".to_string());
+    }
+    let message = message.map(|value| value.chars().take(1024).collect());
+    serde_json::to_vec(&PackagedAlignmentSmokeResult {
+        schema_version: 1,
+        run_id: run_id.to_string(),
+        status: status.to_string(),
+        message,
+    })
+    .map_err(|_| "failed to serialize packaged alignment smoke result".to_string())
+}
+
+#[tauri::command]
+fn record_packaged_alignment_smoke_result(
+    run_id: String,
+    status: String,
+    message: Option<String>,
+) -> Result<(), String> {
+    let path = crate::app::paths::packaged_smoke_result_path(&run_id)
+        .ok_or_else(|| "packaged alignment smoke environment is not valid".to_string())?;
+    let document = packaged_alignment_smoke_result_document(&run_id, &status, message)?;
+    crate::app::atomic_file::write_atomic(&path, &document)
+        .map_err(|_| "failed to persist packaged alignment smoke result".to_string())
+}
+
 #[tauri::command]
 fn frontend_ready(
     app: tauri::AppHandle,
@@ -534,7 +623,7 @@ fn frontend_ready(
     lang: String,
     generation: u64,
     token: String,
-) -> Result<(), String> {
+) -> Result<Option<PackagedAlignmentSmokeContext>, String> {
     let ready = match state.frontend.mark_ready(generation, &token) {
         FrontendReadyResult::Accepted(ready) => ready,
         FrontendReadyResult::Stale { current_generation } => {
@@ -582,7 +671,10 @@ fn frontend_ready(
     for event in ready.pending {
         emit_shell_event(&app, &event);
     }
-    Ok(())
+    Ok(packaged_alignment_smoke_context(
+        crate::app::paths::packaged_smoke_run_id(),
+        crate::app::paths::codex_home_dir(),
+    ))
 }
 
 /// The dependency-light root crash surface calls this as soon as it replaces
@@ -662,6 +754,13 @@ fn schedule_frontend_ready_fallback(app: tauri::AppHandle, generation: u64) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    if let Some(exit_code) = app::alignment_elevation::run_helper_from_args(std::env::args_os()) {
+        std::process::exit(exit_code);
+    }
+    run_tauri_app();
+}
+
+fn run_tauri_app() {
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, args, cwd| {
             log::info!(
@@ -735,6 +834,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             frontend_ready,
             frontend_failed,
+            record_packaged_alignment_smoke_result,
             commands::mac_plan_update,
             commands::mac_stage_update,
             commands::mac_perform_update,
@@ -752,6 +852,20 @@ pub fn run() {
             commands::manager_install_update,
             commands::get_settings,
             commands::set_settings,
+            commands::api_config_session,
+            commands::api_config_login,
+            commands::api_config_keys,
+            commands::api_config_logout,
+            commands::api_config_import_ccs,
+            commands::api_config_write_local,
+            commands::api_config_restart_codex,
+            commands::toolbox_alignment_scan,
+            commands::toolbox_alignment_execute,
+            commands::toolbox_alignment_restore,
+            commands::toolbox_alignment_open_backup,
+            commands::toolbox_alignment_restart,
+            commands::toolbox_force_restart_codex,
+            commands::toolbox_apply_codex_locale,
             commands::get_config_health,
             commands::restore_config_backup,
             commands::reset_config,
@@ -810,7 +924,8 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             install_macos_menu(app.handle(), NativeLocale::En)?;
             log::info!(
-                "Codex App Manager v{} starting (os={}, arch={})",
+                "{} v{} starting (os={}, arch={})",
+                PRODUCT_NAME,
                 app.package_info().version,
                 std::env::consts::OS,
                 std::env::consts::ARCH
@@ -991,7 +1106,7 @@ pub fn run() {
             }
         })
         .build(tauri::generate_context!())
-        .expect("failed to build Codex App Manager")
+        .unwrap_or_else(|error| panic!("failed to build {PRODUCT_NAME}: {error}"))
         // Cmd+Q (and any other app-level quit) lands as ExitRequested rather than
         // a window CloseRequested — gate it with the same phase-aware policy.
         .run(|app, event| {
@@ -1009,8 +1124,8 @@ pub fn run() {
 mod tests {
     use super::{
         browser_accelerators_enabled, frontend_token_script, initial_main_window_visibility,
-        is_allowed_app_navigation, native_confirm_allows_exit, FRONTEND_READY_EVENT,
-        FRONTEND_READY_GLOBAL,
+        is_allowed_app_navigation, native_confirm_allows_exit, packaged_alignment_smoke_context,
+        packaged_alignment_smoke_result_document, FRONTEND_READY_EVENT, FRONTEND_READY_GLOBAL,
     };
     use crate::app::op_phase::{OperationPhase, QuitPolicy};
     use crate::app::shell::FrontendToken;
@@ -1027,6 +1142,41 @@ mod tests {
         assert!(script.contains(r#"token-'\\-value"#));
         assert!(script.contains("configurable: true"));
         assert!(script.contains("Object.freeze"));
+    }
+
+    #[test]
+    fn packaged_alignment_smoke_requires_both_validated_markers() {
+        let context = packaged_alignment_smoke_context(
+            Some("smoke-run".to_string()),
+            Some(std::path::PathBuf::from("isolated-codex-home")),
+        )
+        .unwrap();
+        assert_eq!(context.run_id, "smoke-run");
+        assert!(context.alignment);
+        assert!(packaged_alignment_smoke_context(None, Some("isolated".into())).is_none());
+        assert!(packaged_alignment_smoke_context(Some("smoke-run".into()), None).is_none());
+    }
+
+    #[test]
+    fn packaged_alignment_smoke_result_document_accepts_only_terminal_states() {
+        let passed = packaged_alignment_smoke_result_document("smoke-run", "passed", None).unwrap();
+        let passed: serde_json::Value = serde_json::from_slice(&passed).unwrap();
+        assert_eq!(passed["schemaVersion"], 1);
+        assert_eq!(passed["runId"], "smoke-run");
+        assert_eq!(passed["status"], "passed");
+        assert!(passed["message"].is_null());
+
+        let failed = packaged_alignment_smoke_result_document(
+            "smoke-run",
+            "failed",
+            Some("restore verification failed".into()),
+        )
+        .unwrap();
+        let failed: serde_json::Value = serde_json::from_slice(&failed).unwrap();
+        assert_eq!(failed["status"], "failed");
+        assert_eq!(failed["message"], "restore verification failed");
+
+        assert!(packaged_alignment_smoke_result_document("smoke-run", "pending", None).is_err());
     }
 
     #[test]

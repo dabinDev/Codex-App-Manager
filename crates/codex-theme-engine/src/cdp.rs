@@ -44,8 +44,10 @@ pub struct TargetInfo {
 pub fn validated_debugger_url(target: &TargetInfo, port: u16) -> Result<String> {
     let url = url::Url::parse(&target.web_socket_debugger_url)
         .map_err(|e| err(format!("invalid CDP WebSocket URL: {e}")))?;
-    let loopback = matches!(url.host_str(), Some("127.0.0.1") | Some("localhost") | Some("[::1]"))
-        || url.host_str() == Some("::1");
+    let loopback = matches!(
+        url.host_str(),
+        Some("127.0.0.1") | Some("localhost") | Some("[::1]")
+    ) || url.host_str() == Some("::1");
     if url.scheme() != "ws" || !loopback || url.port() != Some(port) {
         return Err(err(format!(
             "rejected non-loopback CDP WebSocket URL: {}",
@@ -217,7 +219,10 @@ impl CdpSession {
                 .unwrap_or("unknown renderer exception");
             return Err(err(format!("renderer evaluation failed: {detail}")));
         }
-        Ok(result.pointer("/result/value").cloned().unwrap_or(Value::Null))
+        Ok(result
+            .pointer("/result/value")
+            .cloned()
+            .unwrap_or(Value::Null))
     }
 
     pub fn close(&self) {
@@ -293,8 +298,8 @@ async fn loopback_http_get(port: u16, path: &str, timeout: Duration) -> Result<V
                 content_length = value.trim().parse::<usize>().ok();
             }
         }
-        let length = content_length
-            .ok_or_else(|| err(format!("GET {path}: missing Content-Length")))?;
+        let length =
+            content_length.ok_or_else(|| err(format!("GET {path}: missing Content-Length")))?;
         if length > HTTP_BODY_CAP {
             return Err(err(format!("GET {path}: oversized response body")));
         }
@@ -324,8 +329,8 @@ pub async fn list_app_targets(port: u16) -> Result<Vec<TargetInfo>> {
     let body = loopback_http_get(port, "/json/list", LIST_TIMEOUT)
         .await
         .map_err(|e| err(format!("target list failed: {e}")))?;
-    let targets: Vec<TargetInfo> = serde_json::from_slice(&body)
-        .map_err(|e| err(format!("target list parse failed: {e}")))?;
+    let targets: Vec<TargetInfo> =
+        serde_json::from_slice(&body).map_err(|e| err(format!("target list parse failed: {e}")))?;
     let mut filtered: Vec<TargetInfo> = targets
         .into_iter()
         .filter(|t| {
@@ -370,7 +375,8 @@ pub async fn cdp_http_ready(port: u16) -> bool {
     let Ok(body) = serde_json::from_slice::<Value>(&bytes) else {
         return false;
     };
-    body.get("webSocketDebuggerUrl").is_some_and(Value::is_string)
+    body.get("webSocketDebuggerUrl")
+        .is_some_and(Value::is_string)
         || body.get("Browser").is_some_and(Value::is_string)
 }
 
@@ -416,10 +422,7 @@ pub struct ConnectedTarget {
 
 /// Connect every verified Codex renderer on the port, retrying until the
 /// deadline (Codex needs a moment after launch before targets appear).
-pub async fn connect_codex_targets(
-    port: u16,
-    timeout: Duration,
-) -> Result<Vec<ConnectedTarget>> {
+pub async fn connect_codex_targets(port: u16, timeout: Duration) -> Result<Vec<ConnectedTarget>> {
     let deadline = tokio::time::Instant::now() + timeout;
     let mut last_error: Option<String> = None;
     loop {
@@ -478,7 +481,9 @@ mod tests {
 
     #[test]
     fn debugger_url_must_be_loopback_ws_on_the_expected_port() {
-        assert!(validated_debugger_url(&target("ws://127.0.0.1:9345/devtools/page/1"), 9345).is_ok());
+        assert!(
+            validated_debugger_url(&target("ws://127.0.0.1:9345/devtools/page/1"), 9345).is_ok()
+        );
         assert!(validated_debugger_url(&target("ws://localhost:9345/x"), 9345).is_ok());
         // Wrong port, wrong scheme, non-loopback host: all rejected.
         assert!(validated_debugger_url(&target("ws://127.0.0.1:9346/x"), 9345).is_err());
@@ -498,7 +503,10 @@ mod tests {
         ] {
             let mut candidate = target("ws://127.0.0.1:9345/devtools/page/1");
             candidate.url = url.into();
-            assert!(is_theme_excluded_target(&candidate), "expected exclusion: {url}");
+            assert!(
+                is_theme_excluded_target(&candidate),
+                "expected exclusion: {url}"
+            );
         }
     }
 
@@ -512,7 +520,10 @@ mod tests {
         ] {
             let mut candidate = target("ws://127.0.0.1:9345/devtools/page/1");
             candidate.url = url.into();
-            assert!(!is_theme_excluded_target(&candidate), "unexpected exclusion: {url}");
+            assert!(
+                !is_theme_excluded_target(&candidate),
+                "unexpected exclusion: {url}"
+            );
         }
     }
 }

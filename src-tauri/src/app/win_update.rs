@@ -14,17 +14,16 @@ use serde::{Deserialize, Serialize};
 use codex_win_engine::{
     cancel_active_download, cleanup_portable_metadata, close_codex_gracefully_for_root,
     close_msix_codex_processes, codex_running_for_root, detect_installed_codex,
-    detect_portable_install,
-    download_to_with_progress_bounded_with_network, fetch_text_with_network, find_msix_sha256,
-    install_msix_sideload_with_observer, install_portable_from_msix_with_observer,
-    limits::MAX_PACKAGE_BYTES, parse_manifest, pause_active_download, plan_update,
-    precheck_msix_dependencies, probe_capabilities, purge_codex_user_data, read_msix_identity,
-    remove_msix_package, sha256_file, uninstall_portable, validate_codex_identity,
-    verify_msix_health_with_options, verify_openai_authenticode, version_key, AuthenticodeReport,
-    CapabilityState, EngineError, InstalledWindowsCodex, MsixHealthReport, MsixIdentity,
-    MsixRemoveReport, MsixSideloadReport, NetworkConfig, PortableBoundary, PortableInstallReport,
-    PortableUninstallReport, WinCapabilityReport, WinInstallRoute, WindowsRelease,
-    WindowsUpdatePlan,
+    detect_portable_install, download_to_with_progress_bounded_with_network,
+    fetch_text_with_network, find_msix_sha256, install_msix_sideload_with_observer,
+    install_portable_from_msix_with_observer, limits::MAX_PACKAGE_BYTES, parse_manifest,
+    pause_active_download, plan_update, precheck_msix_dependencies, probe_capabilities,
+    purge_codex_user_data, read_msix_identity, remove_msix_package, sha256_file,
+    uninstall_portable, validate_codex_identity, verify_msix_health_with_options,
+    verify_openai_authenticode, version_key, AuthenticodeReport, CapabilityState, EngineError,
+    InstalledWindowsCodex, MsixHealthReport, MsixIdentity, MsixRemoveReport, MsixSideloadReport,
+    NetworkConfig, PortableBoundary, PortableInstallReport, PortableUninstallReport,
+    WinCapabilityReport, WinInstallRoute, WindowsRelease, WindowsUpdatePlan,
 };
 
 use crate::app::install_tx::{ActiveInstallTx, InstallTxKind};
@@ -201,8 +200,8 @@ fn record_managed_install(
     installed: &InstalledWindowsCodex,
     source: &str,
 ) -> OperationOutcome {
-    let mut outcome =
-        OperationOutcome::full_success("present", Some("managed")).with_path(installed.path.clone());
+    let mut outcome = OperationOutcome::full_success("present", Some("managed"))
+        .with_path(installed.path.clone());
     outcome.cleanup = StepOutcome::not_applicable();
     let mut store = ProvenanceStore::load();
     if let Some(previous) = previous {
@@ -279,7 +278,9 @@ fn outcome_from_portable_uninstall(
     if outcome.cleanup.is_failed() {
         // Shortcut / uninstall-entry failures.
         if portable.notes.iter().any(|n| {
-            n.contains("Start Menu") || n.contains("Apps & Features") || n.contains("uninstall entry")
+            n.contains("Start Menu")
+                || n.contains("Apps & Features")
+                || n.contains("uninstall entry")
         }) {
             outcome.push_recovery(recovery::CLEANUP_METADATA);
         }
@@ -1331,9 +1332,7 @@ pub fn perform_windows_update_with_install_mode_network_and_phase(
                     app_state: "unknown".to_string(),
                     install_class: None,
                     path: None,
-                    provenance: StepOutcome::failed(
-                        "安装完成但未检测到可记录的安装，托管状态未知",
-                    ),
+                    provenance: StepOutcome::failed("安装完成但未检测到可记录的安装，托管状态未知"),
                     cleanup: StepOutcome::not_applicable(),
                     warnings: vec![
                         "MSIX sideload reported success but no install was detected afterward."
@@ -1523,9 +1522,7 @@ fn install_portable_after_stage(
             },
             install_class: None,
             path: Some(install_root.clone()),
-            provenance: StepOutcome::failed(
-                "便携安装完成但未检测到可记录的安装，托管状态未知",
-            ),
+            provenance: StepOutcome::failed("便携安装完成但未检测到可记录的安装，托管状态未知"),
             cleanup: StepOutcome::not_applicable(),
             warnings: vec![
                 "Portable install finished but no install was detected for provenance.".to_string(),
@@ -1700,6 +1697,7 @@ pub fn launch_codex(settings: &AppSettings) -> Result<(), AppError> {
         codex_win_engine::LaunchOptions {
             disable_codex_self_updates: settings.disable_codex_self_updates,
             remote_debugging_port: None,
+            locale: settings.locale.clone(),
         },
     )
     .map_err(|e| AppError::Engine(e.to_string()))
@@ -1809,7 +1807,10 @@ pub fn uninstall_windows_codex(
             success: msix.success,
             action: "remove-msix".to_string(),
             message: if outcome.is_partial() {
-                format!("{}（主卸载已完成，附属步骤有失败 — 可仅重试清理）", msix.message)
+                format!(
+                    "{}（主卸载已完成，附属步骤有失败 — 可仅重试清理）",
+                    msix.message
+                )
             } else {
                 msix.message.clone()
             },
@@ -1836,8 +1837,7 @@ pub fn uninstall_windows_codex(
             provenance = StepOutcome::failed(format!("托管记录清除失败（{e}）"));
         }
     }
-    let outcome =
-        outcome_from_portable_uninstall(&portable, provenance, &installed_before.path);
+    let outcome = outcome_from_portable_uninstall(&portable, provenance, &installed_before.path);
     let mut notes = portable.notes.clone();
     notes.extend(outcome.warnings.iter().cloned());
     let report = WinUninstallReport {
@@ -2004,7 +2004,7 @@ mod tests {
         bind_manifest_checksums, check_win_update_abort, detect_existing_windows_install_at_path,
         detect_managed_codex, outcome_from_portable_uninstall,
         portable_boundary_mutated_install_root, retry_windows_ancillary_with_detector,
-        WinAbortGuard, WinPerformAction, WinInstallStatus, WIN_UPDATE_ABORT,
+        WinAbortGuard, WinInstallStatus, WinPerformAction, WIN_UPDATE_ABORT,
     };
     use crate::app::operation_outcome::{recovery, StepOutcome};
     use crate::app::provenance::ProvenanceStore;
@@ -2285,11 +2285,7 @@ aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  OpenAI.Codex_2
             message: "cleanup warnings".into(),
             notes: vec!["Start Menu shortcut cleanup failed: access denied".into()],
         };
-        let outcome = outcome_from_portable_uninstall(
-            &portable,
-            StepOutcome::ok(),
-            r"C:\Codex",
-        );
+        let outcome = outcome_from_portable_uninstall(&portable, StepOutcome::ok(), r"C:\Codex");
         assert!(outcome.primary_ok, "absent tree is still primary success");
         assert_eq!(outcome.app_state, "absent");
         assert_eq!(outcome.path.as_deref(), Some(r"C:\Codex"));
@@ -2315,11 +2311,7 @@ aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  OpenAI.Codex_2
             message: "cleanup warnings".into(),
             notes: vec!["User data cleanup failed: access denied".into()],
         };
-        let outcome = outcome_from_portable_uninstall(
-            &portable,
-            StepOutcome::ok(),
-            r"C:\Codex",
-        );
+        let outcome = outcome_from_portable_uninstall(&portable, StepOutcome::ok(), r"C:\Codex");
         assert!(outcome.primary_ok);
         assert!(outcome.is_partial());
         assert!(outcome
@@ -2341,8 +2333,7 @@ aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  OpenAI.Codex_2
             message: "remove failed".into(),
             notes: vec![],
         };
-        let outcome =
-            outcome_from_portable_uninstall(&portable, StepOutcome::ok(), r"C:\Codex");
+        let outcome = outcome_from_portable_uninstall(&portable, StepOutcome::ok(), r"C:\Codex");
         assert!(!outcome.primary_ok);
         assert!(!outcome.is_partial());
         assert_eq!(outcome.app_state, "present");
@@ -2367,6 +2358,5 @@ aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  OpenAI.Codex_2
             .recovery_actions
             .iter()
             .any(|action| action == recovery::RECORD_PROVENANCE));
-
     }
 }

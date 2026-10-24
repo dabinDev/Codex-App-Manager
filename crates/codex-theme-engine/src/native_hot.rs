@@ -38,6 +38,38 @@ pub const SETTING_KEYS: [&str; 5] = [
     "appearanceLightCodeThemeId",
 ];
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct CodexLocalePlan {
+    pub chromium_locale: Option<String>,
+    pub setting_value: Value,
+    pub requires_catalog: bool,
+    pub active_theme: Option<String>,
+}
+
+pub fn codex_locale_plan(
+    locale: Option<&str>,
+    active_theme: Option<&str>,
+) -> Result<CodexLocalePlan> {
+    let active_theme = active_theme.map(str::to_owned);
+    match locale {
+        None => Ok(CodexLocalePlan {
+            chromium_locale: None,
+            setting_value: Value::Null,
+            requires_catalog: false,
+            active_theme,
+        }),
+        Some("zh-CN") => Ok(CodexLocalePlan {
+            chromium_locale: Some("zh-CN".to_string()),
+            setting_value: Value::String("zh-CN".to_string()),
+            requires_catalog: true,
+            active_theme,
+        }),
+        Some(value) => Err(err(format!(
+            "codex-locale-unsupported: unsupported Codex locale {value}"
+        ))),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SettingsAdapter {
     V26_707,
@@ -187,8 +219,8 @@ struct JsOutcome {
 
 async fn run_js(session: &CdpSession, expression: &str, what: &str) -> Result<JsOutcome> {
     let value = session.evaluate(expression).await?;
-    let outcome: JsOutcome = serde_json::from_value(value)
-        .map_err(|e| err(format!("{what}: 结果解析失败: {e}")))?;
+    let outcome: JsOutcome =
+        serde_json::from_value(value).map_err(|e| err(format!("{what}: 结果解析失败: {e}")))?;
     if !outcome.ok {
         return Err(err(format!(
             "hot-import-unsupported: {what}: {}",
@@ -261,8 +293,8 @@ pub async fn write_values(
         .iter()
         .map(|(key, value)| serde_json::json!([key, value]))
         .collect();
-    let payload_json = serde_json::to_string(&payload)
-        .map_err(|e| err(format!("写入负载序列化失败: {e}")))?;
+    let payload_json =
+        serde_json::to_string(&payload).map_err(|e| err(format!("写入负载序列化失败: {e}")))?;
     let expression = format!(
         r#"(async () => {{
   const api = window.__camThemeSettingsV1;
@@ -278,7 +310,93 @@ pub async fn write_values(
   return {{ ok: true }};
 }})()"#
     );
-    run_js(session, &expression, "写入外观设置").await.map(|_| ())
+    run_js(session, &expression, "写入外观设置")
+        .await
+        .map(|_| ())
+}
+
+fn verify_setting_value(
+    key: &str,
+    expected: &Value,
+    mut values: serde_json::Map<String, Value>,
+) -> Result<()> {
+    match values.remove(key) {
+        Some(actual) if actual == *expected => Ok(()),
+        Some(actual) => Err(err(format!(
+            "setting-verification-failed: {key}: expected {expected}, got {actual}"
+        ))),
+        None => Err(err(format!(
+            "setting-verification-failed: {key}: read-back value missing"
+        ))),
+    }
+}
+
+/// Write one official Codex setting, then read it through the same settings API
+/// before returning. Passing `default: null` preserves a cleared optional value
+/// in the by-value CDP result instead of letting JavaScript omit the property.
+pub async fn write_verified_value(
+    session: &CdpSession,
+    key: &str,
+    expected: Value,
+    version_hint: Option<&str>,
+) -> Result<()> {
+    ensure_api(session, version_hint).await?;
+    let key_json = serde_json::to_string(key)
+        .map_err(|e| err(format!("setting key serialization failed: {e}")))?;
+    let expected_json = serde_json::to_string(&expected)
+        .map_err(|e| err(format!("setting value serialization failed: {e}")))?;
+    let expression = format!(
+        r#"(async () => {{
+  const api = window.__camThemeSettingsV1;
+  if (!api) return {{ ok: false, error: "api not initialized" }};
+  const key = {key_json};
+  const expected = {expected_json};
+  try {{
+    await api.write({{ key }}, expected);
+    const actual = await api.read({{ key, default: null }});
+    return {{ ok: true, values: {{ [key]: actual }} }};
+  }} catch (e) {{
+    return {{ ok: false, error: key + ": " + String(e) }};
+  }}
+}})()"#
+    );
+    let outcome = run_js(session, &expression, "write and verify Codex setting").await?;
+    verify_setting_value(key, &expected, outcome.values.unwrap_or_default())
+}
+
+pub fn has_locale_catalog_evidence(locale: &str, resources: &[String]) -> bool {
+    resources.iter().any(|url| {
+        url.rsplit('/').next().is_some_and(|name| {
+            let name = name.split(['?', '#']).next().unwrap_or(name);
+            name.starts_with(&format!("{locale}-")) && name.ends_with(".js")
+        })
+    })
+}
+
+/// Wait until the current renderer has loaded the requested React message
+/// catalog. A native-menu locale file is deliberately not accepted as proof.
+pub async fn wait_for_locale_catalog(
+    session: &CdpSession,
+    locale: &str,
+    timeout: std::time::Duration,
+) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let value = session
+            .evaluate(r#"performance.getEntriesByType("resource").map((entry) => entry.name)"#)
+            .await?;
+        let resources: Vec<String> = serde_json::from_value(value)
+            .map_err(|e| err(format!("locale catalog evidence parse failed: {e}")))?;
+        if has_locale_catalog_evidence(locale, &resources) {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(err(format!(
+                "codex-locale-catalog-not-loaded: {locale} catalog did not load"
+            )));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
 }
 
 /// The write set for a typed theme: both ChromeThemes, both code theme ids
@@ -399,6 +517,68 @@ mod tests {
         let entries = snapshot_write_entries(&snapshot);
         let keys: Vec<&str> = entries.iter().map(|(k, _)| *k).collect();
         assert_eq!(keys, vec!["appearanceLightChromeTheme", "appearanceTheme"]);
+    }
+
+    #[test]
+    fn verified_setting_accepts_string_and_null_values() {
+        let mut string_values = serde_json::Map::new();
+        string_values.insert("localeOverride".into(), serde_json::json!("zh-CN"));
+        verify_setting_value("localeOverride", &serde_json::json!("zh-CN"), string_values).unwrap();
+
+        let mut null_values = serde_json::Map::new();
+        null_values.insert("localeOverride".into(), Value::Null);
+        verify_setting_value("localeOverride", &Value::Null, null_values).unwrap();
+    }
+
+    #[test]
+    fn verified_setting_rejects_mismatch_and_missing_value() {
+        let mut mismatch = serde_json::Map::new();
+        mismatch.insert("localeOverride".into(), serde_json::json!("en-US"));
+        assert!(
+            verify_setting_value("localeOverride", &serde_json::json!("zh-CN"), mismatch,)
+                .unwrap_err()
+                .to_string()
+                .contains("setting-verification-failed")
+        );
+        assert!(
+            verify_setting_value("localeOverride", &Value::Null, serde_json::Map::new())
+                .unwrap_err()
+                .to_string()
+                .contains("setting-verification-failed")
+        );
+    }
+
+    #[test]
+    fn chinese_catalog_evidence_requires_the_real_catalog_chunk() {
+        assert!(has_locale_catalog_evidence(
+            "zh-CN",
+            &["app://-/webview/assets/zh-CN-ClxN0P7N.js".into()]
+        ));
+        assert!(!has_locale_catalog_evidence(
+            "zh-CN",
+            &["app://-/native-menu-locales/zh-CN.json".into()]
+        ));
+    }
+
+    #[test]
+    fn codex_locale_plan_maps_chinese_and_system_default() {
+        let zh = codex_locale_plan(Some("zh-CN"), Some("orange-dark")).unwrap();
+        assert_eq!(zh.chromium_locale.as_deref(), Some("zh-CN"));
+        assert_eq!(zh.setting_value, serde_json::json!("zh-CN"));
+        assert!(zh.requires_catalog);
+        assert_eq!(zh.active_theme.as_deref(), Some("orange-dark"));
+
+        let system = codex_locale_plan(None, None).unwrap();
+        assert_eq!(system.chromium_locale, None);
+        assert_eq!(system.setting_value, Value::Null);
+        assert!(!system.requires_catalog);
+        assert_eq!(system.active_theme, None);
+    }
+
+    #[test]
+    fn codex_locale_plan_rejects_unsupported_values() {
+        assert!(codex_locale_plan(Some("en-US"), None).is_err());
+        assert!(codex_locale_plan(Some("  "), None).is_err());
     }
 
     #[test]

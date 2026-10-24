@@ -17,14 +17,16 @@
         "label": "main",
         "create": false,
         "title": "Codex App Manager",
-        "width": 400,
-        "height": 640,
-        "resizable": false,
+        "width": 1100,
+        "height": 720,
+        "minWidth": 960,
+        "minHeight": 640,
+        "resizable": true,
         "decorations": false,
         "transparent": true,
         "visible": false,
         "center": true,
-        "shadow": false
+        "shadow": true
       }
     ],
     "security": {
@@ -45,8 +47,14 @@
     "copyright": "Copyright (c) 2026 Wangnov",
     "shortDescription": "Codex App mirror install and update manager.",
     "longDescription": "A manager app for installing and updating mirrored official Codex desktop app packages.",
-    "targets": ["nsis", "dmg", "app"],
-    "resources": ["resources/*"],
+    "targets": [
+      "nsis",
+      "dmg",
+      "app"
+    ],
+    "resources": [
+      "resources/*"
+    ],
     "windows": {
       "nsis": {
         "displayLanguageSelector": true,

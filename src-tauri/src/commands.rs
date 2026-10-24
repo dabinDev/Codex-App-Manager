@@ -16,10 +16,10 @@ use crate::app::mac_update::{
     cancel_macos_download, detect_existing_install_at_path as detect_macos_install_at_path,
     discard_macos_download, install_macos_with_network_and_phase,
     mac_adopt_path as adopt_macos_path, pause_macos_download,
-    perform_macos_update_with_network_and_phase,
-    plan_macos_update_with_network, retry_macos_ancillary, stage_macos_update_with_network,
-    uninstall_macos, InstalledCodex, MacInstallStatus, MacPerformReport, MacStageReport,
-    MacUninstallReport, MacUpdateReport, PerformExpectation,
+    perform_macos_update_with_network_and_phase, plan_macos_update_with_network,
+    retry_macos_ancillary, stage_macos_update_with_network, uninstall_macos, InstalledCodex,
+    MacInstallStatus, MacPerformReport, MacStageReport, MacUninstallReport, MacUpdateReport,
+    PerformExpectation,
 };
 use crate::app::op_phase::{OperationPhase, QuitPolicy};
 use crate::app::operation_outcome::{AncillaryRetryReport, AncillaryRetryRequest};
@@ -27,28 +27,34 @@ use crate::app::oplock::{
     OperationCompletion, OperationError, OperationGuard, OperationKind, OperationManager,
     OperationProgress, OperationSnapshot, OperationToken,
 };
+use crate::app::orange_api::{OrangeError, OrangeProxy};
+use crate::app::orange_session::{OrangeKeyList, OrangeSessionView};
 use crate::app::paths;
 use crate::app::provenance::ProvenanceStore;
 use crate::app::settings_store::AppSettings as PersistedAppSettings;
 use crate::app::settings_store::{ProxyMode, UpdateSource};
 use crate::app::url_guard::{validate_custom_proxy, validate_custom_source};
-use crate::app::window_mode::{self, WindowMode, WindowModeReport};
 use crate::app::win_update::{
     auto_stage_windows_update_with_install_mode_and_network, cancel_windows_download,
     detect_existing_windows_install_at_path as detect_windows_install_at_path,
     discard_windows_download, pause_windows_download,
     perform_windows_update_with_install_mode_network_and_phase,
-    plan_windows_update_with_install_mode_and_network,
-    retry_windows_ancillary, stage_windows_update_with_install_mode_and_network,
-    uninstall_windows_codex, win_adopt as adopt_windows_install,
-    win_adopt_path as adopt_windows_path, win_install_status,
-    DownloadProgress as WinDownloadProgress, OperationEvidence, WinAutoStageReport, WinInstallStatus,
-    WinPerformExpectation, WinPerformReport, WinStageReport, WinUninstallReport, WinUpdateReport,
+    plan_windows_update_with_install_mode_and_network, retry_windows_ancillary,
+    stage_windows_update_with_install_mode_and_network, uninstall_windows_codex,
+    win_adopt as adopt_windows_install, win_adopt_path as adopt_windows_path, win_install_status,
+    DownloadProgress as WinDownloadProgress, OperationEvidence, WinAutoStageReport,
+    WinInstallStatus, WinPerformExpectation, WinPerformReport, WinStageReport, WinUninstallReport,
+    WinUpdateReport,
 };
+use crate::app::window_mode::{self, WindowMode, WindowModeReport};
 use crate::domain::settings::AppSettings as DomainAppSettings;
 use crate::domain::target::OperatingSystem;
 use crate::errors::{AppError, CommandError};
 use crate::state::ManagerState;
+
+static PROVIDER_COMMAND_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static ALIGNMENT_COMMAND_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static ALIGNMENT_RESTART_PERMIT: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
 
 fn normalize_windows_source_base(raw: &str) -> Option<String> {
     let mut base = raw.trim().trim_end_matches('/').to_string();
@@ -125,6 +131,104 @@ fn validated_custom_proxy_for_settings(raw: &str, context: &str) -> Result<Strin
         log::warn!("url_guard rejected {context} proxy reason={e}");
         AppError::Engine(e.to_string())
     })
+}
+
+fn orange_proxy_for_settings() -> Result<OrangeProxy, CommandError> {
+    let saved = PersistedAppSettings::load();
+    match saved.proxy_mode {
+        ProxyMode::System => Ok(OrangeProxy::System),
+        ProxyMode::Direct => Ok(OrangeProxy::Direct),
+        ProxyMode::Custom => validated_custom_proxy_for_settings(
+            &saved.custom_proxy_url,
+            crate::app::brand::SERVICE_NAME,
+        )
+        .map(OrangeProxy::Custom)
+        .map_err(Into::into),
+    }
+}
+
+fn orange_command_error(error: OrangeError) -> CommandError {
+    CommandError {
+        code: error.code().to_string(),
+        message: error.to_string(),
+    }
+}
+
+fn provider_command_error(error: crate::app::codex_provider::ProviderWriteError) -> CommandError {
+    CommandError {
+        code: error.code().to_string(),
+        message: error.to_string(),
+    }
+}
+
+fn alignment_command_error(
+    error: crate::app::conversation_alignment::AlignmentError,
+) -> CommandError {
+    CommandError {
+        code: error.code().to_string(),
+        message: error.to_string(),
+    }
+}
+
+fn elevation_command_error(error: crate::app::alignment_elevation::ElevationError) -> CommandError {
+    CommandError {
+        code: error.code().to_string(),
+        message: error.to_string(),
+    }
+}
+
+fn codex_locale_command_error(error: AppError) -> CommandError {
+    let message = error.to_string();
+    let code = if message.contains("setting-verification-failed") {
+        Some("codex_locale_setting_verification_failed")
+    } else if message.contains("codex-locale-zero-translated-ui") {
+        Some("codex_locale_zero_translated_ui")
+    } else if message.contains("codex-locale-runtime-install-failed") {
+        Some("codex_locale_runtime_install_failed")
+    } else if message.contains("no verified Codex renderer") {
+        Some("codex_locale_cdp_unavailable")
+    } else {
+        None
+    };
+    if let Some(code) = code {
+        return CommandError {
+            code: code.to_string(),
+            message,
+        };
+    }
+    error.into()
+}
+
+fn set_alignment_restart_permit(allowed: bool) {
+    *ALIGNMENT_RESTART_PERMIT
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner()) = allowed;
+}
+
+fn alignment_restart_permitted() -> bool {
+    *ALIGNMENT_RESTART_PERMIT
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+}
+
+fn alignment_paths() -> Result<crate::app::conversation_alignment::AlignmentPaths, CommandError> {
+    paths::codex_home_dir()
+        .map(crate::app::conversation_alignment::AlignmentPaths::from_codex_home)
+        .ok_or(crate::app::conversation_alignment::AlignmentError::CodexHomeUnavailable)
+        .map_err(alignment_command_error)
+}
+
+fn stop_alignment_desktop() -> Result<bool, crate::app::conversation_alignment::AlignmentError> {
+    crate::app::codex_theme::stop_for_external_config_write()
+        .map_err(|_| crate::app::conversation_alignment::AlignmentError::Mutation)
+}
+
+fn system_alignment_process_gate() -> crate::app::conversation_alignment::SystemAlignmentProcessGate
+{
+    crate::app::conversation_alignment::SystemAlignmentProcessGate::new(
+        crate::app::codex_theme::installed_codex_path().ok(),
+        stop_alignment_desktop,
+    )
 }
 
 fn mac_network_config_for_settings() -> Result<codex_mac_engine::NetworkConfig, AppError> {
@@ -245,6 +349,7 @@ fn windows_domain_settings_for_persisted(state: &ManagerState) -> DomainAppSetti
     let mut settings = state.settings.clone();
     settings.install_root = saved.install_root;
     settings.disable_codex_self_updates = saved.disable_codex_self_updates;
+    settings.locale = saved.codex_locale.clone();
     settings
 }
 
@@ -430,7 +535,8 @@ fn destructive_token_error(err: OperationError) -> CommandError {
 fn refresh_config_health(state: &ManagerState) -> ConfigHealth {
     let (_, settings_health) = PersistedAppSettings::load_with_health();
     let (_, provenance_health) = ProvenanceStore::load_with_health();
-    let health = ConfigHealth::from_parts(settings_health, provenance_health).with_live_backup_flags();
+    let health =
+        ConfigHealth::from_parts(settings_health, provenance_health).with_live_backup_flags();
     let mut slot = state
         .config_health
         .lock()
@@ -544,8 +650,9 @@ fn probe_install_parent_replace(path: &Path) -> Result<PathBuf, AppError> {
     let probe_dir = nearest_existing_dir(requested_parent);
     let probe_id = uuid::Uuid::new_v4();
     let source = probe_dir.join(format!("{INSTALL_LOCATION_PROBE_PREFIX}{probe_id}-source"));
-    let destination =
-        probe_dir.join(format!("{INSTALL_LOCATION_PROBE_PREFIX}{probe_id}-destination"));
+    let destination = probe_dir.join(format!(
+        "{INSTALL_LOCATION_PROBE_PREFIX}{probe_id}-destination"
+    ));
 
     let probe_result = (|| -> std::io::Result<()> {
         std::fs::create_dir(&source)?;
@@ -892,7 +999,11 @@ pub async fn mac_launch_codex(state: State<'_, ManagerState>) -> Result<(), Comm
         return Err(AppError::UnsupportedPlatform.into());
     }
     let settings = PersistedAppSettings::load();
-    if settings.codex_theme.is_some() && state.operations.snapshot().is_none() {
+    if persisted_codex_customization_active(
+        settings.codex_theme.is_some(),
+        settings.codex_locale_compatibility,
+    ) && state.operations.snapshot().is_none()
+    {
         let themed =
             crate::app::codex_theme::launch_with_active_theme(&state.codex_theme, &settings)
                 .await?;
@@ -1086,6 +1197,440 @@ pub fn set_settings(
 }
 
 #[tauri::command]
+pub async fn api_config_session(
+    state: State<'_, ManagerState>,
+) -> Result<OrangeSessionView, CommandError> {
+    state
+        .orange
+        .session_view(orange_proxy_for_settings()?)
+        .await
+        .map_err(orange_command_error)
+}
+
+#[tauri::command]
+pub async fn api_config_login(
+    state: State<'_, ManagerState>,
+    email: String,
+    password: String,
+    remember: bool,
+) -> Result<OrangeSessionView, CommandError> {
+    state
+        .orange
+        .login(
+            orange_proxy_for_settings()?,
+            email.trim().to_string(),
+            password,
+            remember,
+        )
+        .await
+        .map_err(orange_command_error)
+}
+
+#[tauri::command]
+pub async fn api_config_keys(
+    state: State<'_, ManagerState>,
+) -> Result<OrangeKeyList, CommandError> {
+    let local_key = crate::app::codex_provider::read_local_api_key();
+    state
+        .orange
+        .refresh_keys(local_key.as_deref())
+        .await
+        .map_err(orange_command_error)
+}
+
+#[tauri::command]
+pub async fn api_config_logout(
+    state: State<'_, ManagerState>,
+) -> Result<OrangeSessionView, CommandError> {
+    state.orange.logout().await.map_err(orange_command_error)
+}
+
+#[tauri::command]
+pub async fn api_config_import_ccs(
+    state: State<'_, ManagerState>,
+    key_id: u64,
+) -> Result<(), CommandError> {
+    let api_key = state
+        .orange
+        .full_key(key_id)
+        .await
+        .map_err(orange_command_error)?;
+    let provider_name = state.orange.provider_name().await;
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::app::codex_provider::import_into_ccswitch(&provider_name, &api_key)
+            .map_err(provider_command_error)
+    })
+    .await
+    .map_err(|error| AppError::Internal(format!("CC Switch task failed: {error}")))?
+}
+
+#[tauri::command]
+pub async fn api_config_write_local(
+    state: State<'_, ManagerState>,
+    key_id: u64,
+) -> Result<crate::app::codex_provider::ProviderWriteReport, CommandError> {
+    let api_key = state
+        .orange
+        .full_key(key_id)
+        .await
+        .map_err(orange_command_error)?;
+    let _operation = begin_guard(&state, OperationKind::ProviderWrite)?;
+    let report = tauri::async_runtime::spawn_blocking(move || {
+        let _guard = PROVIDER_COMMAND_LOCK.try_lock().map_err(|_| CommandError {
+            code: "provider_busy".into(),
+            message: "another Codex provider write is already running".into(),
+        })?;
+        let permit =
+            crate::app::codex_provider::begin_provider_write().map_err(provider_command_error)?;
+        let was_running = crate::app::codex_theme::stop_for_external_config_write()
+            .map_err(CommandError::from)?;
+        crate::app::codex_provider::write_provider_files(permit, &api_key, was_running)
+            .map_err(provider_command_error)
+    })
+    .await
+    .map_err(|error| AppError::Internal(format!("Codex provider task failed: {error}")))??;
+
+    if report.outcome == crate::app::codex_provider::ProviderWriteOutcome::Committed {
+        state.orange.mark_enabled(key_id).await;
+    }
+    Ok(report)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApiConfigRestartPlan {
+    Themed,
+    Plain,
+}
+
+fn api_config_restart_plan(has_active_theme: bool, operation_active: bool) -> ApiConfigRestartPlan {
+    if has_active_theme && !operation_active {
+        ApiConfigRestartPlan::Themed
+    } else {
+        ApiConfigRestartPlan::Plain
+    }
+}
+
+fn persisted_codex_customization_active(
+    has_active_theme: bool,
+    locale_compatibility: bool,
+) -> bool {
+    has_active_theme || locale_compatibility
+}
+
+#[tauri::command]
+pub async fn api_config_restart_codex(state: State<'_, ManagerState>) -> Result<(), CommandError> {
+    let settings = PersistedAppSettings::load();
+    if api_config_restart_plan(
+        persisted_codex_customization_active(
+            settings.codex_theme.is_some(),
+            settings.codex_locale_compatibility,
+        ),
+        state.operations.snapshot().is_some(),
+    ) == ApiConfigRestartPlan::Themed
+    {
+        let themed =
+            crate::app::codex_theme::launch_with_active_theme(&state.codex_theme, &settings)
+                .await?;
+        if themed {
+            return Ok(());
+        }
+    }
+    tauri::async_runtime::spawn_blocking(crate::app::codex_theme::restart_codex_plain)
+        .await
+        .map_err(|error| AppError::Internal(format!("Codex restart task failed: {error}")))?
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn toolbox_alignment_scan(
+) -> Result<crate::app::conversation_alignment::AlignmentScan, CommandError> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let paths = alignment_paths()?;
+        let process = system_alignment_process_gate();
+        let process_state =
+            crate::app::conversation_alignment::ProcessGate::process_state(&process)
+                .map_err(alignment_command_error)?;
+        crate::app::conversation_alignment::scan_alignment_at(&paths, process_state)
+            .map_err(alignment_command_error)
+    })
+    .await
+    .map_err(|error| AppError::Internal(format!("alignment scan task failed: {error}")))?
+}
+
+#[tauri::command]
+pub async fn toolbox_alignment_execute(
+    app: AppHandle,
+    state: State<'_, ManagerState>,
+    scan_token: String,
+) -> Result<crate::app::conversation_alignment::AlignmentReport, CommandError> {
+    let _operation = begin_guard(&state, OperationKind::ConversationAlignment)?;
+    set_alignment_restart_permit(false);
+    let mut report = tauri::async_runtime::spawn_blocking({
+        let scan_token = scan_token.clone();
+        move || {
+            let _command = ALIGNMENT_COMMAND_LOCK
+                .try_lock()
+                .map_err(|_| CommandError {
+                    code: "alignment_busy".to_string(),
+                    message: "another conversation alignment operation is already running"
+                        .to_string(),
+                })?;
+            let _provider_command = PROVIDER_COMMAND_LOCK.try_lock().map_err(|_| CommandError {
+                code: "provider_busy".to_string(),
+                message: "another Codex provider write is already running".to_string(),
+            })?;
+            let _provider_permit = crate::app::codex_provider::begin_provider_write()
+                .map_err(provider_command_error)?;
+            let paths = alignment_paths()?;
+            let process = system_alignment_process_gate();
+            crate::app::conversation_alignment::execute_alignment_at(&paths, &scan_token, &process)
+                .map_err(alignment_command_error)
+        }
+    })
+    .await
+    .map_err(|error| AppError::Internal(format!("alignment execute task failed: {error}")))??;
+    use crate::app::alignment_command_policy::{alignment_continuation, AlignmentContinuation};
+    let continuation = alignment_continuation(&report);
+    if cfg!(target_os = "windows")
+        && matches!(
+            continuation,
+            AlignmentContinuation::ElevateAlign | AlignmentContinuation::ElevateRestoreThenAlign
+        )
+    {
+        let operation = match continuation {
+            AlignmentContinuation::ElevateAlign => {
+                crate::app::alignment_elevation::ElevationOperation::Align
+            }
+            AlignmentContinuation::ElevateRestoreThenAlign => {
+                crate::app::alignment_elevation::ElevationOperation::RestoreThenAlign
+            }
+            AlignmentContinuation::ReturnReport | AlignmentContinuation::StopRecoveryRequired => {
+                unreachable!()
+            }
+        };
+        let recovery_id = if continuation == AlignmentContinuation::ElevateRestoreThenAlign {
+            report.recovery_id.clone()
+        } else {
+            None
+        };
+        let _ = app.emit(
+            "toolbox://alignment-elevation",
+            serde_json::json!({
+                "scanToken": scan_token.clone(),
+                "operation": match operation {
+                    crate::app::alignment_elevation::ElevationOperation::Align => "align",
+                    crate::app::alignment_elevation::ElevationOperation::RestoreThenAlign => "restore_then_align",
+                }
+            }),
+        );
+        report = tauri::async_runtime::spawn_blocking(move || {
+            let paths = alignment_paths()?;
+            let launch = crate::app::alignment_elevation::prepare_elevation_request(
+                &paths.codex_home,
+                operation,
+                recovery_id,
+                &scan_token,
+            )
+            .map_err(elevation_command_error)?;
+            crate::app::alignment_elevation::launch_elevated_helper(&launch)
+                .map_err(elevation_command_error)
+        })
+        .await
+        .map_err(|error| {
+            AppError::Internal(format!("alignment elevation task failed: {error}"))
+        })??;
+    }
+    set_alignment_restart_permit(
+        report.restart_allowed
+            && report.outcome
+                != crate::app::conversation_alignment::AlignmentOutcome::RecoveryRequired,
+    );
+    Ok(report)
+}
+
+#[tauri::command]
+pub async fn toolbox_alignment_restore(
+    state: State<'_, ManagerState>,
+    recovery_id: String,
+) -> Result<crate::app::conversation_alignment::AlignmentReport, CommandError> {
+    let _operation = begin_guard(&state, OperationKind::ConversationAlignment)?;
+    set_alignment_restart_permit(false);
+    let report = tauri::async_runtime::spawn_blocking(move || {
+        let _command = ALIGNMENT_COMMAND_LOCK
+            .try_lock()
+            .map_err(|_| CommandError {
+                code: "alignment_busy".to_string(),
+                message: "another conversation alignment operation is already running".to_string(),
+            })?;
+        let _provider_command = PROVIDER_COMMAND_LOCK.try_lock().map_err(|_| CommandError {
+            code: "provider_busy".to_string(),
+            message: "another Codex provider write is already running".to_string(),
+        })?;
+        let _provider_permit =
+            crate::app::codex_provider::begin_provider_write().map_err(provider_command_error)?;
+        let paths = alignment_paths()?;
+        let process = system_alignment_process_gate();
+        crate::app::conversation_alignment::restore_alignment_with_process_at(
+            &paths,
+            &recovery_id,
+            &process,
+        )
+        .map_err(alignment_command_error)
+    })
+    .await
+    .map_err(|error| AppError::Internal(format!("alignment restore task failed: {error}")))??;
+    set_alignment_restart_permit(
+        report.restart_allowed
+            && report.outcome
+                != crate::app::conversation_alignment::AlignmentOutcome::RecoveryRequired,
+    );
+    Ok(report)
+}
+
+#[tauri::command]
+pub async fn toolbox_alignment_open_backup(recovery_id: String) -> Result<(), CommandError> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let paths = alignment_paths()?;
+        let backup =
+            crate::app::conversation_alignment::recovery_directory_at(&paths, &recovery_id)
+                .map_err(alignment_command_error)?;
+        open_dir_platform(&backup).map_err(|error| {
+            AppError::Internal(format!("open alignment backup directory failed: {error}")).into()
+        })
+    })
+    .await
+    .map_err(|error| AppError::Internal(format!("open alignment backup task failed: {error}")))?
+}
+
+#[tauri::command]
+pub async fn toolbox_alignment_restart(state: State<'_, ManagerState>) -> Result<(), CommandError> {
+    if !alignment_restart_permitted() {
+        return Err(CommandError {
+            code: "alignment_restart_not_allowed".to_string(),
+            message: "Codex restart is not allowed for the current alignment result".to_string(),
+        });
+    }
+    let settings = PersistedAppSettings::load();
+    let restart_plan = api_config_restart_plan(
+        persisted_codex_customization_active(
+            settings.codex_theme.is_some(),
+            settings.codex_locale_compatibility,
+        ),
+        state.operations.snapshot().is_some(),
+    );
+    let _operation = begin_guard(&state, OperationKind::ConversationAlignment)?;
+    if restart_plan == ApiConfigRestartPlan::Themed {
+        let themed =
+            crate::app::codex_theme::launch_with_active_theme(&state.codex_theme, &settings)
+                .await?;
+        if themed {
+            set_alignment_restart_permit(false);
+            return Ok(());
+        }
+    }
+    tauri::async_runtime::spawn_blocking(crate::app::codex_theme::restart_codex_plain)
+        .await
+        .map_err(|error| AppError::Internal(format!("Codex restart task failed: {error}")))?
+        .map_err(CommandError::from)?;
+    set_alignment_restart_permit(false);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn toolbox_force_restart_codex(
+    state: State<'_, ManagerState>,
+    confirmed: bool,
+) -> Result<(), CommandError> {
+    use crate::app::alignment_command_policy::{restart_command_policy, RestartCommandPolicy};
+
+    let operation_active = state.operations.snapshot().is_some();
+    match restart_command_policy(operation_active, confirmed) {
+        RestartCommandPolicy::RejectConfirmation => {
+            return Err(CommandError {
+                code: "alignment_restart_confirmation_required".to_string(),
+                message: "Codex force restart requires explicit confirmation".to_string(),
+            });
+        }
+        RestartCommandPolicy::Busy => {
+            return Err(CommandError {
+                code: "alignment_busy".to_string(),
+                message: "another protected operation is already running".to_string(),
+            });
+        }
+        RestartCommandPolicy::ConfirmedManual => {}
+    }
+
+    let settings = PersistedAppSettings::load();
+    let restart_plan = api_config_restart_plan(
+        persisted_codex_customization_active(
+            settings.codex_theme.is_some(),
+            settings.codex_locale_compatibility,
+        ),
+        operation_active,
+    );
+    let _operation = begin_guard(&state, OperationKind::ConversationAlignment)?;
+    if restart_plan == ApiConfigRestartPlan::Themed {
+        let themed =
+            crate::app::codex_theme::launch_with_active_theme(&state.codex_theme, &settings)
+                .await?;
+        if themed {
+            return Ok(());
+        }
+    }
+    tauri::async_runtime::spawn_blocking(crate::app::codex_theme::restart_codex_plain)
+        .await
+        .map_err(|error| AppError::Internal(format!("Codex force restart task failed: {error}")))?
+        .map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub async fn toolbox_apply_codex_locale(
+    state: State<'_, ManagerState>,
+    confirmed: bool,
+) -> Result<crate::app::codex_theme::CodexLocaleApplyResult, CommandError> {
+    use crate::app::alignment_command_policy::{restart_command_policy, RestartCommandPolicy};
+
+    let operation_active = state.operations.snapshot().is_some();
+    match restart_command_policy(operation_active, confirmed) {
+        RestartCommandPolicy::RejectConfirmation => {
+            return Err(CommandError {
+                code: "alignment_restart_confirmation_required".to_string(),
+                message: "Codex locale apply requires explicit confirmation".to_string(),
+            });
+        }
+        RestartCommandPolicy::Busy => {
+            return Err(CommandError {
+                code: "alignment_busy".to_string(),
+                message: "another protected operation is already running".to_string(),
+            });
+        }
+        RestartCommandPolicy::ConfirmedManual => {}
+    }
+
+    let mut settings = PersistedAppSettings::load();
+    let _operation = begin_guard(&state, OperationKind::ConversationAlignment)?;
+    let result = state.codex_theme.apply_locale_with_restart(&settings).await;
+    settings.codex_locale_compatibility =
+        persist_compatibility_for_locale_mode(result.as_ref().ok().map(|result| &result.mode));
+    if let Err(save_error) = settings.save() {
+        if result.is_ok() {
+            return Err(CommandError::from(save_error));
+        }
+        log::error!("failed to clear persisted Codex locale compatibility state: {save_error}");
+    }
+    result.map_err(codex_locale_command_error)
+}
+
+fn persist_compatibility_for_locale_mode(
+    mode: Option<&crate::app::codex_theme::LocaleMode>,
+) -> bool {
+    matches!(
+        mode,
+        Some(crate::app::codex_theme::LocaleMode::CompatibilityRuntime)
+    )
+}
+
+#[tauri::command]
 pub fn get_config_health(state: State<'_, ManagerState>) -> ConfigHealth {
     // Always re-read from disk so the UI sees post-restore/reset truth, not a
     // stale snapshot taken at process start.
@@ -1130,10 +1675,9 @@ pub fn restore_config_backup(
         _ => "ok",
     };
     if status == "corrupt" {
-        return Err(AppError::Internal(format!(
-            "已从 .bak 还原 {which}，但重新读取仍判定为损坏"
-        ))
-        .into());
+        return Err(
+            AppError::Internal(format!("已从 .bak 还原 {which}，但重新读取仍判定为损坏")).into(),
+        );
     }
     Ok(health)
 }
@@ -1168,10 +1712,7 @@ pub fn reset_config(
         _ => "ok",
     };
     if status == "corrupt" {
-        return Err(AppError::Internal(format!(
-            "已重置 {which}，但重新读取仍判定为损坏"
-        ))
-        .into());
+        return Err(AppError::Internal(format!("已重置 {which}，但重新读取仍判定为损坏")).into());
     }
     Ok(health)
 }
@@ -1204,26 +1745,22 @@ pub fn retry_ancillary(
     }
     let _guard: RetryGuard = if purge {
         if confirm != Some(true) {
-            return Err(AppError::Internal(
-                "清除用户数据需要二次确认（confirm=true）".to_string(),
-            )
-            .into());
+            return Err(
+                AppError::Internal("清除用户数据需要二次确认（confirm=true）".to_string()).into(),
+            );
         }
         let token = token.ok_or_else(|| {
             AppError::Internal(
                 "清除用户数据需要破坏性令牌（先 arm_destructive uninstall）".to_string(),
             )
         })?;
-        let guard =
-            DetachedGuard::validate_with_phase(&state, token, OperationPhase::Committing)?;
+        let guard = DetachedGuard::validate_with_phase(&state, token, OperationPhase::Committing)?;
         RetryGuard::Detached(guard)
     } else {
         RetryGuard::Scoped(begin_guard(&state, OperationKind::Adopt)?)
     };
     match state.target.os {
-        OperatingSystem::Macos => {
-            retry_macos_ancillary(actions, path, purge).map_err(Into::into)
-        }
+        OperatingSystem::Macos => retry_macos_ancillary(actions, path, purge).map_err(Into::into),
         OperatingSystem::Windows => {
             let settings = windows_domain_settings_for_persisted(&state);
             retry_windows_ancillary(&settings, actions, path, purge).map_err(Into::into)
@@ -1309,7 +1846,10 @@ pub fn get_operation_completion(
 /// CloseRequested / ExitRequested guards stop intercepting and let it go.
 /// Still refuses when the backend is in a non-interruptible install phase.
 #[tauri::command]
-pub fn confirm_quit(app: tauri::AppHandle, state: State<'_, ManagerState>) -> Result<(), CommandError> {
+pub fn confirm_quit(
+    app: tauri::AppHandle,
+    state: State<'_, ManagerState>,
+) -> Result<(), CommandError> {
     let confirm_close = crate::app::settings_store::AppSettings::load().confirm_close;
     // Decide and arm exit under the SAME operation mutex used by phase changes.
     // If the worker already reached commit this returns Block. Otherwise both app
@@ -1762,14 +2302,16 @@ fn import_codexskin_at(
 #[tauri::command]
 pub fn codex_theme_preview(theme_ref: String) -> Result<Option<String>, CommandError> {
     let settings = PersistedAppSettings::load();
-    Ok(crate::app::codex_theme::preview_data_url(&settings, &theme_ref))
+    Ok(crate::app::codex_theme::preview_data_url(
+        &settings, &theme_ref,
+    ))
 }
 
 /// The online skin catalog (skins.agentsmirror.com, published by
 /// awesome-codex-skins CI).
 #[tauri::command]
-pub async fn codex_theme_catalog(
-) -> Result<Vec<crate::app::codex_theme::CatalogSkin>, CommandError> {
+pub async fn codex_theme_catalog() -> Result<Vec<crate::app::codex_theme::CatalogSkin>, CommandError>
+{
     tauri::async_runtime::spawn_blocking(crate::app::codex_theme::fetch_catalog)
         .await
         .map_err(|e| AppError::Internal(format!("join: {e}")))?
@@ -2161,7 +2703,11 @@ pub async fn win_launch_codex(state: State<'_, ManagerState>) -> Result<(), Comm
         return Err(AppError::UnsupportedPlatform.into());
     }
     let persisted = PersistedAppSettings::load();
-    if persisted.codex_theme.is_some() && state.operations.snapshot().is_none() {
+    if persisted_codex_customization_active(
+        persisted.codex_theme.is_some(),
+        persisted.codex_locale_compatibility,
+    ) && state.operations.snapshot().is_none()
+    {
         let themed =
             crate::app::codex_theme::launch_with_active_theme(&state.codex_theme, &persisted)
                 .await?;
@@ -2246,9 +2792,7 @@ pub async fn win_perform_update(
             if let Some(token) = phase_token.as_ref() {
                 let result = match evidence {
                     OperationEvidence::MutationStarted => ops.mark_mutation_started(token),
-                    OperationEvidence::MutationRolledBack => {
-                        ops.mark_mutation_rolled_back(token)
-                    }
+                    OperationEvidence::MutationRolledBack => ops.mark_mutation_rolled_back(token),
                     OperationEvidence::OutcomeAmbiguous => ops.mark_outcome_ambiguous(token),
                 };
                 if let Err(error) = result {
@@ -2322,10 +2866,12 @@ pub async fn win_uninstall(
 #[cfg(test)]
 mod tests {
     use super::{
-        install_root_from_picked_dir, manager_update_matches_confirmation,
-        normalize_windows_source_base, validate_install_root_path, INSTALL_LOCATION_PROBE_PREFIX,
-        validated_custom_proxy_for_settings,
+        api_config_restart_plan, install_root_from_picked_dir, manager_update_matches_confirmation,
+        normalize_windows_source_base, persist_compatibility_for_locale_mode,
+        persisted_codex_customization_active, validate_install_root_path,
+        validated_custom_proxy_for_settings, ApiConfigRestartPlan, INSTALL_LOCATION_PROBE_PREFIX,
     };
+    use crate::app::codex_theme::LocaleMode;
     use std::fs;
 
     fn temp_path(name: &str) -> std::path::PathBuf {
@@ -2355,6 +2901,44 @@ mod tests {
             Some("https://example.test/custom")
         );
         assert!(normalize_windows_source_base("   ").is_none());
+    }
+
+    #[test]
+    fn api_config_restart_prefers_the_active_theme_only_when_idle() {
+        assert_eq!(
+            api_config_restart_plan(true, false),
+            ApiConfigRestartPlan::Themed
+        );
+        assert_eq!(
+            api_config_restart_plan(false, false),
+            ApiConfigRestartPlan::Plain
+        );
+        assert_eq!(
+            api_config_restart_plan(true, true),
+            ApiConfigRestartPlan::Plain
+        );
+    }
+
+    #[test]
+    fn persisted_theme_or_compatibility_requires_customized_launch() {
+        assert!(persisted_codex_customization_active(true, false));
+        assert!(persisted_codex_customization_active(false, true));
+        assert!(persisted_codex_customization_active(true, true));
+        assert!(!persisted_codex_customization_active(false, false));
+    }
+
+    #[test]
+    fn only_verified_compatibility_mode_remains_persisted() {
+        assert!(persist_compatibility_for_locale_mode(Some(
+            &LocaleMode::CompatibilityRuntime
+        )));
+        assert!(!persist_compatibility_for_locale_mode(Some(
+            &LocaleMode::OfficialCatalog
+        )));
+        assert!(!persist_compatibility_for_locale_mode(Some(
+            &LocaleMode::SystemDefault
+        )));
+        assert!(!persist_compatibility_for_locale_mode(None));
     }
 
     #[test]

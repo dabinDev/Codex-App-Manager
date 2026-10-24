@@ -25,10 +25,7 @@ fn err(message: impl Into<String>) -> ThemeEngineError {
 /// braces for portability).
 fn safe_entry_path(name: &str) -> Option<PathBuf> {
     let path = Path::new(name);
-    if path
-        .components()
-        .all(|c| matches!(c, Component::Normal(_)))
-    {
+    if path.components().all(|c| matches!(c, Component::Normal(_))) {
         Some(path.to_path_buf())
     } else {
         None
@@ -38,15 +35,15 @@ fn safe_entry_path(name: &str) -> Option<PathBuf> {
 /// Import a `.codexskin` archive into `themes_root`, returning the installed
 /// theme's summary. The archive must carry `theme.json` at its root.
 pub fn import_codexskin(archive_path: &Path, themes_root: &Path) -> Result<ThemeSummary> {
-    let archive_meta = std::fs::metadata(archive_path)
-        .map_err(|e| err(format!("无法读取主题包: {e}")))?;
+    let archive_meta =
+        std::fs::metadata(archive_path).map_err(|e| err(format!("无法读取主题包: {e}")))?;
     if archive_meta.len() > MAX_ARCHIVE_BYTES {
         return Err(err("主题包超过大小上限 (50MB)"));
     }
     let file =
         std::fs::File::open(archive_path).map_err(|e| err(format!("无法打开主题包: {e}")))?;
-    let mut archive = zip::ZipArchive::new(file)
-        .map_err(|e| err(format!("主题包不是有效的 zip: {e}")))?;
+    let mut archive =
+        zip::ZipArchive::new(file).map_err(|e| err(format!("主题包不是有效的 zip: {e}")))?;
     if archive.len() > MAX_ENTRIES {
         return Err(err("主题包条目数超过上限"));
     }
@@ -56,8 +53,7 @@ pub fn import_codexskin(archive_path: &Path, themes_root: &Path) -> Result<Theme
         ));
     }
 
-    std::fs::create_dir_all(themes_root)
-        .map_err(|e| err(format!("无法创建主题目录: {e}")))?;
+    std::fs::create_dir_all(themes_root).map_err(|e| err(format!("无法创建主题目录: {e}")))?;
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -118,8 +114,7 @@ fn extract_and_place(
     let parked = themes_root.join(format!(".replaced-{id}-{}", std::process::id()));
     let had_previous = destination.exists();
     if had_previous {
-        std::fs::rename(&destination, &parked)
-            .map_err(|e| err(format!("暂存旧版本失败: {e}")))?;
+        std::fs::rename(&destination, &parked).map_err(|e| err(format!("暂存旧版本失败: {e}")))?;
     }
     match std::fs::rename(staging, &destination) {
         Ok(()) => {
@@ -167,8 +162,14 @@ mod tests {
                 )
                 .into_bytes(),
             ),
-            ("theme.css".to_string(), b"html.codex-theme-studio {}\n".to_vec()),
-            ("previews/home.webp".to_string(), vec![0x52, 0x49, 0x46, 0x46, 1, 2]),
+            (
+                "theme.css".to_string(),
+                b"html.codex-theme-studio {}\n".to_vec(),
+            ),
+            (
+                "previews/home.webp".to_string(),
+                vec![0x52, 0x49, 0x46, 0x46, 1, 2],
+            ),
         ]
     }
 
@@ -178,14 +179,20 @@ mod tests {
         let root = tmp.path().join("themes");
         let skin = tmp.path().join("pkg.codexskin");
         let entries = minimal_entries("import-me");
-        let refs: Vec<(&str, &[u8])> =
-            entries.iter().map(|(n, b)| (n.as_str(), b.as_slice())).collect();
+        let refs: Vec<(&str, &[u8])> = entries
+            .iter()
+            .map(|(n, b)| (n.as_str(), b.as_slice()))
+            .collect();
         write_zip(&skin, &refs);
 
         let summary = import_codexskin(&skin, &root).unwrap();
         assert_eq!(summary.id, "import-me");
         assert_eq!(summary.meta.version.as_deref(), Some("1.0.0"));
-        assert!(summary.preview.as_ref().unwrap().ends_with("previews/home.webp"));
+        assert!(summary
+            .preview
+            .as_ref()
+            .unwrap()
+            .ends_with("previews/home.webp"));
         assert!(root.join("import-me/theme.json").is_file());
 
         // Re-import (upgrade path) replaces in place and leaves no debris.

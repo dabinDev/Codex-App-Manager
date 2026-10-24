@@ -1,6 +1,6 @@
 # Privacy policy · 隐私政策
 
-Effective date / 生效日期：2026-07-14
+Effective date / 生效日期：2026-07-30
 
 This policy applies to Codex App Manager, its public website, and the download
 router maintained by this repository. Third-party services selected or contacted
@@ -15,16 +15,40 @@ by the user remain subject to their own privacy policies.
   phone number, or payment information.
 - The app and website contain no project-operated telemetry, advertising,
   crash-reporting, or behavioral-analytics service.
-- The project does not intentionally read or upload conversations,
-  credentials, workspace files, or other user content from `~/.codex`.
+- The project does not upload conversations, credentials, workspace files, or
+  other user content from `~/.codex`. The local conversation-metadata repair
+  described below is the only feature that reads those provider fields.
 - Settings, logs, and diagnostics remain local unless the user deliberately
   copies or attaches them to an issue or support request.
 
 - 应用没有账户系统，不要求姓名、邮箱、电话或付款信息。
 - 应用与官网不包含由本项目运营的遥测、广告、崩溃上报或行为分析服务。
-- 项目不会主动读取或上传 `~/.codex` 中的对话、凭据、工作区文件或其他用户内容。
+- 项目不会上传 `~/.codex` 中的对话、凭据、工作区文件或其他用户内容。仅下文所述的
+  本地对话元数据修复功能会读取其中的服务商字段。
 - 设置、日志和诊断默认只保存在本机；只有用户主动复制或附加到 Issue/支持请求时才会离开
   本机。
+
+## Local conversation metadata repair · 本地对话元数据修复
+
+Opening the conversation-alignment tool starts a local-only scan. The app reads
+the active provider from `config.toml`, the provider field in local conversation
+databases, and the first metadata record of matching session JSONL files. The
+remaining JSONL bytes may be hashed to detect concurrent changes, but they are
+not parsed as conversation content or transmitted.
+
+No file is changed during the scan. After the user explicitly confirms the
+operation, the app creates local recovery backups, updates only the provider
+metadata, verifies the result, and offers local undo/recovery actions. The tool
+will not modify files while a Codex CLI session is active. These scans, backups,
+changes, and verification steps remain on the user's device.
+
+打开“对话回复对齐”工具时，应用会进行一次纯本地扫描：从 `config.toml` 读取当前服务商，
+从本机对话数据库读取服务商字段，并读取匹配会话 JSONL 文件的首条元数据记录。其余 JSONL
+字节可能用于计算哈希以检测并发变化，但不会被解析为对话正文，也不会被传输。
+
+扫描过程不会修改文件。只有用户明确确认后，应用才会创建本地恢复备份、仅更新服务商
+元数据、校验结果，并提供本地撤销/恢复操作。检测到 Codex CLI 会话正在运行时，工具不会
+修改文件。上述扫描、备份、修改与校验均只在用户设备上进行。
 
 ## Network requests made by the app · 应用发起的网络请求
 

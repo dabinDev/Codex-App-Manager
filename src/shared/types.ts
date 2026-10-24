@@ -1,6 +1,13 @@
 export type OperatingSystem = "windows" | "macos" | "linux" | "unknown";
 export type Architecture = "x64" | "arm64" | "unknown";
-export type OperationKind = "install" | "update" | "uninstall" | "set-install-root" | "adopt";
+export type OperationKind =
+  | "install"
+  | "update"
+  | "uninstall"
+  | "set-install-root"
+  | "adopt"
+  | "provider-write"
+  | "conversation-alignment";
 export type OperationToken = string;
 /** Lifecycle phase of a backend operation lease (mirrors Rust `OperationPhase`). */
 export type OperationPhase =
@@ -239,6 +246,9 @@ export interface AppSettings {
   codexThemeDir: string | null;
   /** Managed skin store; null = platform default. */
   codexThemeStoreDir: string | null;
+  /** Codex UI locale applied through Chromium --lang and the official
+   *  localeOverride setting; null = follow the system language. */
+  codexLocale: string | null;
   /** User-defined local skin groups, in display order. */
   skinGroups: SkinGroup[];
 }
@@ -250,6 +260,92 @@ export interface ConfigHealth {
   detail: string | null;
   settingsBackupAvailable: boolean;
   provenanceBackupAvailable: boolean;
+}
+
+export type ApiConfigConnection = "signed_out" | "connected" | "interrupted";
+export type ApiConfigKeyStatus = "active" | "inactive" | "quota_exhausted" | "expired";
+
+export interface ApiConfigSession {
+  authenticated: boolean;
+  email: string | null;
+  remembered: boolean;
+  connection: ApiConfigConnection;
+  warning: string | null;
+}
+
+export interface ApiConfigKey {
+  id: number;
+  name: string;
+  groupName: string;
+  maskedKey: string;
+  status: ApiConfigKeyStatus;
+  quota: number;
+  quotaUsed: number;
+  expiresAt: string | null;
+  actionable: boolean;
+  enabled: boolean;
+}
+
+export interface ApiConfigKeyList {
+  items: ApiConfigKey[];
+  stale: boolean;
+  fetchedAtUnix: number;
+}
+
+export type ApiConfigWriteOutcome =
+  | "committed"
+  | "failed_before_mutation"
+  | "restored"
+  | "recovery_required";
+
+export interface ApiConfigWriteReport {
+  outcome: ApiConfigWriteOutcome;
+  backupDir: string | null;
+  configPath: string;
+  authPath: string;
+  codexWasRunning: boolean;
+  writeVerified: boolean;
+  rollbackVerified: boolean;
+  errorCode: string | null;
+}
+
+export type AlignmentOutcome =
+  | "committed"
+  | "no_changes"
+  | "stale_plan"
+  | "restored"
+  | "recovery_required";
+
+export interface AlignmentScan {
+  scanToken: string;
+  activeProvider: string;
+  databaseCount: number;
+  threadCount: number;
+  mismatchedThreads: number;
+  rolloutCount: number;
+  mismatchedRollouts: number;
+  skippedRollouts: number;
+  skipReasons: string[];
+  desktopRunning: boolean;
+  cliRunning: boolean;
+  canExecute: boolean;
+  warnings: string[];
+}
+
+export interface AlignmentReport {
+  outcome: AlignmentOutcome;
+  recoveryId: string | null;
+  backupDir: string | null;
+  threadsUpdated: number;
+  rolloutsUpdated: number;
+  rolloutsSkipped: number;
+  writeVerified: boolean;
+  rollbackVerified: boolean;
+  codexWasRunning: boolean;
+  restartAllowed: boolean;
+  undoAllowed: boolean;
+  elevationRequired: boolean;
+  errorCode: string | null;
 }
 
 export type ConfigWhich = "settings" | "provenance";
@@ -289,6 +385,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   codexTheme: null,
   codexThemeDir: null,
   codexThemeStoreDir: null,
+  codexLocale: null,
   skinGroups: [],
 };
 

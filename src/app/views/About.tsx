@@ -4,12 +4,12 @@ import { managerApi, type ManagerUpdateAvailable } from "../../services/managerA
 import { userErrorMessage } from "../errorCopy";
 import { Icon, CodexMark } from "../icons";
 import { useI18n } from "../i18n";
+import { BRAND, siteHost } from "../brand";
 import { NavBar, Ring } from "../components";
 import { formatDiagnostics } from "../diagnostics";
 import { Sheet } from "../Sheet";
 
 const APP_VERSION = import.meta.env.VITE_APP_VERSION ?? "0.0.0";
-const REPO_URL = "https://github.com/Wangnov/Codex-App-Manager";
 
 export function About({ onBack }: { onBack: () => void }) {
   const { t } = useI18n();
@@ -34,15 +34,17 @@ export function About({ onBack }: { onBack: () => void }) {
     }
     try {
       const result = await managerApi.checkManagerUpdate();
-      if (result.kind === "available") {
-        setPendingUpdate(result);
-        setMgrMsg(t("about.mgrFound", { version: result.version }));
-      } else if (result.kind === "none") {
-        setMgrMsg(t("about.mgrUpToDate"));
-      } else if (result.kind === "development") {
-        setMgrMsg(t("about.mgrDev"));
-      } else {
-        setMgrMsg(t("about.mgrUnavailable"));
+      switch (result.kind) {
+        case "available":
+          setPendingUpdate(result);
+          setMgrMsg(t("about.mgrFound", { version: result.version }));
+          break;
+        case "none":
+          setMgrMsg(t("about.mgrUpToDate"));
+          break;
+        case "development":
+          setMgrMsg(t("about.mgrDev"));
+          break;
       }
     } catch (cause) {
       setMgrMsg(userErrorMessage(cause, t));
@@ -112,11 +114,11 @@ export function About({ onBack }: { onBack: () => void }) {
             </span>
             <span className="rval">{mgrBusy ? t("about.mgrChecking") : ""}</span>
           </button>
-          <button className="row" onClick={() => void managerApi.openUrl(REPO_URL)}>
+          <button className="row" onClick={() => void managerApi.openUrl(BRAND.sites.support)}>
             <Icon name="message" className="ricon" />
             <span className="rtext">
               <span className="rtitle">{t("about.feedback")}</span>
-              <span className="rsub">{REPO_URL.replace("https://", "")}</span>
+              <span className="rsub">{siteHost(BRAND.sites.support)}</span>
             </span>
             <Icon name="external" className="chev" />
           </button>

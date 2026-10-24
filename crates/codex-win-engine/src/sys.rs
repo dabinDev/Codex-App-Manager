@@ -35,12 +35,19 @@ pub struct InstalledWindowsCodex {
     pub installed_at: Option<u64>,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+// Not `Copy`: `locale` is an owned `String`. Every call site constructs a
+// `LaunchOptions` and passes it straight into `launch_codex_with_options` by
+// value with no reuse, so move semantics are sufficient.
+#[derive(Debug, Clone, Default)]
 pub struct LaunchOptions {
     pub disable_codex_self_updates: bool,
     /// Start Electron's loopback DevTools endpoint for renderer theme injection.
     /// `None` preserves the ordinary launch path.
     pub remote_debugging_port: Option<u16>,
+    /// Set Chromium and the native-menu locale. The renderer's React catalog is
+    /// controlled separately through Codex's official `localeOverride` setting.
+    /// `None` follows the system locale on the ordinary launch path.
+    pub locale: Option<String>,
 }
 
 const CODEX_SELF_UPDATE_ENV_KEY: &str = "CODEX_SPARKLE_ENABLED";
@@ -51,6 +58,11 @@ fn remote_debugging_arguments(port: u16) -> [String; 2] {
         "--remote-debugging-address=127.0.0.1".to_string(),
         format!("--remote-debugging-port={port}"),
     ]
+}
+
+/// Chromium's language-override switch for Chromium surfaces and native menus.
+fn lang_argument(locale: &str) -> String {
+    format!("--lang={locale}")
 }
 
 #[derive(Debug, Deserialize)]
@@ -1954,6 +1966,9 @@ pub fn launch_codex_with_options(
         if let Some(port) = options.remote_debugging_port {
             command.args(remote_debugging_arguments(port));
         }
+        if let Some(locale) = &options.locale {
+            command.arg(lang_argument(locale));
+        }
         match spawn_and_require_liveness(command, PORTABLE_LIVENESS_WINDOW) {
             Ok(LivenessResult::Survived { child }) => {
                 std::mem::forget(child);
@@ -1975,11 +1990,20 @@ pub fn launch_codex_with_options(
                 "launching MSIX Codex with updater disabled via persisted user environment"
             );
         }
+        // Both the debug port and the locale switch are delivered as MSIX
+        // activation arguments (a single space-separated string). Only fall back
+        // to the plain activation when neither is requested.
+        let mut arguments: Vec<String> = Vec::new();
         if let Some(port) = options.remote_debugging_port {
-            let arguments = remote_debugging_arguments(port).join(" ");
-            launch_msix_app_with_arguments(installed, &arguments)
-        } else {
+            arguments.extend(remote_debugging_arguments(port));
+        }
+        if let Some(locale) = &options.locale {
+            arguments.push(lang_argument(locale));
+        }
+        if arguments.is_empty() {
             launch_msix_app()
+        } else {
+            launch_msix_app_with_arguments(installed, &arguments.join(" "))
         }
     }
 }
@@ -2342,7 +2366,7 @@ fn capabilities_from_probe_json(value: &serde_json::Value) -> WinCapabilityRepor
 
 #[cfg(test)]
 mod tests {
-    use super::{registered_msix_aumid, remote_debugging_arguments};
+    use super::{lang_argument, registered_msix_aumid, remote_debugging_arguments, LaunchOptions};
     #[cfg(windows)]
     use super::*;
 
@@ -2355,6 +2379,20 @@ mod tests {
                 "--remote-debugging-port=9345".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn builds_the_chromium_language_switch() {
+        assert_eq!(lang_argument("zh-CN"), "--lang=zh-CN");
+        assert_eq!(lang_argument("en-US"), "--lang=en-US");
+    }
+
+    #[test]
+    fn default_launch_options_request_no_locale_or_debug_port() {
+        let options = LaunchOptions::default();
+        assert!(options.locale.is_none());
+        assert!(options.remote_debugging_port.is_none());
+        assert!(!options.disable_codex_self_updates);
     }
 
     #[test]

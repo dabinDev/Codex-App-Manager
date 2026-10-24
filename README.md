@@ -167,6 +167,10 @@ npm run check          # 类型检查
 npm run tauri:build    # 本地构建(未签名)
 ```
 
+应用名称、图标和内置站点统一维护在
+[`brand.config.json`](brand.config.json)，修改后运行 `npm run brand:sync`。
+字段说明与兼容性边界见 [`docs/branding.md`](docs/branding.md)。
+
 ## 边界
 
 - 不修改、不重打包 Codex 安装包

@@ -90,18 +90,19 @@ fn live_inject_verify_revert_when_stock() {
 
         let built =
             codex_theme_engine::payload::build_payload(&root.join("guts-terminal")).unwrap();
-        let verify = codex_theme_engine::payload::verify_expression(
-            codex_theme_engine::ENGINE_VERSION,
-        )
-        .unwrap();
+        let verify =
+            codex_theme_engine::payload::verify_expression(codex_theme_engine::ENGINE_VERSION)
+                .unwrap();
         for target in &connected {
-            target.session.evaluate(&built.payload).await.expect("inject");
+            target
+                .session
+                .evaluate(&built.payload)
+                .await
+                .expect("inject");
             let report = target.session.evaluate(&verify).await.expect("verify");
             println!(
                 "target {} verify: pass={} themeId={:?}",
-                target.probe.title,
-                report["pass"],
-                report["themeId"]
+                target.probe.title, report["pass"], report["themeId"]
             );
             assert_eq!(report["installed"], true, "theme must be installed");
             assert_eq!(report["stylePresent"], true, "style must be present");
@@ -131,15 +132,20 @@ fn imports_env_provided_codexskin() {
     let path = std::env::var("CODEXSKIN").expect("set CODEXSKIN=/path/to/pkg.codexskin");
     let tmp = std::env::temp_dir().join(format!("codexskin-import-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
-    let summary =
-        codex_theme_engine::import::import_codexskin(std::path::Path::new(&path), &tmp)
-            .expect("import");
+    let summary = codex_theme_engine::import::import_codexskin(std::path::Path::new(&path), &tmp)
+        .expect("import");
     println!(
         "imported id={} version={:?} preview={:?} verified={:?}",
         summary.id, summary.meta.version, summary.preview, summary.meta.codex_verified
     );
-    assert!(summary.meta.version.is_some(), "packed skins carry a version");
-    assert!(summary.preview.is_some(), "packed skins carry a cover preview");
+    assert!(
+        summary.meta.version.is_some(),
+        "packed skins carry a version"
+    );
+    assert!(
+        summary.preview.is_some(),
+        "packed skins carry a cover preview"
+    );
     let _ = std::fs::remove_dir_all(&tmp);
 }
 

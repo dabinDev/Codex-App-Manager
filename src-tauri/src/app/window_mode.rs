@@ -1,6 +1,5 @@
-//! Window form factor. The manager is a compact 400×640 popover by default
-//! (the at-a-glance dashboard) and expands into a desktop-sized workbench for
-//! space-hungry surfaces (theme gallery, future config editors). One window,
+//! Window form factor. The manager launches as a desktop-sized workbench and
+//! can collapse into a compact 400×640 popover for at-a-glance use. One window,
 //! two shapes: compact is fixed-size, expanded is user-resizable within a
 //! minimum, and both transitions keep the window's visual center in place,
 //! clamped into the current monitor's work area so no edge ends up off-screen.
@@ -20,6 +19,8 @@ pub enum WindowMode {
     Compact,
     Expanded,
 }
+
+pub const INITIAL_WINDOW_MODE: WindowMode = WindowMode::Expanded;
 
 /// What the backend actually applied, echoed to the frontend so it can persist
 /// the (possibly clamped) expanded size instead of the size it asked for.
@@ -53,13 +54,25 @@ pub fn normalize_expanded_size(
     work_logical: (f64, f64),
 ) -> (f64, f64) {
     let clamp_axis = |requested: Option<f64>, default: f64, min: f64, work: f64| -> f64 {
-        let value = requested.filter(|v| v.is_finite() && *v > 0.0).unwrap_or(default);
+        let value = requested
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .unwrap_or(default);
         let floor = min.min(work.max(1.0));
         value.clamp(floor, work.max(floor))
     };
     (
-        clamp_axis(width, EXPANDED_DEFAULT_SIZE.0, EXPANDED_MIN_SIZE.0, work_logical.0),
-        clamp_axis(height, EXPANDED_DEFAULT_SIZE.1, EXPANDED_MIN_SIZE.1, work_logical.1),
+        clamp_axis(
+            width,
+            EXPANDED_DEFAULT_SIZE.0,
+            EXPANDED_MIN_SIZE.0,
+            work_logical.0,
+        ),
+        clamp_axis(
+            height,
+            EXPANDED_DEFAULT_SIZE.1,
+            EXPANDED_MIN_SIZE.1,
+            work_logical.1,
+        ),
     )
 }
 
@@ -80,9 +93,9 @@ pub fn placement(prev: Rect, target_w: f64, target_h: f64, work: Rect) -> (f64, 
 }
 
 /// Apply a form factor to the main window. Ordering is load-bearing: the
-/// expanded minimum must be lifted *before* shrinking to compact (a 960×640
-/// floor would swallow the 400×640 request), and set *after* growing so the
-/// grow itself is never constrained by a stale floor.
+/// existing minimum must be lifted *before* either target size is applied (a
+/// 960×640 floor would swallow compact, and could block small-monitor startup
+/// clamping), then the effective expanded minimum is set after growing.
 pub fn apply_window_mode(
     app: &tauri::AppHandle,
     mode: WindowMode,
@@ -103,7 +116,9 @@ pub fn apply_window_mode(
 
     // Previous outer frame (physical px) — the center we preserve. An
     // undecorated window's outer frame equals its inner size.
-    let prev_pos = window.outer_position().map_err(|e| win_err("position", e))?;
+    let prev_pos = window
+        .outer_position()
+        .map_err(|e| win_err("position", e))?;
     let prev_size = window.outer_size().map_err(|e| win_err("size", e))?;
     let prev = Rect {
         x: prev_pos.x as f64,
@@ -145,11 +160,12 @@ pub fn apply_window_mode(
         }
     };
 
+    window
+        .set_min_size(None::<LogicalSize<f64>>)
+        .map_err(|e| win_err("min size", e))?;
+
     match mode {
         WindowMode::Compact => {
-            window
-                .set_min_size(None::<LogicalSize<f64>>)
-                .map_err(|e| win_err("min size", e))?;
             window
                 .set_size(LogicalSize::new(logical_w, logical_h))
                 .map_err(|e| win_err("resize", e))?;
@@ -209,6 +225,11 @@ mod tests {
         w: 1728.0,
         h: 1052.0,
     };
+
+    #[test]
+    fn startup_mode_is_expanded() {
+        assert_eq!(INITIAL_WINDOW_MODE, WindowMode::Expanded);
+    }
 
     #[test]
     fn placement_keeps_center_when_it_fits() {

@@ -26,6 +26,10 @@ param(
     [string]$CertificateBase64 = $env:WINDOWS_CERTIFICATE,
     [string]$CertificatePassword = $env:WINDOWS_CERTIFICATE_PASSWORD,
     [string]$TimestampUrl = $(if ($env:WINDOWS_TIMESTAMP_URL) { $env:WINDOWS_TIMESTAMP_URL } else { "http://timestamp.digicert.com" }),
+
+    [ValidateSet("optional", "required")]
+    [string]$Mode = "optional",
+
     [string]$Stage = "sign"
 )
 
@@ -46,6 +50,9 @@ function Fail-Stage([string]$Message) {
 }
 
 if ([string]::IsNullOrWhiteSpace($CertificateBase64)) {
+    if ($Mode -eq "required") {
+        Fail-Stage "trusted code-signing certificate is required for distributable output"
+    }
     Write-Host "[$Stage] WINDOWS_CERTIFICATE not set — skipping Authenticode signing (non-blocking milestone)."
     Write-Host "[$Stage] Installer remains unsigned; see docs/windows-signing.md."
     # Do not `exit` — CI invokes this in-process with `&`.

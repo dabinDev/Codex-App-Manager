@@ -22,7 +22,7 @@ param(
     [ValidateSet("optional", "required")]
     [string]$Mode = "optional",
 
-    # When set (required mode), SignerCertificate.Subject must contain this.
+    # In required mode, SignerCertificate.Subject must equal this full subject.
     [string]$ExpectedSubject = "",
 
     [string]$Stage = "sign-verify"
@@ -45,6 +45,10 @@ function Fail-Stage([string]$Message) {
 }
 
 Write-Stage "Authenticode verification (mode=$Mode)"
+
+if ($Mode -eq "required" -and [string]::IsNullOrWhiteSpace($ExpectedSubject)) {
+    Fail-Stage "exact expected signer subject is required"
+}
 
 $results = @()
 $failed = $false
@@ -91,9 +95,9 @@ foreach ($raw in $Path) {
                 $ok = $false
                 Write-Host "::error::[$Stage] $($item.Name): expected Valid, got $status"
             }
-            elseif ($ExpectedSubject -and ($subject -notlike "*$ExpectedSubject*")) {
+            elseif ($ExpectedSubject -and ($subject -ne $ExpectedSubject)) {
                 $ok = $false
-                Write-Host "::error::[$Stage] $($item.Name): subject '$subject' does not contain '$ExpectedSubject'"
+                Write-Host "::error::[$Stage] $($item.Name): subject '$subject' does not equal '$ExpectedSubject'"
             }
             else {
                 $ok = $true
